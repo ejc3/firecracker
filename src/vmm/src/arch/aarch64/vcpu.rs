@@ -223,18 +223,6 @@ impl KvmVcpu {
         // We already checked that the capability is supported.
         kvi.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
 
-        // Enable nested virtualization with HAS_EL2 (bit 7).
-        // This enables full nested virt (vCPU has virtual EL2).
-        // Controlled by FCVM_NV2=1 environment variable for testing.
-        const KVM_ARM_VCPU_HAS_EL2: u32 = 7;
-        // HAS_EL2_E2H0 (bit 8) limits NV to nVHE mode by masking VHE from guest.
-        // Without this, the guest enables VHE in head.S causing timer trap storms.
-        const KVM_ARM_VCPU_HAS_EL2_E2H0: u32 = 8;
-        let enable_nv2 = std::env::var("FCVM_NV2").map(|v| v == "1").unwrap_or(false);
-        if enable_nv2 {
-            kvi.features[0] |= (1 << KVM_ARM_VCPU_HAS_EL2) | (1 << KVM_ARM_VCPU_HAS_EL2_E2H0);
-        }
-
         Ok(kvi)
     }
 
