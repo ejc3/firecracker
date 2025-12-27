@@ -357,15 +357,17 @@ impl KvmVcpu {
         const KVM_ARM_VCPU_HAS_EL2: u32 = 7;
         let has_el2 = (self.kvi.features[0] & (1 << KVM_ARM_VCPU_HAS_EL2)) != 0;
         eprintln!("[NV2 DEBUG] setup_boot_regs called, kvi.features[0] = {:#x}, has_el2 = {}", self.kvi.features[0], has_el2);
-        // With HAS_EL2 + HAS_EL2_E2H0, boot at EL1h.
+        // With HAS_EL2 + HAS_EL2_E2H0, boot at EL2h so the guest kernel sees HYP mode.
         // The E2H0 flag forces nVHE mode, so the guest kernel won't try to enable VHE.
         // This avoids the timer trap storm that happens when the guest enables VHE.
-        // Note: The "CPUs started in inconsistent modes" warning may still appear but
-        // the boot should complete since we're not enabling VHE.
-        let pstate_value = PSTATE_FAULT_BITS_64;
-        if has_el2 {
-            eprintln!("[NV2] Booting at EL1h with E2H0 (forced nVHE mode)");
-        }
+        // The guest kernel's is_hyp_mode_available() checks CurrentEL on boot - it must
+        // see EL2 or it will assume no hypervisor mode is available.
+        let pstate_value = if has_el2 {
+            eprintln!("[NV2] Booting at EL2h (guest will see HYP mode available)");
+            PSTATE_FAULT_BITS_64_EL2
+        } else {
+            PSTATE_FAULT_BITS_64
+        };
         self.fd
             .set_one_reg(id, &pstate_value.to_le_bytes())
             .map_err(|err| {
