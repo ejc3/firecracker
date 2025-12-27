@@ -157,11 +157,7 @@ impl KvmVcpu {
         let mut mpidr = [0_u8; 8];
         match self.fd.get_one_reg(MPIDR_EL1, &mut mpidr) {
             Err(err) => Err(VcpuArchError::GetOneReg(MPIDR_EL1, err)),
-            Ok(_) => {
-                let mpidr_val = u64::from_le_bytes(mpidr);
-                eprintln!("[NV2 DEBUG] get_mpidr: MPIDR_EL1 = {:#x} for vCPU {}", mpidr_val, self.index);
-                Ok(mpidr_val)
-            }
+            Ok(_) => Ok(u64::from_le_bytes(mpidr)),
         }
     }
 
@@ -236,10 +232,7 @@ impl KvmVcpu {
         const KVM_ARM_VCPU_HAS_EL2_E2H0: u32 = 8;
         let enable_nv2 = std::env::var("FCVM_NV2").map(|v| v == "1").unwrap_or(false);
         if enable_nv2 {
-            eprintln!("[NV2] Enabling HAS_EL2 + HAS_EL2_E2H0 (FCVM_NV2=1)");
             kvi.features[0] |= (1 << KVM_ARM_VCPU_HAS_EL2) | (1 << KVM_ARM_VCPU_HAS_EL2_E2H0);
-        } else {
-            eprintln!("[NV2] HAS_EL2 disabled (set FCVM_NV2=1 to enable)");
         }
 
         Ok(kvi)
@@ -356,14 +349,12 @@ impl KvmVcpu {
         let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, pstate);
         const KVM_ARM_VCPU_HAS_EL2: u32 = 7;
         let has_el2 = (self.kvi.features[0] & (1 << KVM_ARM_VCPU_HAS_EL2)) != 0;
-        eprintln!("[NV2 DEBUG] setup_boot_regs called, kvi.features[0] = {:#x}, has_el2 = {}", self.kvi.features[0], has_el2);
         // With HAS_EL2 + HAS_EL2_E2H0, boot at EL2h so the guest kernel sees HYP mode.
         // The E2H0 flag forces nVHE mode, so the guest kernel won't try to enable VHE.
         // This avoids the timer trap storm that happens when the guest enables VHE.
         // The guest kernel's is_hyp_mode_available() checks CurrentEL on boot - it must
         // see EL2 or it will assume no hypervisor mode is available.
         let pstate_value = if has_el2 {
-            eprintln!("[NV2] Booting at EL2h (guest will see HYP mode available)");
             PSTATE_FAULT_BITS_64_EL2
         } else {
             PSTATE_FAULT_BITS_64
@@ -383,11 +374,11 @@ impl KvmVcpu {
             // Set RW (bit 31) = 1: EL1 is AArch64
             const HCR_EL2_RW: u64 = 1 << 31;
             let hcr_value = HCR_EL2_RW;
-            eprintln!("[NV2] Setting HCR_EL2 = {:#x} (RW=1, E2H=0 to disable VHE)", hcr_value);
-            match self.fd.set_one_reg(SYS_HCR_EL2, &hcr_value.to_le_bytes()) {
-                Ok(_) => eprintln!("[NV2] HCR_EL2 set successfully"),
-                Err(ref e) => eprintln!("[NV2] HCR_EL2 set failed: {:?}", e),
-            }
+            self.fd
+                .set_one_reg(SYS_HCR_EL2, &hcr_value.to_le_bytes())
+                .map_err(|err| {
+                    VcpuArchError::SetOneReg(SYS_HCR_EL2, format!("{hcr_value:#x}"), err)
+                })?;
 
             // CNTHCTL_EL2: Allow physical timer access from EL1/EL0
             // For non-VHE: bits 0,1 control EL1/EL0 access
@@ -399,11 +390,6 @@ impl KvmVcpu {
             const CNTHCTL_EL2_EL1PCTEN_VHE: u64 = 1 << 10; // VHE: Allow EL1 physical counter access
             let cnthctl_value = CNTHCTL_EL2_EL1PCEN | CNTHCTL_EL2_EL1PCTEN
                               | CNTHCTL_EL2_EL1PTEN | CNTHCTL_EL2_EL1PCTEN_VHE;
-            eprintln!("[NV2] Setting CNTHCTL_EL2 = {:#x}", cnthctl_value);
-            match self.fd.set_one_reg(SYS_CNTHCTL_EL2, &cnthctl_value.to_le_bytes()) {
-                Ok(_) => eprintln!("[NV2] CNTHCTL_EL2 set successfully"),
-                Err(ref e) => eprintln!("[NV2] CNTHCTL_EL2 set failed: {:?}", e),
-            }
             self.fd
                 .set_one_reg(SYS_CNTHCTL_EL2, &cnthctl_value.to_le_bytes())
                 .map_err(|err| {
@@ -416,26 +402,24 @@ impl KvmVcpu {
             // VMPIDR_EL2 is what a nested guest sees when it reads MPIDR_EL1.
             // Format: Aff3[39:32] | 1[31] | Aff2[23:16] | Aff1[15:8] | Aff0[7:0]
             let expected_mpidr = 0x80000000u64 | (self.index as u64);
-            eprintln!("[NV2] Setting VMPIDR_EL2 = {:#x} for vCPU {}", expected_mpidr, self.index);
-            match self.fd.set_one_reg(SYS_VMPIDR_EL2, &expected_mpidr.to_le_bytes()) {
-                Ok(_) => eprintln!("[NV2] VMPIDR_EL2 set successfully"),
-                Err(ref e) => eprintln!("[NV2] VMPIDR_EL2 set failed: {:?}", e),
-            }
+            self.fd
+                .set_one_reg(SYS_VMPIDR_EL2, &expected_mpidr.to_le_bytes())
+                .map_err(|err| {
+                    VcpuArchError::SetOneReg(SYS_VMPIDR_EL2, format!("{expected_mpidr:#x}"), err)
+                })?;
 
             // Also set VPIDR_EL2 to the host's MIDR value.
             // This is what a nested guest sees when it reads MIDR_EL1.
             let mut midr_bytes = [0u8; 8];
-            match self.fd.get_one_reg(MIDR_EL1, &mut midr_bytes) {
-                Ok(_) => {
-                    let midr_value = u64::from_le_bytes(midr_bytes);
-                    eprintln!("[NV2] Setting VPIDR_EL2 = {:#x} (from host MIDR)", midr_value);
-                    match self.fd.set_one_reg(SYS_VPIDR_EL2, &midr_value.to_le_bytes()) {
-                        Ok(_) => eprintln!("[NV2] VPIDR_EL2 set successfully"),
-                        Err(ref e) => eprintln!("[NV2] VPIDR_EL2 set failed: {:?}", e),
-                    }
-                }
-                Err(ref e) => eprintln!("[NV2] Could not read MIDR_EL1: {:?}", e),
-            }
+            self.fd.get_one_reg(MIDR_EL1, &mut midr_bytes).map_err(|err| {
+                VcpuArchError::GetOneReg(MIDR_EL1, err)
+            })?;
+            let midr_value = u64::from_le_bytes(midr_bytes);
+            self.fd
+                .set_one_reg(SYS_VPIDR_EL2, &midr_value.to_le_bytes())
+                .map_err(|err| {
+                    VcpuArchError::SetOneReg(SYS_VPIDR_EL2, format!("{midr_value:#x}"), err)
+                })?;
         }
 
         // Other vCPUs are powered off initially awaiting PSCI wakeup.

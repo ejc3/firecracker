@@ -128,7 +128,7 @@ pub fn configure_system_for_boot(
     // Enable SMC for PSCI when nested virtualization is enabled (HAS_EL2).
     // With nested virt, HVC traps to the guest's virtual EL2 which has no handler.
     // SMC goes to KVM's secure monitor emulation which handles PSCI correctly.
-    let nested_virt = true; // TODO: Make this configurable via machine config
+    let nested_virt = std::env::var("FCVM_NV2").map(|v| v == "1").unwrap_or(false);
 
     let fdt = fdt::create_fdt(
         vm.guest_memory(),
