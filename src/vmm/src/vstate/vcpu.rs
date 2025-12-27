@@ -27,7 +27,7 @@ pub use crate::arch::{KvmVcpu, KvmVcpuConfigureError, KvmVcpuError, Peripherals,
 use crate::cpu_config::templates::{CpuConfiguration, GuestConfigError};
 #[cfg(feature = "gdb")]
 use crate::gdb::target::{GdbTargetError, get_raw_tid};
-use crate::logger::{IncMetric, METRICS};
+use crate::logger::{IncMetric, METRICS, debug};
 use crate::seccomp::{BpfProgram, BpfProgramRef};
 use crate::utils::signal::{Killable, register_signal_handler, sigrtmin};
 use crate::utils::sm::StateMachine;
@@ -450,7 +450,10 @@ impl Vcpu {
             return Ok(VcpuEmulation::Interrupted);
         }
 
-        match self.kvm_vcpu.fd.run() {
+        let run_result = self.kvm_vcpu.fd.run();
+        // Debug: log every vCPU exit
+        debug!("vCPU {} run returned: {:?}", self.kvm_vcpu.index, run_result);
+        match run_result {
             Err(ref err) if err.errno() == libc::EINTR => {
                 self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
                 // Notify that this KVM_RUN was interrupted.

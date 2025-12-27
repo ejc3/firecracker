@@ -125,6 +125,11 @@ pub fn configure_system_for_boot(
         .as_cstring()
         .expect("Cannot create cstring from cmdline string");
 
+    // Enable SMC for PSCI when nested virtualization is enabled (HAS_EL2).
+    // With nested virt, HVC traps to the guest's virtual EL2 which has no handler.
+    // SMC goes to KVM's secure monitor emulation which handles PSCI correctly.
+    let nested_virt = true; // TODO: Make this configurable via machine config
+
     let fdt = fdt::create_fdt(
         vm.guest_memory(),
         vcpu_mpidr,
@@ -132,6 +137,7 @@ pub fn configure_system_for_boot(
         device_manager,
         vm.get_irqchip(),
         initrd,
+        nested_virt,
     )?;
 
     let fdt_address = GuestAddress(get_fdt_addr(vm.guest_memory()));

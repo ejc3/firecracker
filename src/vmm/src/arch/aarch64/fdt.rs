@@ -70,6 +70,7 @@ pub fn create_fdt(
     device_manager: &DeviceManager,
     gic_device: &GICDevice,
     initrd: &Option<InitrdConfig>,
+    nested_virt: bool,
 ) -> Result<Vec<u8>, FdtError> {
     // Allocate stuff necessary for storing the blob.
     let mut fdt_writer = FdtWriter::new()?;
@@ -94,7 +95,7 @@ pub fn create_fdt(
     create_gic_node(&mut fdt_writer, gic_device)?;
     create_timer_node(&mut fdt_writer)?;
     create_clock_node(&mut fdt_writer)?;
-    create_psci_node(&mut fdt_writer)?;
+    create_psci_node(&mut fdt_writer, nested_virt)?;
     create_devices_node(&mut fdt_writer, device_manager)?;
     create_vmgenid_node(&mut fdt_writer, &device_manager.acpi_devices.vmgenid)?;
     create_pci_nodes(&mut fdt_writer, &device_manager.pci_devices)?;
@@ -356,15 +357,18 @@ fn create_timer_node(fdt: &mut FdtWriter) -> Result<(), FdtError> {
     Ok(())
 }
 
-fn create_psci_node(fdt: &mut FdtWriter) -> Result<(), FdtError> {
+fn create_psci_node(fdt: &mut FdtWriter, use_smc: bool) -> Result<(), FdtError> {
     let compatible = "arm,psci-0.2";
 
     let psci = fdt.begin_node("psci")?;
     fdt.property_string("compatible", compatible)?;
     // Two methods available: hvc and smc.
-    // As per documentation, PSCI calls between a guest and hypervisor may use the HVC conduit
-    // instead of SMC. So, since we are using kvm, we need to use hvc.
-    fdt.property_string("method", "hvc")?;
+    // When nested virtualization is enabled (guest has EL2), we MUST use SMC.
+    // HVC would trap to the guest's virtual EL2 which has no handler.
+    // SMC goes to the host's EL3 emulation (KVM's secure monitor) which handles PSCI.
+    // When nested virt is disabled, either method works, but we use HVC for compatibility.
+    let method = if use_smc { "smc" } else { "hvc" };
+    fdt.property_string("method", method)?;
     fdt.end_node(psci)?;
 
     Ok(())
@@ -576,6 +580,7 @@ mod tests {
             &device_manager,
             &gic,
             &None,
+            false, // nested_virt - false to match saved DTB
         )
         .unwrap();
     }
@@ -624,6 +629,7 @@ mod tests {
             &device_manager,
             &gic,
             &None,
+            false, // nested_virt - false to match saved DTB
         )
         .unwrap();
 
@@ -686,6 +692,7 @@ mod tests {
             &device_manager,
             &gic,
             &Some(initrd),
+            false, // nested_virt - false to match saved DTB
         )
         .unwrap();
 

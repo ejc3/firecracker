@@ -157,7 +157,11 @@ impl KvmVcpu {
         let mut mpidr = [0_u8; 8];
         match self.fd.get_one_reg(MPIDR_EL1, &mut mpidr) {
             Err(err) => Err(VcpuArchError::GetOneReg(MPIDR_EL1, err)),
-            Ok(_) => Ok(u64::from_le_bytes(mpidr)),
+            Ok(_) => {
+                let mpidr_val = u64::from_le_bytes(mpidr);
+                eprintln!("[NV2 DEBUG] get_mpidr: MPIDR_EL1 = {:#x} for vCPU {}", mpidr_val, self.index);
+                Ok(mpidr_val)
+            }
         }
     }
 
@@ -222,6 +226,21 @@ impl KvmVcpu {
             .map_err(KvmVcpuError::GetPreferredTarget)?;
         // We already checked that the capability is supported.
         kvi.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
+
+        // Enable nested virtualization with HAS_EL2 (bit 7).
+        // This enables full nested virt (vCPU has virtual EL2).
+        // Controlled by FCVM_NV2=1 environment variable for testing.
+        const KVM_ARM_VCPU_HAS_EL2: u32 = 7;
+        // HAS_EL2_E2H0 (bit 8) limits NV to nVHE mode by masking VHE from guest.
+        // Without this, the guest enables VHE in head.S causing timer trap storms.
+        const KVM_ARM_VCPU_HAS_EL2_E2H0: u32 = 8;
+        let enable_nv2 = std::env::var("FCVM_NV2").map(|v| v == "1").unwrap_or(false);
+        if enable_nv2 {
+            eprintln!("[NV2] Enabling HAS_EL2 + HAS_EL2_E2H0 (FCVM_NV2=1)");
+            kvi.features[0] |= (1 << KVM_ARM_VCPU_HAS_EL2) | (1 << KVM_ARM_VCPU_HAS_EL2_E2H0);
+        } else {
+            eprintln!("[NV2] HAS_EL2 disabled (set FCVM_NV2=1 to enable)");
+        }
 
         Ok(kvi)
     }
@@ -331,22 +350,113 @@ impl KvmVcpu {
         let kreg_off = offset_of!(kvm_regs, regs);
 
         // Get the register index of the PSTATE (Processor State) register.
+        // When nested virtualization is enabled (HAS_EL2), boot at EL2 so the guest
+        // kernel's is_hyp_mode_available() returns true.
         let pstate = offset_of!(user_pt_regs, pstate) + kreg_off;
         let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, pstate);
+        const KVM_ARM_VCPU_HAS_EL2: u32 = 7;
+        let has_el2 = (self.kvi.features[0] & (1 << KVM_ARM_VCPU_HAS_EL2)) != 0;
+        eprintln!("[NV2 DEBUG] setup_boot_regs called, kvi.features[0] = {:#x}, has_el2 = {}", self.kvi.features[0], has_el2);
+        // With HAS_EL2 + HAS_EL2_E2H0, boot at EL1h.
+        // The E2H0 flag forces nVHE mode, so the guest kernel won't try to enable VHE.
+        // This avoids the timer trap storm that happens when the guest enables VHE.
+        // Note: The "CPUs started in inconsistent modes" warning may still appear but
+        // the boot should complete since we're not enabling VHE.
+        let pstate_value = PSTATE_FAULT_BITS_64;
+        if has_el2 {
+            eprintln!("[NV2] Booting at EL1h with E2H0 (forced nVHE mode)");
+        }
         self.fd
-            .set_one_reg(id, &PSTATE_FAULT_BITS_64.to_le_bytes())
+            .set_one_reg(id, &pstate_value.to_le_bytes())
             .map_err(|err| {
-                VcpuArchError::SetOneReg(id, format!("{PSTATE_FAULT_BITS_64:#x}"), err)
+                VcpuArchError::SetOneReg(id, format!("{pstate_value:#x}"), err)
             })?;
+
+        // When HAS_EL2 is enabled, initialize EL2 system registers.
+        // Without this, timer accesses trap to the guest's virtual EL2, causing a hang.
+        if has_el2 {
+            // Initialize HCR_EL2 to control virtualization behavior.
+            // Critical: Do NOT set E2H (bit 34) - this forces the guest to use nVHE mode.
+            // VHE mode causes timer trapping issues with NV2.
+            // Set RW (bit 31) = 1: EL1 is AArch64
+            const HCR_EL2_RW: u64 = 1 << 31;
+            let hcr_value = HCR_EL2_RW;
+            eprintln!("[NV2] Setting HCR_EL2 = {:#x} (RW=1, E2H=0 to disable VHE)", hcr_value);
+            match self.fd.set_one_reg(SYS_HCR_EL2, &hcr_value.to_le_bytes()) {
+                Ok(_) => eprintln!("[NV2] HCR_EL2 set successfully"),
+                Err(ref e) => eprintln!("[NV2] HCR_EL2 set failed: {:?}", e),
+            }
+
+            // CNTHCTL_EL2: Allow physical timer access from EL1/EL0
+            // For non-VHE: bits 0,1 control EL1/EL0 access
+            // For VHE: bits 10,11 control EL1 access, bits 0,1 control EL0 access
+            // Set all relevant bits to be safe.
+            const CNTHCTL_EL2_EL1PCEN: u64 = 1 << 1;   // non-VHE: Allow EL1 physical timer access
+            const CNTHCTL_EL2_EL1PCTEN: u64 = 1 << 0;  // non-VHE: Allow EL1 physical counter access
+            const CNTHCTL_EL2_EL1PTEN: u64 = 1 << 11;  // VHE: Allow EL1 physical timer access
+            const CNTHCTL_EL2_EL1PCTEN_VHE: u64 = 1 << 10; // VHE: Allow EL1 physical counter access
+            let cnthctl_value = CNTHCTL_EL2_EL1PCEN | CNTHCTL_EL2_EL1PCTEN
+                              | CNTHCTL_EL2_EL1PTEN | CNTHCTL_EL2_EL1PCTEN_VHE;
+            eprintln!("[NV2] Setting CNTHCTL_EL2 = {:#x}", cnthctl_value);
+            match self.fd.set_one_reg(SYS_CNTHCTL_EL2, &cnthctl_value.to_le_bytes()) {
+                Ok(_) => eprintln!("[NV2] CNTHCTL_EL2 set successfully"),
+                Err(ref e) => eprintln!("[NV2] CNTHCTL_EL2 set failed: {:?}", e),
+            }
+            self.fd
+                .set_one_reg(SYS_CNTHCTL_EL2, &cnthctl_value.to_le_bytes())
+                .map_err(|err| {
+                    VcpuArchError::SetOneReg(SYS_CNTHCTL_EL2, format!("{cnthctl_value:#x}"), err)
+                })?;
+
+            // With HAS_EL2 (NV2), explicitly set VMPIDR_EL2 for the vCPU.
+            // KVM's NV2 implementation resets VMPIDR_EL2 to "unknown" (garbage values),
+            // causing the guest to read invalid MPIDR and fail to find boot CPU.
+            // VMPIDR_EL2 is what a nested guest sees when it reads MPIDR_EL1.
+            // Format: Aff3[39:32] | 1[31] | Aff2[23:16] | Aff1[15:8] | Aff0[7:0]
+            let expected_mpidr = 0x80000000u64 | (self.index as u64);
+            eprintln!("[NV2] Setting VMPIDR_EL2 = {:#x} for vCPU {}", expected_mpidr, self.index);
+            match self.fd.set_one_reg(SYS_VMPIDR_EL2, &expected_mpidr.to_le_bytes()) {
+                Ok(_) => eprintln!("[NV2] VMPIDR_EL2 set successfully"),
+                Err(ref e) => eprintln!("[NV2] VMPIDR_EL2 set failed: {:?}", e),
+            }
+
+            // Also set VPIDR_EL2 to the host's MIDR value.
+            // This is what a nested guest sees when it reads MIDR_EL1.
+            let mut midr_bytes = [0u8; 8];
+            match self.fd.get_one_reg(MIDR_EL1, &mut midr_bytes) {
+                Ok(_) => {
+                    let midr_value = u64::from_le_bytes(midr_bytes);
+                    eprintln!("[NV2] Setting VPIDR_EL2 = {:#x} (from host MIDR)", midr_value);
+                    match self.fd.set_one_reg(SYS_VPIDR_EL2, &midr_value.to_le_bytes()) {
+                        Ok(_) => eprintln!("[NV2] VPIDR_EL2 set successfully"),
+                        Err(ref e) => eprintln!("[NV2] VPIDR_EL2 set failed: {:?}", e),
+                    }
+                }
+                Err(ref e) => eprintln!("[NV2] Could not read MIDR_EL1: {:?}", e),
+            }
+        }
 
         // Other vCPUs are powered off initially awaiting PSCI wakeup.
         if self.index == 0 {
             // Setting the PC (Processor Counter) to the current program address (kernel address).
             let pc = offset_of!(user_pt_regs, pc) + kreg_off;
             let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, pc);
+            eprintln!("[NV2 DEBUG] Setting PC to boot_ip = {:#x}, reg_id = {:#x}", boot_ip, id);
             self.fd
                 .set_one_reg(id, &boot_ip.to_le_bytes())
                 .map_err(|err| VcpuArchError::SetOneReg(id, format!("{boot_ip:#x}"), err))?;
+            // Verify PC was set correctly by reading it back
+            let mut pc_readback = [0u8; 8];
+            self.fd.get_one_reg(id, &mut pc_readback).ok();
+            let pc_value = u64::from_le_bytes(pc_readback);
+            eprintln!("[NV2 DEBUG] PC set to {:#x}, readback = {:#x}", boot_ip, pc_value);
+            // Also read PSTATE to verify EL2h mode
+            let pstate_off = offset_of!(user_pt_regs, pstate) + kreg_off;
+            let pstate_id = arm64_core_reg_id!(KVM_REG_SIZE_U64, pstate_off);
+            let mut pstate_readback = [0u8; 8];
+            self.fd.get_one_reg(pstate_id, &mut pstate_readback).ok();
+            let pstate_val = u64::from_le_bytes(pstate_readback);
+            eprintln!("[NV2 DEBUG] PSTATE readback = {:#x} (expected {:#x} for EL2h)", pstate_val, pstate_value);
 
             // Last mandatory thing to set -> the address pointing to the FDT (also called DTB).
             // "The device tree blob (dtb) must be placed on an 8-byte boundary and must
