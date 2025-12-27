@@ -265,6 +265,11 @@ fn main_exec() -> Result<(), MainError> {
                 Argument::new("enable-pci")
                     .takes_value(false)
                     .help("Enables PCIe support."),
+            )
+            .arg(
+                Argument::new("enable-nv2")
+                    .takes_value(false)
+                    .help("Enables nested virtualization (ARM64 NV2)."),
             );
 
     arg_parser.parse_from_cmdline()?;
@@ -375,6 +380,7 @@ fn main_exec() -> Result<(), MainError> {
 
     let boot_timer_enabled = arguments.flag_present("boot-timer");
     let pci_enabled = arguments.flag_present("enable-pci");
+    let nv2_enabled = arguments.flag_present("enable-nv2");
     let api_enabled = !arguments.flag_present("no-api");
     let api_payload_limit = arg_parser
         .arguments()
@@ -429,6 +435,7 @@ fn main_exec() -> Result<(), MainError> {
             process_time_reporter,
             boot_timer_enabled,
             pci_enabled,
+            nv2_enabled,
             api_payload_limit,
             mmds_size_limit,
             metadata_json.as_deref(),
@@ -445,6 +452,7 @@ fn main_exec() -> Result<(), MainError> {
             instance_info,
             boot_timer_enabled,
             pci_enabled,
+            nv2_enabled,
             mmds_size_limit,
             metadata_json.as_deref(),
         )
@@ -570,6 +578,7 @@ fn build_microvm_from_json(
     instance_info: InstanceInfo,
     boot_timer_enabled: bool,
     pci_enabled: bool,
+    nv2_enabled: bool,
     mmds_size_limit: usize,
     metadata_json: Option<&str>,
 ) -> Result<Arc<Mutex<vmm::Vmm>>, BuildFromJsonError> {
@@ -578,6 +587,7 @@ fn build_microvm_from_json(
             .map_err(BuildFromJsonError::ParseFromJson)?;
     vm_resources.boot_timer = boot_timer_enabled;
     vm_resources.pci_enabled = pci_enabled;
+    vm_resources.nv2_enabled = nv2_enabled;
     let vmm = vmm::builder::build_and_boot_microvm(
         &instance_info,
         &vm_resources,
@@ -605,6 +615,7 @@ fn run_without_api(
     instance_info: InstanceInfo,
     bool_timer_enabled: bool,
     pci_enabled: bool,
+    nv2_enabled: bool,
     mmds_size_limit: usize,
     metadata_json: Option<&str>,
 ) -> Result<(), RunWithoutApiError> {
@@ -623,6 +634,7 @@ fn run_without_api(
         instance_info,
         bool_timer_enabled,
         pci_enabled,
+        nv2_enabled,
         mmds_size_limit,
         metadata_json,
     )

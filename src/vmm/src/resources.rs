@@ -133,8 +133,12 @@ pub struct VmResources {
     pub boot_timer: bool,
     /// Whether or not to use PCIe transport for VirtIO devices.
     pub pci_enabled: bool,
+
     /// Where serial console output should be written to
     pub serial_out_path: Option<PathBuf>,
+ 
+    /// Whether or not to enable nested virtualization (ARM64 NV2).
+    pub nv2_enabled: bool,
 }
 
 impl VmResources {
@@ -650,8 +654,11 @@ mod tests {
             entropy: Default::default(),
             pmem: Default::default(),
             pci_enabled: false,
+
             serial_out_path: None,
             memory_hotplug: Default::default(),
+ 
+            nv2_enabled: false,
         }
     }
 

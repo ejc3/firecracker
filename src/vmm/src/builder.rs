@@ -307,6 +307,7 @@ pub fn build_microvm_for_boot(
         entry_point,
         &initrd,
         boot_cmdline,
+        vm_resources.nv2_enabled,
     )?;
 
     let vmm = Vmm {
