@@ -11,10 +11,11 @@ use std::mem::offset_of;
 use kvm_bindings::*;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-#[allow(non_upper_case_globals)]
 /// PSR (Processor State Register) bits.
 /// Taken from arch/arm64/include/uapi/asm/ptrace.h.
+#[allow(non_upper_case_globals)]
 const PSR_MODE_EL1h: u64 = 0x0000_0005;
+#[allow(non_upper_case_globals)]
 const PSR_MODE_EL2h: u64 = 0x0000_0009;
 const PSR_F_BIT: u64 = 0x0000_0040;
 const PSR_I_BIT: u64 = 0x0000_0080;
