@@ -100,21 +100,26 @@ pub fn configure_system_for_boot(
 ) -> Result<(), ConfigurationError> {
     // If NV2 (nested virtualization) is enabled, add HAS_EL2 vcpu features.
     // HAS_EL2 (bit 7) enables virtual EL2 for the guest.
-    // HAS_EL2_E2H0 (bit 8) forces nVHE mode to avoid timer trap storms.
+    // Use HAS_EL2 WITHOUT HAS_EL2_E2H0 to enable VHE mode (E2H=1).
+    // VHE mode is required for recursive nested virtualization.
+    // The kernel's NV2 implementation requires E2H=1 for nested KVM to work.
+    // See: arch/arm64/kvm/config.c:236 - feat_nv2_e2h() requires !FEAT_E2H0
     let effective_template = if nv2_enabled {
         const KVM_ARM_VCPU_HAS_EL2: u32 = 7;
-        const KVM_ARM_VCPU_HAS_EL2_E2H0: u32 = 8;
         let nv2_features = VcpuFeatures {
             index: 0,
             bitmap: RegisterValueFilter {
-                filter: (1 << KVM_ARM_VCPU_HAS_EL2) | (1 << KVM_ARM_VCPU_HAS_EL2_E2H0),
-                value: (1 << KVM_ARM_VCPU_HAS_EL2) | (1 << KVM_ARM_VCPU_HAS_EL2_E2H0),
+                filter: 1 << KVM_ARM_VCPU_HAS_EL2,
+                value: 1 << KVM_ARM_VCPU_HAS_EL2,
             },
         };
+        eprintln!("[NV2 DEBUG] Enabling HAS_EL2 (bit 7) for VHE mode, filter={:#x}, value={:#x}",
+                  nv2_features.bitmap.filter, nv2_features.bitmap.value);
         let mut template = cpu_template.clone();
         template.vcpu_features.push(nv2_features);
         template
     } else {
+        eprintln!("[NV2 DEBUG] nv2_enabled=false, NOT enabling HAS_EL2");
         cpu_template.clone()
     };
 

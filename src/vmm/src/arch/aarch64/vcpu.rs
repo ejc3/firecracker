@@ -203,10 +203,14 @@ impl KvmVcpu {
     ///
     /// * `vm_fd` - The kvm `VmFd` for this microvm.
     pub fn init(&mut self, vcpu_features: &[VcpuFeatures]) -> Result<(), KvmVcpuError> {
+        eprintln!("[NV2 DEBUG] vcpu.init: kvi.features[0] before = {:#x}", self.kvi.features[0]);
         for feature in vcpu_features.iter() {
             let index = feature.index as usize;
+            eprintln!("[NV2 DEBUG] vcpu.init: applying feature index={}, filter={:#x}, value={:#x}",
+                      index, feature.bitmap.filter, feature.bitmap.value);
             self.kvi.features[index] = feature.bitmap.apply(self.kvi.features[index]);
         }
+        eprintln!("[NV2 DEBUG] vcpu.init: kvi.features[0] after = {:#x}", self.kvi.features[0]);
 
         self.init_vcpu()?;
         self.finalize_vcpu()?;
@@ -354,35 +358,23 @@ impl KvmVcpu {
                 VcpuArchError::SetOneReg(id, format!("{pstate_value:#x}"), err)
             })?;
 
-        // When HAS_EL2 is enabled, initialize EL2 system registers.
-        // Without this, timer accesses trap to the guest's virtual EL2, causing a hang.
+        // When HAS_EL2 is enabled, initialize EL2 system registers for VHE mode.
+        // For VHE (E2H=1), the guest kernel runs at EL2 and can use kvm-arm.mode=nested.
         if has_el2 {
-            // Initialize HCR_EL2 to control virtualization behavior.
-            // Critical: Do NOT set E2H (bit 34) - this forces the guest to use nVHE mode.
-            // VHE mode causes timer trapping issues with NV2.
-            // Set RW (bit 31) = 1: EL1 is AArch64
-            const HCR_EL2_RW: u64 = 1 << 31;
-            let hcr_value = HCR_EL2_RW;
+            // Set HCR_EL2 with E2H=1 for VHE mode.
+            // HCR_EL2.E2H (bit 34) enables VHE, allowing the guest kernel to run at EL2.
+            // This is required for kvm-arm.mode=nested to work in the guest.
+            const HCR_E2H: u64 = 1 << 34;
+            // Also set VM bit (bit 0) to enable stage-2 translation
+            const HCR_VM: u64 = 1 << 0;
+            // And TGE (bit 27) for EL0 exceptions to route to EL2
+            const HCR_TGE: u64 = 1 << 27;
+            let hcr_el2_value = HCR_E2H | HCR_VM | HCR_TGE;
+            eprintln!("[NV2 DEBUG] Setting HCR_EL2 = {:#x} (E2H=1 for VHE mode)", hcr_el2_value);
             self.fd
-                .set_one_reg(SYS_HCR_EL2, &hcr_value.to_le_bytes())
+                .set_one_reg(SYS_HCR_EL2, &hcr_el2_value.to_le_bytes())
                 .map_err(|err| {
-                    VcpuArchError::SetOneReg(SYS_HCR_EL2, format!("{hcr_value:#x}"), err)
-                })?;
-
-            // CNTHCTL_EL2: Allow physical timer access from EL1/EL0
-            // For non-VHE: bits 0,1 control EL1/EL0 access
-            // For VHE: bits 10,11 control EL1 access, bits 0,1 control EL0 access
-            // Set all relevant bits to be safe.
-            const CNTHCTL_EL2_EL1PCEN: u64 = 1 << 1;   // non-VHE: Allow EL1 physical timer access
-            const CNTHCTL_EL2_EL1PCTEN: u64 = 1 << 0;  // non-VHE: Allow EL1 physical counter access
-            const CNTHCTL_EL2_EL1PTEN: u64 = 1 << 11;  // VHE: Allow EL1 physical timer access
-            const CNTHCTL_EL2_EL1PCTEN_VHE: u64 = 1 << 10; // VHE: Allow EL1 physical counter access
-            let cnthctl_value = CNTHCTL_EL2_EL1PCEN | CNTHCTL_EL2_EL1PCTEN
-                              | CNTHCTL_EL2_EL1PTEN | CNTHCTL_EL2_EL1PCTEN_VHE;
-            self.fd
-                .set_one_reg(SYS_CNTHCTL_EL2, &cnthctl_value.to_le_bytes())
-                .map_err(|err| {
-                    VcpuArchError::SetOneReg(SYS_CNTHCTL_EL2, format!("{cnthctl_value:#x}"), err)
+                    VcpuArchError::SetOneReg(SYS_HCR_EL2, format!("{hcr_el2_value:#x}"), err)
                 })?;
 
             // With HAS_EL2 (NV2), explicitly set VMPIDR_EL2 for the vCPU.
