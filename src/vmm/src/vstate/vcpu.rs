@@ -479,6 +479,34 @@ fn handle_kvm_exit(
     peripherals: &mut Peripherals,
     emulation_result: Result<VcpuExit, errno::Error>,
 ) -> Result<VcpuEmulation, VcpuError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static EXIT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    // Log every 10000th exit to track activity without flooding
+    let count = EXIT_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count % 10000 == 0 {
+        debug!("[KVM_EXIT DEBUG] exit_count={} result={:?}", count, emulation_result);
+    }
+
+    // Log non-MMIO exits more prominently (these are less common and more interesting)
+    match &emulation_result {
+        Ok(VcpuExit::MmioRead(_, _)) | Ok(VcpuExit::MmioWrite(_, _)) => {}
+        Ok(exit) => {
+            info!("[KVM_EXIT] Non-MMIO exit: {:?}", exit);
+        }
+        Err(e) if e.errno() == libc::EAGAIN => {
+            // Log EAGAIN periodically
+            static EAGAIN_COUNT: AtomicU64 = AtomicU64::new(0);
+            let ec = EAGAIN_COUNT.fetch_add(1, Ordering::Relaxed);
+            if ec % 1000 == 0 {
+                debug!("[KVM_EXIT] EAGAIN count: {}", ec);
+            }
+        }
+        Err(e) => {
+            info!("[KVM_EXIT] Error exit: {:?}", e);
+        }
+    }
+
     match emulation_result {
         Ok(run) => match run {
             VcpuExit::MmioRead(addr, data) => {
