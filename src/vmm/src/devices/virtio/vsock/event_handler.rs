@@ -26,9 +26,47 @@ use std::fmt::Debug;
 ///   - forward the event to the backend; then
 ///   - again, attempt to fetch any incoming packets queued by the backend into virtio RX
 ///     buffers.
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use event_manager::{EventOps, Events, MutEventSubscriber};
 use log::{error, warn};
 use vmm_sys_util::epoll::EventSet;
+
+/// Global flag indicating NV2 nested virtualization is enabled.
+/// Set by `set_nv2_enabled(true)` when --enable-nv2 is passed.
+static NV2_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Set the NV2 enabled flag. Called during Firecracker initialization
+/// when --enable-nv2 is passed.
+pub fn set_nv2_enabled(enabled: bool) {
+    NV2_ENABLED.store(enabled, Ordering::SeqCst);
+}
+
+/// Issue a full system data synchronization barrier on ARM64 when NV2 is enabled.
+///
+/// Under nested virtualization (FEAT_NV2), the guest's writes to the virtqueue
+/// may not be visible to the host's mmap reads due to double Stage 2 translation.
+/// The DSB SY barrier ensures all guest writes are complete and visible before
+/// we read from the virtqueue.
+///
+/// This is needed because Firecracker reads virtqueues via userspace mmap, not
+/// the kernel vsock driver which has its own barrier (virtio_transport_rx_work).
+///
+/// Only executed when --enable-nv2 is passed, to avoid overhead in non-nested cases.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn nv2_cache_sync_barrier() {
+    if NV2_ENABLED.load(Ordering::Relaxed) {
+        // SAFETY: DSB SY is a read-only barrier instruction with no side effects
+        // other than ensuring memory ordering.
+        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) }
+    }
+}
+
+/// No-op on non-ARM architectures.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn nv2_cache_sync_barrier() {}
 
 use super::VsockBackend;
 use super::device::{EVQ_INDEX, RXQ_INDEX, TXQ_INDEX, Vsock};
@@ -60,6 +98,8 @@ where
             error!("Failed to get vsock rx queue event: {:?}", err);
             METRICS.rx_queue_event_fails.inc();
         } else if self.backend.has_pending_rx() {
+            // Ensure guest's writes to virtqueue descriptors are visible.
+            nv2_cache_sync_barrier();
             if self.process_rx().unwrap() {
                 used_queues.push(RXQ_INDEX.try_into().unwrap());
             }
@@ -80,6 +120,8 @@ where
             error!("Failed to get vsock tx queue event: {:?}", err);
             METRICS.tx_queue_event_fails.inc();
         } else {
+            // Ensure guest's writes to virtqueue are visible before we read.
+            nv2_cache_sync_barrier();
             if self.process_tx().unwrap() {
                 used_queues.push(TXQ_INDEX.try_into().unwrap());
             }
@@ -116,6 +158,8 @@ where
         // In particular, if `self.backend.send_pkt()` halted the TX queue processing (by
         // returning an error) at some point in the past, now is the time to try walking the
         // TX queue again.
+        // Ensure guest's writes to virtqueue are visible before we read.
+        nv2_cache_sync_barrier();
         if self.process_tx()? {
             used_queues.push(TXQ_INDEX.try_into().unwrap());
         }
