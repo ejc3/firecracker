@@ -323,3 +323,47 @@ fn test_issue_serial_hangup_anon_pipe_while_unregistered_stdin() {
     ev_count = event_manager.run_with_timeout(0).unwrap();
     assert_eq!(ev_count, 0);
 }
+
+/// Regression test for snapshot restore serial console fix.
+///
+/// After snapshot restore, `emulate_serial_init()` must re-enable serial
+/// interrupts. vm-superio's IER write handler only stores the value — it does
+/// NOT generate any interrupt. On x86_64, the guest 8250 driver uses
+/// interrupt-driven TX and waits for a THRE (Transmitter Holding Register
+/// Empty) interrupt before sending each byte. Without a DATA write to trigger
+/// `thr_empty_interrupt()`, the driver stalls permanently after restore.
+///
+/// The fix: `emulate_serial_init()` sets IER with both RDA and THRE bits,
+/// then writes to DATA_OFFSET to trigger the initial THRE interrupt via
+/// eventfd → KVM irqfd → guest IRQ 4.
+#[test]
+fn test_thre_interrupt_requires_data_write_after_ier() {
+    use vmm::devices::legacy::{IER_RDA_BIT, IER_RDA_OFFSET, IER_THR_EMPTY_BIT};
+
+    let intr_evt = EventFdTrigger::new(EventFd::new(libc::EFD_NONBLOCK).unwrap());
+    let mut serial = Serial::with_events(
+        intr_evt,
+        SerialEventsWrapper {
+            buffer_ready_event_fd: None,
+        },
+        SerialOut::Sink,
+    );
+
+    // Setting IER alone does NOT fire an interrupt — this is what the old
+    // emulate_serial_init() did, and why serial was broken after restore.
+    serial
+        .write(IER_RDA_OFFSET, IER_RDA_BIT | IER_THR_EMPTY_BIT)
+        .unwrap();
+    assert!(
+        serial.interrupt_evt().read().is_err(),
+        "IER write must not trigger interrupt (this was the bug:          emulate_serial_init only set IER, so no THRE interrupt ever fired)"
+    );
+
+    // Writing to DATA register triggers thr_empty_interrupt() which signals
+    // the eventfd. This is the fix: write DATA after setting IER.
+    serial.write(0, 0x0a).unwrap(); // DATA_OFFSET = 0
+    assert!(
+        serial.interrupt_evt().read().unwrap() > 0,
+        "DATA write with THRE enabled must signal eventfd (this is the fix:          eventfd → KVM irqfd → IRQ 4 → guest 8250 driver resumes TX)"
+    );
+}
