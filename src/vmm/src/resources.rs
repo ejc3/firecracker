@@ -155,6 +155,7 @@ pub struct VmResources {
     pub boot_timer: bool,
     /// Whether or not to use PCIe transport for VirtIO devices.
     pub pci_enabled: bool,
+
     /// Where serial console output should be written to
     pub serial_out_path: Option<PathBuf>,
     /// Optional rate limiter config for serial output.
@@ -163,6 +164,9 @@ pub struct VmResources {
     pub enclave: Option<EnclaveConfig>,
     /// Device passthrough configuration.
     pub device_passthrough: DevicePassthroughConfigs,
+
+    /// Whether or not to enable nested virtualization (ARM64 NV2).
+    pub nv2_enabled: bool,
 }
 
 impl VmResources {
@@ -846,11 +850,14 @@ mod tests {
             entropy: Default::default(),
             pmem: Default::default(),
             pci_enabled: false,
+
             serial_out_path: None,
             serial_rate_limiter_cfg: None,
             memory_hotplug: Default::default(),
             enclave: None,
             device_passthrough: Default::default(),
+
+            nv2_enabled: false,
         }
     }
 

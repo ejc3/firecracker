@@ -169,6 +169,7 @@ pub(crate) fn run_with_api(
     process_time_reporter: ProcessTimeReporter,
     boot_timer_enabled: bool,
     pci_enabled: bool,
+    nv2_enabled: bool,
     api_payload_limit: usize,
     mmds_size_limit: usize,
     metadata_json: Option<&str>,
@@ -239,6 +240,7 @@ pub(crate) fn run_with_api(
             instance_info,
             boot_timer_enabled,
             pci_enabled,
+            nv2_enabled,
             mmds_size_limit,
             metadata_json,
         )
@@ -252,6 +254,7 @@ pub(crate) fn run_with_api(
             &api_event_fd,
             boot_timer_enabled,
             pci_enabled,
+            nv2_enabled,
             mmds_size_limit,
             metadata_json,
         )
