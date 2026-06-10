@@ -435,9 +435,7 @@ impl KvmVcpu {
         };
         self.fd
             .set_one_reg(id, &pstate_value.to_le_bytes())
-            .map_err(|err| {
-                VcpuArchError::SetOneReg(id, format!("{pstate_value:#x}"), err)
-            })?;
+            .map_err(|err| VcpuArchError::SetOneReg(id, format!("{pstate_value:#x}"), err))?;
 
         // When HAS_EL2 is enabled, initialize EL2 system registers for VHE mode.
         // For VHE (E2H=1), the guest kernel runs at EL2 and can use kvm-arm.mode=nested.
@@ -462,7 +460,10 @@ impl KvmVcpu {
             // causing the guest to read invalid MPIDR and fail to find boot CPU.
             // VMPIDR_EL2 is what a nested guest sees when it reads MPIDR_EL1.
             // Format: Aff3[39:32] | 1[31] | Aff2[23:16] | Aff1[15:8] | Aff0[7:0]
-            let expected_mpidr = 0x80000000u64 | (self.index as u64);
+            // Pack the index like KVM's reset_mpidr: Aff0 holds at most 16
+            // CPUs (GICv3 limit), the rest goes in Aff1.
+            let idx = u64::from(self.index);
+            let expected_mpidr = 0x8000_0000u64 | (idx & 0xf) | (((idx >> 4) & 0xff) << 8);
             self.fd
                 .set_one_reg(SYS_VMPIDR_EL2, &expected_mpidr.to_le_bytes())
                 .map_err(|err| {
@@ -472,9 +473,9 @@ impl KvmVcpu {
             // Also set VPIDR_EL2 to the host's MIDR value.
             // This is what a nested guest sees when it reads MIDR_EL1.
             let mut midr_bytes = [0u8; 8];
-            self.fd.get_one_reg(MIDR_EL1, &mut midr_bytes).map_err(|err| {
-                VcpuArchError::GetOneReg(MIDR_EL1, err)
-            })?;
+            self.fd
+                .get_one_reg(MIDR_EL1, &mut midr_bytes)
+                .map_err(|err| VcpuArchError::GetOneReg(MIDR_EL1, err))?;
             let midr_value = u64::from_le_bytes(midr_bytes);
             self.fd
                 .set_one_reg(SYS_VPIDR_EL2, &midr_value.to_le_bytes())

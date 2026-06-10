@@ -237,6 +237,7 @@ pub fn configure_system_for_boot(
     entry_point: EntryPoint,
     initrd: &Option<InitrdConfig>,
     boot_cmdline: Cmdline,
+    _nv2_enabled: bool,
 ) -> Result<(), ConfigurationError> {
     configure_vcpus_for_boot(
         kvm,
