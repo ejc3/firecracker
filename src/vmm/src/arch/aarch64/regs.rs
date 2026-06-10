@@ -26,7 +26,8 @@ pub const PSTATE_FAULT_BITS_64: u64 = PSR_MODE_EL1h | PSR_A_BIT | PSR_F_BIT | PS
 /// PSTATE for EL2 boot (nested virtualization).
 /// When HAS_EL2 is enabled, the guest kernel should boot at EL2 so that
 /// `__boot_cpu_mode` is set correctly and `is_hyp_mode_available()` returns true.
-pub const PSTATE_FAULT_BITS_64_EL2: u64 = PSR_MODE_EL2h | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
+pub const PSTATE_FAULT_BITS_64_EL2: u64 =
+    PSR_MODE_EL2h | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
 
 /// Gets a core id.
 macro_rules! arm64_core_reg_id {

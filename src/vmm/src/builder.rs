@@ -327,13 +327,18 @@ pub fn build_microvm_for_boot(
     #[cfg(target_arch = "aarch64")]
     let counter_offset = {
         let offset = KvmVm::host_counter();
-        kvm_vm
-            .set_counter_offset(offset)
-            .map_err(crate::vstate::vm::VmError::Arch)
-            .map_err(StartMicrovmError::KvmVm)?;
-        offset
+        match kvm_vm.set_counter_offset(offset) {
+            Ok(()) => Some(offset),
+            // Kernels without KVM_CAP_COUNTER_OFFSET (< 6.4): keep the legacy
+            // host-based counter view; pause/resume will not freeze the clock.
+            Err(err) => {
+                log::warn!(
+                    "KVM_ARM_SET_COUNTER_OFFSET unavailable ({err}); guest clock                      will not freeze across pause/resume"
+                );
+                None
+            }
+        }
     };
-
 
     let vmm = Vmm {
         instance_info: instance_info.clone(),
@@ -425,9 +430,6 @@ pub enum BuildMicrovmFromSnapshotError {
     KvmAccess(#[from] vmm_sys_util::errno::Error),
     /// Error configuring the TSC, frequency not present in the given snapshot.
     TscFrequencyNotPresent,
-    #[cfg(target_arch = "aarch64")]
-    /// Saved CNTPCT_EL0 not present in the snapshot's vCPU registers.
-    MissingSavedCounter,
     #[cfg(target_arch = "x86_64")]
     /// Could not get TSC to check if TSC scaling was required with the snapshot: {0}
     GetTsc(#[from] crate::arch::GetTscError),
@@ -501,7 +503,10 @@ pub fn build_microvm_from_snapshot(
         }
     }
 
-
+    // Arm the NV2 vsock cache-coherency barriers for restored VMs too — the
+    // boot path sets this in build_microvm_for_boot, and a restored vEL2 guest
+    // needs the DSB SY barriers just as much as a fresh-booted one.
+    crate::devices::virtio::vsock::set_nv2_enabled(vm_resources.nv2_enabled);
 
     // Keep the guest's counter domain coherent across restore (the aarch64
     // analog of the TSC handling above): set the VM-wide counter offset so
@@ -519,11 +524,29 @@ pub fn build_microvm_from_snapshot(
             .regs
             .iter()
             .find(|reg| reg.id == CNTPCT_EL0_ID)
-            .map(|reg| reg.value::<u64, 8>())
-            .ok_or(BuildMicrovmFromSnapshotError::MissingSavedCounter)?;
-        let offset = KvmVm::host_counter().wrapping_sub(saved_cntpct);
-        vm.set_counter_offset(offset)?;
-        offset
+            .map(|reg| reg.value::<u64, 8>());
+        match saved_cntpct {
+            Some(saved) => {
+                let offset = KvmVm::host_counter().wrapping_sub(saved);
+                match vm.set_counter_offset(offset) {
+                    Ok(()) => Some(offset),
+                    Err(err) => {
+                        log::warn!(
+                            "KVM_ARM_SET_COUNTER_OFFSET unavailable ({err}); restored                              guest timers keep the legacy time-jump behavior"
+                        );
+                        None
+                    }
+                }
+            }
+            // Snapshot without a saved CNTPCT (foreign/ancient producer):
+            // restore with legacy semantics rather than failing the restore.
+            None => {
+                log::warn!(
+                    "snapshot has no saved CNTPCT_EL0; restored guest timers keep                      the legacy time-jump behavior"
+                );
+                None
+            }
+        }
     };
 
     // Restore vcpus kvm state.

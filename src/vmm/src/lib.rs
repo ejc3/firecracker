@@ -314,9 +314,11 @@ pub struct Vmm {
     /// VMM. Set at boot and restore; advanced across pause/resume so the guest
     /// clock freezes while the VM is paused instead of jumping forward, which
     /// would leave timer CVALs in the past (for HAS_EL2 guests the emulated
-    /// EL1 timers then storm, starving the vCPUs).
+    /// EL1 timers then storm, starving the vCPUs). `None` when the kernel does
+    /// not support KVM_CAP_COUNTER_OFFSET (pre-6.4) — the clock then keeps the
+    /// legacy jump-forward behavior.
     #[cfg(target_arch = "aarch64")]
-    pub counter_offset: u64,
+    pub counter_offset: Option<u64>,
     /// Host counter captured when the VM was paused, used to advance
     /// `counter_offset` on resume.
     #[cfg(target_arch = "aarch64")]
@@ -485,13 +487,15 @@ impl Vmm {
         // CVALs in the past — for HAS_EL2 guests KVM's emulated EL1 timers
         // then fire in a storm that starves the vCPUs).
         #[cfg(target_arch = "aarch64")]
-        if let Some(paused_at) = self.paused_at_counter.take() {
+        if let (Some(paused_at), Some(offset)) =
+            (self.paused_at_counter.take(), self.counter_offset)
+        {
             let delta = crate::vstate::vm::KvmVm::host_counter().wrapping_sub(paused_at);
-            let new_offset = self.counter_offset.wrapping_add(delta);
+            let new_offset = offset.wrapping_add(delta);
             kvm_vm
                 .set_counter_offset(new_offset)
                 .map_err(VmmError::SetCounterOffset)?;
-            self.counter_offset = new_offset;
+            self.counter_offset = Some(new_offset);
         }
 
         self.device_manager.kick_virtio_devices();
@@ -511,7 +515,7 @@ impl Vmm {
         // Freeze the guest clock: capture the host counter so resume_vm() can
         // advance the VM counter offset by the pause duration.
         #[cfg(target_arch = "aarch64")]
-        {
+        if self.paused_at_counter.is_none() {
             self.paused_at_counter = Some(crate::vstate::vm::KvmVm::host_counter());
         }
 

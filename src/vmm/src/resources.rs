@@ -674,7 +674,7 @@ mod tests {
             serial_out_path: None,
             serial_rate_limiter_cfg: None,
             memory_hotplug: Default::default(),
- 
+
             nv2_enabled: false,
         }
     }

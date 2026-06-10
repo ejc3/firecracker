@@ -114,8 +114,8 @@
                 "comment": "sigaltstack is used by Rust stdlib to remove alternative signal stack during thread teardown."
             },
             {
-              "syscall": "getrandom",
-              "comment": "getrandom is used by aws-lc library which we consume in virtio-rng"
+                "syscall": "getrandom",
+                "comment": "getrandom is used by aws-lc library which we consume in virtio-rng"
             },
             {
                 "syscall": "accept4",
@@ -217,7 +217,7 @@
             },
             {
                 "syscall": "madvise",
-                "comment": "Used by the VirtIO balloon device and by musl for some customer workloads. It is also used by aws-lc during random number generation. They setup a memory page that mark with MADV_WIPEONFORK to be able to detect forks. They also call it with -1 to see if madvise is supported in certain platforms." 
+                "comment": "Used by the VirtIO balloon device and by musl for some customer workloads. It is also used by aws-lc during random number generation. They setup a memory page that mark with MADV_WIPEONFORK to be able to detect forks. They also call it with -1 to see if madvise is supported in certain platforms."
             },
             {
                 "syscall": "msync",
@@ -246,7 +246,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -266,7 +268,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -286,7 +290,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -306,7 +312,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -326,7 +334,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -346,7 +356,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -366,7 +378,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -707,9 +721,24 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "KVM_ARM_SET_COUNTER_OFFSET, used to keep the guest counter coherent across pause/resume",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074835125,
+                        "comment": "KVM_ARM_SET_COUNTER_OFFSET"
                     }
                 ]
             }
@@ -784,8 +813,8 @@
                 "comment": "sigaltstack is used by Rust stdlib to remove alternative signal stack during thread teardown."
             },
             {
-              "syscall": "getrandom",
-              "comment": "getrandom is used by `HttpServer` to reinialize `HashMap` after moving to the API thread"
+                "syscall": "getrandom",
+                "comment": "getrandom is used by `HttpServer` to reinialize `HashMap` after moving to the API thread"
             },
             {
                 "syscall": "accept4",
@@ -905,7 +934,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -925,7 +956,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -1157,7 +1190,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
