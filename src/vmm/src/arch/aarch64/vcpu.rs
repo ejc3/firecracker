@@ -248,6 +248,20 @@ impl KvmVcpu {
 
         state.pvtime_ipa = self.pvtime_ipa.map(|guest_addr| guest_addr.0);
 
+        // Debug instrumentation: dump every saved register so two snapshots can be
+        // diffed offline (fresh-boot vs restored). Gated by FC_DEBUG_REG_DUMP.
+        if std::env::var("FC_DEBUG_REG_DUMP").is_ok() {
+            let hex =
+                |b: &[u8]| -> String { b.iter().rev().map(|x| format!("{:02x}", x)).collect() };
+            for reg in state.regs.iter() {
+                eprintln!(
+                    "[REG-DUMP] vcpu{} id={:#018x} val=0x{}",
+                    self.index,
+                    reg.id,
+                    hex(reg.as_slice())
+                );
+            }
+        }
 
         Ok(state)
     }
@@ -289,6 +303,63 @@ impl KvmVcpu {
                 .map_err(KvmVcpuError::RestoreState)?;
         }
 
+        // Debug instrumentation: verify every restored register reads back with the
+        // value we wrote, and diff the saved register list against the current
+        // KVM_GET_REG_LIST. Gated by FC_DEBUG_REG_DIFF.
+        if std::env::var("FC_DEBUG_REG_DIFF").is_ok() {
+            let hex =
+                |b: &[u8]| -> String { b.iter().rev().map(|x| format!("{:02x}", x)).collect() };
+            let mut mismatches = 0u32;
+            for reg in state
+                .regs
+                .iter()
+                .filter(|reg| reg.id != KVM_REG_ARM64_SVE_VLS)
+            {
+                let saved = reg.as_slice();
+                let mut now = vec![0u8; saved.len()];
+                match self.fd.get_one_reg(reg.id, &mut now) {
+                    Ok(_) => {
+                        if now.as_slice() != saved {
+                            mismatches += 1;
+                            eprintln!(
+                                "[REG-DIFF] vcpu{} id={:#018x} saved=0x{} now=0x{}",
+                                self.index,
+                                reg.id,
+                                hex(saved),
+                                hex(&now)
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "[REG-DIFF] vcpu{} id={:#018x} GET failed: {}",
+                        self.index, reg.id, e
+                    ),
+                }
+            }
+            eprintln!(
+                "[REG-DIFF] vcpu{} total_saved_regs={} readback_mismatches={}",
+                self.index,
+                state.regs.len(),
+                mismatches
+            );
+            if let Ok(now_ids) = self.get_all_registers_ids() {
+                let saved_ids: std::collections::HashSet<u64> =
+                    state.regs.iter().map(|r| r.id).collect();
+                let now_set: std::collections::HashSet<u64> = now_ids.iter().copied().collect();
+                for id in saved_ids.difference(&now_set) {
+                    eprintln!(
+                        "[REG-DIFF] vcpu{} saved-but-not-listed id={:#018x}",
+                        self.index, id
+                    );
+                }
+                for id in now_set.difference(&saved_ids) {
+                    eprintln!(
+                        "[REG-DIFF] vcpu{} listed-but-not-saved id={:#018x}",
+                        self.index, id
+                    );
+                }
+            }
+        }
 
         Ok(())
     }

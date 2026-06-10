@@ -376,6 +376,19 @@ pub fn build_microvm_for_boot(
         boot_cmdline,
         vm_resources.nv2_enabled,
     )?;
+    // Own the guest counter domain from the start: zero-base CNTPCT/CNTVCT via
+    // the VM-wide counter offset so pause/resume can freeze the guest clock
+    // (see Vmm::pause_vm/resume_vm). Without an owned offset there is no way
+    // to advance it by the pause duration later.
+    #[cfg(target_arch = "aarch64")]
+    let counter_offset = {
+        let offset = KvmVm::host_counter();
+        kvm_vm
+            .set_counter_offset(offset)
+            .map_err(crate::vstate::vm::VmError::Arch)
+            .map_err(StartMicrovmError::KvmVm)?;
+        offset
+    };
 
 
     let vmm = Vmm {
@@ -386,6 +399,10 @@ pub fn build_microvm_for_boot(
         vm,
         device_manager,
         can_create_diff_snapshots: true,
+        #[cfg(target_arch = "aarch64")]
+        counter_offset,
+        #[cfg(target_arch = "aarch64")]
+        paused_at_counter: None,
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -456,6 +473,9 @@ pub enum BuildMicrovmFromSnapshotError {
     KvmAccess(#[from] vmm_sys_util::errno::Error),
     /// Error configuring the TSC, frequency not present in the given snapshot.
     TscFrequencyNotPresent,
+    #[cfg(target_arch = "aarch64")]
+    /// Saved CNTPCT_EL0 not present in the snapshot's vCPU registers.
+    MissingSavedCounter,
     #[cfg(target_arch = "x86_64")]
     /// Could not get TSC to check if TSC scaling was required with the snapshot: {0}
     GetTsc(#[from] crate::arch::GetTscError),
@@ -573,6 +593,29 @@ pub fn build_microvm_from_snapshot(
 
 
 
+    // Keep the guest's counter domain coherent across restore (the aarch64
+    // analog of the TSC handling above): set the VM-wide counter offset so
+    // CNTPCT/CNTVCT continue from their snapshotted values. This must
+    // happen BEFORE the register replay below — it flips
+    // KVM_ARCH_FLAG_VM_COUNTER_OFFSET, which stops the CNTVCT/CNTPCT
+    // SET_ONE_REG handlers from adjusting per-timer offsets that the later
+    // CNTVOFF_EL2 replay would clobber (HAS_EL2 guests), leaving the
+    // emulated EL1 timers expired-in-the-past and the vCPUs in a
+    // timer-interrupt storm.
+    #[cfg(target_arch = "aarch64")]
+    let counter_offset = {
+        const CNTPCT_EL0_ID: u64 = 0x6030_0000_0013_df01;
+        let saved_cntpct = microvm_state.vcpu_states[0]
+            .regs
+            .iter()
+            .find(|reg| reg.id == CNTPCT_EL0_ID)
+            .map(|reg| reg.value::<u64, 8>())
+            .ok_or(BuildMicrovmFromSnapshotError::MissingSavedCounter)?;
+        let offset = KvmVm::host_counter().wrapping_sub(saved_cntpct);
+        vm.set_counter_offset(offset)?;
+        offset
+    };
+
     // Restore vcpus kvm state.
     for (vcpu, state) in vcpus.iter_mut().zip(microvm_state.vcpu_states.iter()) {
         vcpu.kvm_vcpu
@@ -632,6 +675,10 @@ pub fn build_microvm_from_snapshot(
         vm,
         device_manager,
         can_create_diff_snapshots: true,
+        #[cfg(target_arch = "aarch64")]
+        counter_offset,
+        #[cfg(target_arch = "aarch64")]
+        paused_at_counter: None,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -1054,6 +1101,10 @@ pub(crate) mod tests {
             vm: Vm::Kvm(Arc::new(vm)),
             device_manager: default_device_manager(),
             can_create_diff_snapshots: true,
+            #[cfg(target_arch = "aarch64")]
+            counter_offset: 0,
+            #[cfg(target_arch = "aarch64")]
+            paused_at_counter: None,
         }
     }
 
