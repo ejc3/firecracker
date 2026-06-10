@@ -219,6 +219,9 @@ pub enum VmmError {
     #[cfg(target_arch = "aarch64")]
     /// Invalid command line error.
     Cmdline,
+    #[cfg(target_arch = "aarch64")]
+    /// Failed to set guest counter offset: {0}
+    SetCounterOffset(crate::vstate::vm::KvmVmError),
     /// Device manager error: {0}
     DeviceManager(#[from] device_manager::DeviceManagerCreateError),
     /// MMIO Device manager error: {0}
@@ -307,6 +310,17 @@ pub struct Vmm {
     pub vm: Vm,
     // Device manager
     device_manager: DeviceManager,
+    /// VM-wide guest counter offset (KVM_ARM_SET_COUNTER_OFFSET) owned by this
+    /// VMM. Set at boot and restore; advanced across pause/resume so the guest
+    /// clock freezes while the VM is paused instead of jumping forward, which
+    /// would leave timer CVALs in the past (for HAS_EL2 guests the emulated
+    /// EL1 timers then storm, starving the vCPUs).
+    #[cfg(target_arch = "aarch64")]
+    pub counter_offset: u64,
+    /// Host counter captured when the VM was paused, used to advance
+    /// `counter_offset` on resume.
+    #[cfg(target_arch = "aarch64")]
+    paused_at_counter: Option<u64>,
 }
 
 impl Vmm {
@@ -464,6 +478,22 @@ impl Vmm {
             .vm
             .as_kvm()
             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
+
+        // Advance the VM counter offset by the pause duration BEFORE the vCPUs
+        // run again, so the guest clock continues from where it stopped rather
+        // than jumping forward by the pause duration (which leaves armed timer
+        // CVALs in the past — for HAS_EL2 guests KVM's emulated EL1 timers
+        // then fire in a storm that starves the vCPUs).
+        #[cfg(target_arch = "aarch64")]
+        if let Some(paused_at) = self.paused_at_counter.take() {
+            let delta = crate::vstate::vm::KvmVm::host_counter().wrapping_sub(paused_at);
+            let new_offset = self.counter_offset.wrapping_add(delta);
+            kvm_vm
+                .set_counter_offset(new_offset)
+                .map_err(VmmError::SetCounterOffset)?;
+            self.counter_offset = new_offset;
+        }
+
         self.device_manager.kick_virtio_devices();
         kvm_vm.resume_vcpus()?;
         self.instance_info.state = VmState::Running;
@@ -477,6 +507,14 @@ impl Vmm {
             .as_kvm()
             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
         kvm_vm.pause_vcpus()?;
+
+        // Freeze the guest clock: capture the host counter so resume_vm() can
+        // advance the VM counter offset by the pause duration.
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.paused_at_counter = Some(crate::vstate::vm::KvmVm::host_counter());
+        }
+
         self.instance_info.state = VmState::Paused;
         Ok(())
     }
