@@ -253,6 +253,10 @@ pub fn build_microvm_for_boot(
         event_manager,
     )?;
 
+    // Set NV2 flag for vsock DSB barriers before attaching vsock device
+    #[cfg(target_arch = "aarch64")]
+    crate::devices::virtio::vsock::set_nv2_enabled(vm_resources.nv2_enabled);
+
     if let Some(unix_vsock) = vm_resources.vsock.get() {
         attach_unixsock_vsock_device(
             &mut device_manager,
@@ -314,7 +318,9 @@ pub fn build_microvm_for_boot(
         entry_point,
         &initrd,
         boot_cmdline,
+        vm_resources.nv2_enabled,
     )?;
+
 
     let vmm = Vmm {
         instance_info: instance_info.clone(),
@@ -474,6 +480,8 @@ pub fn build_microvm_from_snapshot(
             }
         }
     }
+
+
 
     // Restore vcpus kvm state.
     for (vcpu, state) in vcpus.iter_mut().zip(microvm_state.vcpu_states.iter()) {

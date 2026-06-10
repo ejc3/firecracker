@@ -25,8 +25,9 @@ use linux_loader::loader::{Cmdline, KernelLoader};
 use vm_memory::{GuestMemoryError, GuestMemoryRegion};
 
 use crate::arch::{BootProtocol, EntryPoint, arch_memory_regions_with_gap};
+use crate::cpu_config::aarch64::custom_cpu_template::VcpuFeatures;
 use crate::cpu_config::aarch64::{CpuConfiguration, CpuConfigurationError};
-use crate::cpu_config::templates::CustomCpuTemplate;
+use crate::cpu_config::templates::{CustomCpuTemplate, RegisterValueFilter};
 use crate::initrd::InitrdConfig;
 use zerocopy::IntoBytes;
 
@@ -101,12 +102,35 @@ pub fn configure_system_for_boot(
     entry_point: EntryPoint,
     initrd: &Option<InitrdConfig>,
     boot_cmdline: Cmdline,
+    nv2_enabled: bool,
 ) -> Result<(), ConfigurationError> {
+    // If NV2 (nested virtualization) is enabled, add HAS_EL2 vcpu features.
+    // HAS_EL2 (bit 7) enables virtual EL2 for the guest.
+    // Use HAS_EL2 WITHOUT HAS_EL2_E2H0 to enable VHE mode (E2H=1).
+    // VHE mode is required for recursive nested virtualization.
+    // The kernel's NV2 implementation requires E2H=1 for nested KVM to work.
+    // See: arch/arm64/kvm/config.c:236 - feat_nv2_e2h() requires !FEAT_E2H0
+    let effective_template = if nv2_enabled {
+        const KVM_ARM_VCPU_HAS_EL2: u32 = 7;
+        let nv2_features = VcpuFeatures {
+            index: 0,
+            bitmap: RegisterValueFilter {
+                filter: 1 << KVM_ARM_VCPU_HAS_EL2,
+                value: 1 << KVM_ARM_VCPU_HAS_EL2,
+            },
+        };
+        let mut template = cpu_template.clone();
+        template.vcpu_features.push(nv2_features);
+        template
+    } else {
+        cpu_template.clone()
+    };
+
     // Construct the base CpuConfiguration to apply CPU template onto.
-    let cpu_config = CpuConfiguration::new(cpu_template, vcpus)?;
+    let cpu_config = CpuConfiguration::new(&effective_template, vcpus)?;
 
     // Apply CPU template to the base CpuConfiguration.
-    let cpu_config = CpuConfiguration::apply_template(cpu_config, cpu_template);
+    let cpu_config = CpuConfiguration::apply_template(cpu_config, &effective_template);
 
     let vcpu_config = VcpuConfig {
         vcpu_count: machine_config.vcpu_count,
@@ -138,6 +162,9 @@ pub fn configure_system_for_boot(
         .as_cstring()
         .expect("Cannot create cstring from cmdline string");
 
+    // Enable SMC for PSCI when nested virtualization is enabled (HAS_EL2).
+    // With nested virt, HVC traps to the guest's virtual EL2 which has no handler.
+    // SMC goes to KVM's secure monitor emulation which handles PSCI correctly.
     let fdt = fdt::create_fdt(
         vm.guest_memory(),
         vcpu_mpidr,
@@ -145,6 +172,7 @@ pub fn configure_system_for_boot(
         device_manager,
         vm.get_irqchip(),
         initrd,
+        nv2_enabled,
     )?;
 
     let fdt_address = GuestAddress(get_fdt_addr(vm.guest_memory()));
