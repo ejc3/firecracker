@@ -484,7 +484,7 @@ pub(crate) mod tests {
         GuestMemoryMmap::from_regions(
             memory::create(
                 regions.iter().copied(),
-                libc::MAP_PRIVATE,
+                libc::MAP_NORESERVE | libc::MAP_PRIVATE,
                 Some(file),
                 false,
             )

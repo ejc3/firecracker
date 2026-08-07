@@ -457,7 +457,13 @@ impl GuestMemoryRegion for GuestRegionMmapExt {
     }
 }
 
-/// Creates a `Vec` of `GuestRegionMmap` with the given configuration
+/// Creates a `Vec` of `GuestRegionMmap` with the given configuration.
+///
+/// `mmap_flags` are passed through verbatim; callers that want overcommit-friendly
+/// mappings must include `MAP_NORESERVE` themselves. (Reserving matters for hugetlbfs
+/// mappings: without `MAP_NORESERVE` the kernel reserves the full private range at mmap
+/// time, so an unservable mapping fails here with `ENOMEM` instead of the guest dying
+/// from a SIGBUS on a copy-on-write fault later.)
 pub fn create(
     regions: impl Iterator<Item = (GuestAddress, usize)>,
     mmap_flags: libc::c_int,
@@ -473,7 +479,7 @@ pub fn create(
                 track_dirty_pages.then(|| AtomicBitmap::with_len(size)),
             )
             .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
-            .with_mmap_flags(libc::MAP_NORESERVE | mmap_flags);
+            .with_mmap_flags(mmap_flags);
 
             if let Some(ref file) = file {
                 let file_offset = FileOffset::from_arc(Arc::clone(file), offset);
@@ -509,7 +515,7 @@ pub fn memfd_backed(
 
     create(
         regions.iter().copied(),
-        libc::MAP_SHARED | huge_pages.mmap_flags(),
+        libc::MAP_NORESERVE | libc::MAP_SHARED | huge_pages.mmap_flags(),
         Some(memfd_file),
         track_dirty_pages,
     )
@@ -523,7 +529,7 @@ pub fn anonymous(
 ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
     create(
         regions,
-        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | huge_pages.mmap_flags(),
+        libc::MAP_NORESERVE | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | huge_pages.mmap_flags(),
         None,
         track_dirty_pages,
     )
@@ -531,10 +537,19 @@ pub fn anonymous(
 
 /// Creates a GuestMemoryMmap given a `file` containing the data
 /// and a `state` containing mapping information.
+///
+/// With `reserve` set, `MAP_NORESERVE` is omitted so the kernel reserves backing for the
+/// full private range at mmap time. This matters for hugetlbfs files (the UffdMinor
+/// backend): hugetlb pages are neither swappable nor reclaimable, so an over-committed
+/// `MAP_NORESERVE` mapping turns pool exhaustion into a SIGBUS on the first
+/// copy-on-write fault of a *running* guest. Reserving instead fails the mmap here with
+/// `ENOMEM` — a clean, reportable restore error — and guarantees an admitted guest can
+/// always complete its CoW faults.
 pub fn snapshot_file(
     file: File,
     regions: impl Iterator<Item = (GuestAddress, usize)>,
     track_dirty_pages: bool,
+    reserve: bool,
 ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
     let regions: Vec<_> = regions.collect();
     let memory_size = regions
@@ -551,7 +566,11 @@ pub fn snapshot_file(
 
     create(
         regions.into_iter(),
-        libc::MAP_PRIVATE,
+        if reserve {
+            libc::MAP_PRIVATE
+        } else {
+            libc::MAP_NORESERVE | libc::MAP_PRIVATE
+        },
         Some(file),
         track_dirty_pages,
     )
@@ -870,7 +889,7 @@ mod tests {
 
             let regions = vec![(GuestAddress(0), page_size)];
             let guest_regions =
-                snapshot_file(file, regions.into_iter(), dirty_page_tracking).unwrap();
+                snapshot_file(file, regions.into_iter(), dirty_page_tracking, false).unwrap();
             assert_eq!(guest_regions.len(), 1);
             guest_regions.iter().for_each(|region| {
                 assert_eq!(region.bitmap().is_some(), dirty_page_tracking);
@@ -891,7 +910,7 @@ mod tests {
             (GuestAddress(0x10000), page_size),
             (GuestAddress(0x20000), page_size),
         ];
-        let guest_regions = snapshot_file(file, regions.into_iter(), false).unwrap();
+        let guest_regions = snapshot_file(file, regions.into_iter(), false, false).unwrap();
         assert_eq!(guest_regions.len(), 3);
     }
 
@@ -903,7 +922,7 @@ mod tests {
         file.write_all(&vec![0x42u8; page_size]).unwrap();
 
         let regions = vec![(GuestAddress(0), 2 * page_size)];
-        let result = snapshot_file(file, regions.into_iter(), false);
+        let result = snapshot_file(file, regions.into_iter(), false, false);
         assert!(matches!(result.unwrap_err(), MemoryError::OffsetTooLarge));
     }
 
@@ -1093,8 +1112,9 @@ mod tests {
         let mut memory_file = TempFile::new().unwrap().into_file();
         guest_memory.dump(&mut memory_file).unwrap();
 
-        let restored_guest_memory =
-            into_region_ext(snapshot_file(memory_file, memory_state.regions(), false).unwrap());
+        let restored_guest_memory = into_region_ext(
+            snapshot_file(memory_file, memory_state.regions(), false, false).unwrap(),
+        );
 
         // Check that the region contents are the same.
         let mut restored_region = vec![0u8; page_size * 2];
@@ -1153,7 +1173,7 @@ mod tests {
 
         // We can restore from this because this is the first dirty dump.
         let restored_guest_memory =
-            into_region_ext(snapshot_file(file, memory_state.regions(), false).unwrap());
+            into_region_ext(snapshot_file(file, memory_state.regions(), false, false).unwrap());
 
         // Check that the region contents are the same.
         let mut restored_region = vec![0u8; region_size];
@@ -1306,6 +1326,7 @@ mod tests {
                 memory_file,
                 std::iter::once((GuestAddress(0), 2 * page_size)),
                 false,
+                false,
             )
             .unwrap(),
         );
@@ -1375,9 +1396,7 @@ mod tests {
         let region1_data = vec![0xAAu8; region_size];
         let region2_data = vec![0xBBu8; region_size];
         guest_memory.write(&region1_data, region_1_address).unwrap();
-        guest_memory
-            .write(&region2_data, region_2_address)
-            .unwrap();
+        guest_memory.write(&region2_data, region_2_address).unwrap();
 
         // Reset Firecracker's internal bitmap (the writes above marked everything dirty)
         guest_memory.reset_dirty();
@@ -1410,9 +1429,7 @@ mod tests {
         file.seek(SeekFrom::Start(region_size as u64)).unwrap();
         file.read_exact(&mut dirty_region2).unwrap();
 
-        full_file
-            .seek(SeekFrom::Start(region_size as u64))
-            .unwrap();
+        full_file.seek(SeekFrom::Start(region_size as u64)).unwrap();
         full_file.read_exact(&mut full_region2).unwrap();
 
         assert_eq!(

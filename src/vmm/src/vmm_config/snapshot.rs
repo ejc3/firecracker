@@ -25,12 +25,24 @@ pub enum SnapshotType {
 /// 1) A file that contains the guest memory to be loaded,
 /// 2) An UDS where a custom page-fault handler process is listening for the UFFD set up by
 ///    Firecracker to handle its guest memory page faults.
+/// 3) An UDS over which a handler process first hands Firecracker a shared backing file
+///    (typically a memfd) for the guest memory and then serves *minor* faults on it.
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 pub enum MemBackendType {
     /// Guest memory contents will be loaded from a file.
     File,
     /// Guest memory will be served through UFFD by a separate process.
     Uffd,
+    /// Guest memory is mapped `MAP_PRIVATE` over a backing file received from the handler
+    /// over the UDS, and the resulting userfaultfd is registered in
+    /// `UFFDIO_REGISTER_MODE_MINOR` so the handler resolves faults with `UFFDIO_CONTINUE`.
+    ///
+    /// Every microVM restored from the same handler maps the *same* inode, so clean guest
+    /// pages are shared through the page cache across all of them (one physical copy), and
+    /// the first guest write to a page takes an ordinary copy-on-write fault into private
+    /// memory. Unlike [`MemBackendType::Uffd`] (anonymous memory + `UFFDIO_COPY`), which
+    /// gives every microVM its own private copy of every faulted page.
+    UffdMinor,
 }
 
 /// Stores the configuration that will be used for creating a snapshot.
