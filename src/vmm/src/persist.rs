@@ -431,6 +431,13 @@ pub fn restore_from_snapshot(
             vm_resources.machine_config.huge_pages,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
+        MemBackendType::UffdMinor => guest_memory_from_uffd_minor(
+            mem_backend_path,
+            mem_state,
+            track_dirty_pages,
+            vm_resources.machine_config.huge_pages,
+        )
+        .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
     };
     builder::build_microvm_from_snapshot(
         instance_info,
@@ -481,7 +488,14 @@ fn guest_memory_from_file(
     track_dirty_pages: bool,
 ) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromFileError> {
     let mem_file = File::open(mem_file_path)?;
-    let guest_mem = memory::snapshot_file(mem_file, mem_state.regions(), track_dirty_pages)?;
+    let guest_mem = memory::snapshot_file(
+        mem_file,
+        mem_state.regions(),
+        track_dirty_pages,
+        // Overcommit-friendly, as before: 4K file pages are reclaimable page cache, so
+        // there is no SIGBUS cliff to guard against.
+        false,
+    )?;
     Ok(guest_mem)
 }
 
@@ -498,6 +512,8 @@ pub enum GuestMemoryFromUffdError {
     Connect(#[from] std::io::Error),
     /// Failed to sends file descriptor: {0}
     Send(#[from] vmm_sys_util::errno::Error),
+    /// The UFFD handler did not send a guest memory backing file descriptor.
+    NoBackingFile,
 }
 
 fn guest_memory_from_uffd(
@@ -529,7 +545,104 @@ fn guest_memory_from_uffd(
             .map_err(GuestMemoryFromUffdError::Register)?;
     }
 
-    send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
+    let socket = UnixStream::connect(mem_uds_path)?;
+    send_uffd_handshake(socket, &backend_mappings, &uffd)?;
+
+    Ok((guest_memory, Some(uffd)))
+}
+
+/// Restores guest memory by mapping a *shared backing file* `MAP_PRIVATE` and letting the
+/// handler resolve minor faults on it with `UFFDIO_CONTINUE`.
+///
+/// Protocol (all over the single connection to `mem_uds_path`):
+/// 1. Firecracker connects.
+/// 2. The handler immediately sends one message carrying the backing file descriptor
+///    (`SCM_RIGHTS`). The file holds the snapshot's guest memory at the same offsets the
+///    memory snapshot file uses, i.e. regions laid out back to back in `mem_state` order.
+/// 3. Firecracker maps every guest memory region `MAP_PRIVATE` over that fd
+///    (`MAP_NORESERVE` for shmem; hugetlbfs backings reserve their full range so pool
+///    exhaustion is a clean `ENOMEM` here instead of a SIGBUS at CoW time — see below),
+///    registers each region with a userfaultfd in `UFFDIO_REGISTER_MODE_MINOR`, and
+///    replies with the usual mappings JSON + the userfaultfd (same message shape as
+///    [`MemBackendType::Uffd`]).
+///
+/// Because the mapping is private, `UFFDIO_CONTINUE` installs a **read-only** PTE pointing at
+/// the shared page-cache folio (see `mm/hugetlb.c` `hugetlb_mfill_atomic_pte` and
+/// `mm/userfaultfd.c` `mfill_atomic_install_pte`: `if (page_in_cache && !vm_shared) writable =
+/// false`). Reads are therefore genuinely shared between all microVMs restored from the same
+/// backing file, and the first guest write to a page takes an ordinary copy-on-write fault
+/// into private memory — the handler never sees it and the snapshot stays pristine.
+fn guest_memory_from_uffd_minor(
+    mem_uds_path: &Path,
+    mem_state: &GuestMemoryState,
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
+    let socket = UnixStream::connect(mem_uds_path)?;
+
+    // The handler sends the backing file as soon as we connect.
+    let mut hello = [0u8; 32];
+    let (_, backing) = socket.recv_with_fd(&mut hello)?;
+    let backing = backing.ok_or(GuestMemoryFromUffdError::NoBackingFile)?;
+
+    // MAP_PRIVATE over the shared inode. No MAP_HUGETLB even for a hugetlbfs memfd — that
+    // flag is only meaningful for anonymous mappings; a mapping of a hugetlbfs inode is
+    // huge because the inode is.
+    //
+    // hugetlb mappings RESERVE the full private range (`reserve = true`, i.e. no
+    // MAP_NORESERVE): hugetlb pages are neither swappable nor reclaimable, so with
+    // MAP_NORESERVE a starved pool surfaces as a SIGBUS on the first copy-on-write fault
+    // of a RUNNING guest (measured: 4 concurrent 512 MiB clones on a 1 GiB pool died
+    // mid-boot exactly this way). Reserving turns that into a clean ENOMEM from this
+    // mmap — the restore fails loudly and the guest never starts — and guarantees an
+    // admitted clone can always complete its CoW faults. Clean pages still come from the
+    // ONE shared folio per page (reservations are accounting, not allocation), so
+    // sharing is unaffected; the reservation only caps admission at pool_size /
+    // guest_size clones. 4K shmem backings keep MAP_NORESERVE: their CoW pages are
+    // ordinary anonymous memory with no SIGBUS cliff.
+    let guest_memory = memory::snapshot_file(
+        backing,
+        mem_state.regions(),
+        track_dirty_pages,
+        huge_pages.is_hugetlbfs(),
+    )?;
+
+    let mut backend_mappings = Vec::with_capacity(guest_memory.len());
+    let mut offset = 0;
+    for mem_region in guest_memory.iter() {
+        #[allow(deprecated)]
+        backend_mappings.push(GuestRegionUffdMapping {
+            base_host_virt_addr: mem_region.as_ptr() as u64,
+            size: mem_region.size(),
+            offset,
+            page_size: huge_pages.page_size(),
+            page_size_kib: huge_pages.page_size(),
+        });
+        offset += mem_region.size() as u64;
+    }
+
+    let mut uffd_builder = UffdBuilder::new();
+    uffd_builder.require_features(FeatureFlags::EVENT_REMOVE);
+
+    let uffd = uffd_builder
+        .close_on_exec(true)
+        .non_blocking(true)
+        // MUST stay false: KVM and vhost touch guest memory from kernel context, and
+        // UFFD_USER_MODE_ONLY makes the kernel refuse to deliver those faults (EFAULT).
+        .user_mode_only(false)
+        .create()
+        .map_err(GuestMemoryFromUffdError::Create)?;
+
+    for mem_region in guest_memory.iter() {
+        uffd.register_with_mode(
+            mem_region.as_ptr().cast(),
+            mem_region.size() as _,
+            userfaultfd::RegisterMode::MINOR,
+        )
+        .map_err(GuestMemoryFromUffdError::Register)?;
+    }
+
+    send_uffd_handshake(socket, &backend_mappings, &uffd)?;
 
     Ok((guest_memory, Some(uffd)))
 }
@@ -558,7 +671,7 @@ fn create_guest_memory(
 }
 
 fn send_uffd_handshake(
-    mem_uds_path: &Path,
+    socket: UnixStream,
     backend_mappings: &[GuestRegionUffdMapping],
     uffd: &impl AsRawFd,
 ) -> Result<(), GuestMemoryFromUffdError> {
@@ -566,7 +679,6 @@ fn send_uffd_handshake(
     // (i.e GuestRegionUffdMapping entries).
     let backend_mappings = serde_json::to_string(backend_mappings).unwrap();
 
-    let socket = UnixStream::connect(mem_uds_path)?;
     socket.send_with_fd(
         backend_mappings.as_bytes(),
         // In the happy case we can close the fd since the other process has it open and is
@@ -777,7 +889,10 @@ mod tests {
 
         let listener = UnixListener::bind(uds_path).expect("Cannot bind to socket path");
 
-        send_uffd_handshake(uds_path, &uffd_regions, &std::io::stdin()).unwrap();
+        // The handshake now takes an already-connected stream (UffdMinor receives the
+        // backing fd on the same connection before replying on it).
+        let socket = UnixStream::connect(uds_path).expect("Cannot connect to socket path");
+        send_uffd_handshake(socket, &uffd_regions, &std::io::stdin()).unwrap();
 
         let (stream, _) = listener.accept().expect("Cannot listen on UDS socket");
 
