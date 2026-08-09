@@ -98,8 +98,8 @@ arm64_sys_reg!(CLIDR_EL1, 3, 1, 0, 0, 1);
 // used for the virtual timer count and compare-value register IDs. These must
 // match KVM_REG_ARM_TIMER_{CNT,CVAL}, not the architectural register names. KVM
 // also remaps SYS_CNTVCT_EL0 to KVM_REG_ARM_TIMER_CNT while enumerating registers.
-// https://github.com/torvalds/linux/blob/9930100e61148c6c4dca2bb094b85368043553fb/arch/arm64/include/uapi/asm/kvm.h#L262-L273
-// https://github.com/torvalds/linux/blob/9930100e61148c6c4dca2bb094b85368043553fb/arch/arm64/kvm/sys_regs.c#L5473-L5479
+// https://github.com/torvalds/linux/blob/v7.0/arch/arm64/include/uapi/asm/kvm.h#L262-L273
+// https://github.com/torvalds/linux/blob/v7.0/arch/arm64/kvm/sys_regs.c#L5473-L5479
 arm64_sys_reg!(KVM_REG_ARM_TIMER_CVAL, 3, 3, 14, 0, 2);
 arm64_sys_reg!(KVM_REG_ARM_TIMER_CNT, 3, 3, 14, 3, 2);
 

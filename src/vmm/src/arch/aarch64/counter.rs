@@ -104,9 +104,12 @@ impl<'a> KvmCounterIo<'a> {
 impl CounterIo for KvmCounterIo<'_> {
     fn read_counter(&self) -> Result<u64, CounterError> {
         // KVM_GET_ONE_REG(SYS_CNTPCT_EL0) reaches kvm_phys_timer_read(), the
-        // same KVM counter source visible to the guest. This remains true for
-        // an L1 VMM under nested virtualization and deliberately avoids any
-        // assumption that userspace CNTVCT_EL0 shares KVM's counter domain.
+        // same KVM counter source visible to the guest. After the VM-wide
+        // offset is installed, KVM subtracts that offset from this read, so it
+        // returns the guest-adjusted counter used by pause/resume arithmetic.
+        // This remains true for an L1 VMM under nested virtualization and
+        // deliberately avoids assuming userspace CNTVCT_EL0 shares KVM's
+        // counter domain.
         let mut counter = [0_u8; 8];
         self.vcpu_fd
             .get_one_reg(SYS_CNTPCT_EL0, &mut counter)
@@ -286,31 +289,55 @@ impl CounterController {
 /// the VM-wide counter domain.
 pub(crate) fn canonical_saved_counter(states: &[VcpuState]) -> Result<u64, CounterError> {
     let boot_vcpu = states.first().ok_or(CounterError::NoVcpuState)?;
-    unique_saved_counter(boot_vcpu, 0, SYS_CNTPCT_EL0)
+    unique_saved_counter(boot_vcpu, 0, SavedCounter::Physical)
+}
+
+#[derive(Clone, Copy)]
+enum SavedCounter {
+    Physical,
+    Virtual,
+}
+
+impl SavedCounter {
+    fn register_id(self) -> u64 {
+        match self {
+            Self::Physical => SYS_CNTPCT_EL0,
+            Self::Virtual => KVM_REG_ARM_TIMER_CNT,
+        }
+    }
+
+    fn missing_error(self, vcpu_index: usize) -> CounterError {
+        match self {
+            Self::Physical => CounterError::MissingSavedCounter(vcpu_index),
+            Self::Virtual => CounterError::MissingSavedVirtualCounter(vcpu_index),
+        }
+    }
+
+    fn duplicate_error(self, vcpu_index: usize) -> CounterError {
+        match self {
+            Self::Physical => CounterError::DuplicateSavedCounter(vcpu_index),
+            Self::Virtual => CounterError::DuplicateSavedVirtualCounter(vcpu_index),
+        }
+    }
 }
 
 fn unique_saved_counter(
     state: &VcpuState,
     vcpu_index: usize,
-    register_id: u64,
+    counter: SavedCounter,
 ) -> Result<u64, CounterError> {
+    let register_id = counter.register_id();
     let mut counters = state
         .regs
         .iter()
         .filter(|register| register.id == register_id);
-    let counter = counters.next().ok_or_else(|| match register_id {
-        SYS_CNTPCT_EL0 => CounterError::MissingSavedCounter(vcpu_index),
-        KVM_REG_ARM_TIMER_CNT => CounterError::MissingSavedVirtualCounter(vcpu_index),
-        _ => unreachable!("only architectural counter registers are queried"),
-    })?;
+    let register = counters
+        .next()
+        .ok_or_else(|| counter.missing_error(vcpu_index))?;
     if counters.next().is_some() {
-        return Err(match register_id {
-            SYS_CNTPCT_EL0 => CounterError::DuplicateSavedCounter(vcpu_index),
-            KVM_REG_ARM_TIMER_CNT => CounterError::DuplicateSavedVirtualCounter(vcpu_index),
-            _ => unreachable!("only architectural counter registers are queried"),
-        });
+        return Err(counter.duplicate_error(vcpu_index));
     }
-    Ok(counter.value::<u64, 8>())
+    Ok(register.value::<u64, 8>())
 }
 
 /// Normalize serialized counter values to the exact point at which vCPUs paused.
@@ -329,8 +356,8 @@ pub(crate) fn normalize_snapshot_counters(
     }
 
     for (vcpu_index, state) in states.iter_mut().enumerate() {
-        let saved_physical = unique_saved_counter(state, vcpu_index, SYS_CNTPCT_EL0)?;
-        unique_saved_counter(state, vcpu_index, KVM_REG_ARM_TIMER_CNT)?;
+        let saved_physical = unique_saved_counter(state, vcpu_index, SavedCounter::Physical)?;
+        unique_saved_counter(state, vcpu_index, SavedCounter::Virtual)?;
         let pause_to_save_delta = saved_physical.wrapping_sub(paused_physical_counter);
 
         for mut register in state.regs.iter_mut() {
@@ -805,9 +832,34 @@ mod tests {
             UAPI_KVM_REG_ARM_TIMER_CVAL,
             &901_u64.to_le_bytes(),
         ));
+        let cval_bytes_before = states
+            .iter()
+            .map(|state| {
+                state
+                    .regs
+                    .iter()
+                    .find(|register| register.id == UAPI_KVM_REG_ARM_TIMER_CVAL)
+                    .unwrap()
+                    .as_slice()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
 
         normalize_snapshot_counters(&mut states, 100).unwrap();
 
+        let cval_bytes_after = states
+            .iter()
+            .map(|state| {
+                state
+                    .regs
+                    .iter()
+                    .find(|register| register.id == UAPI_KVM_REG_ARM_TIMER_CVAL)
+                    .unwrap()
+                    .as_slice()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cval_bytes_after, cval_bytes_before);
         assert_eq!(saved_counter(&states[0], UAPI_SYS_CNTPCT_EL0), 100);
         assert_eq!(saved_counter(&states[0], UAPI_KVM_REG_ARM_TIMER_CNT), 80);
         assert_eq!(saved_counter(&states[0], UAPI_KVM_REG_ARM_TIMER_CVAL), 900);
