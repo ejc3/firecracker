@@ -11,6 +11,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -49,6 +50,7 @@ use crate::{EventManager, Vmm, vstate};
 // The existing fcvm wire greeting is declared protocol V1 here. Any incompatible future
 // handshake must use a new magic rather than accepting ambiguous payloads on this stream.
 const UFFD_MINOR_BACKING_HELLO_V1: &[u8] = b"FCVM_UFFD_MINOR_BACKING";
+const UFFD_MINOR_BACKING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Holds information related to the VM that is not part of VmState.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -558,6 +560,8 @@ pub enum GuestMemoryFromUffdError {
     NoBackingFile,
     /// The UFFD handler sent an invalid minor-backing protocol greeting.
     InvalidBackingHandshake,
+    /// Timed out while receiving the UFFD minor-backing protocol greeting.
+    BackingHandshakeTimeout,
 }
 
 fn guest_memory_from_uffd(
@@ -640,17 +644,78 @@ fn guest_memory_from_uffd_minor(
 }
 
 fn receive_uffd_minor_backing(socket: &UnixStream) -> Result<File, GuestMemoryFromUffdError> {
-    // One extra byte makes an overlong greeting fail closed instead of accepting a valid
-    // prefix. The sender emits the entire V1 greeting and descriptor in one sendmsg call.
-    let mut hello = [0u8; UFFD_MINOR_BACKING_HELLO_V1.len() + 1];
-    let (hello_len, backing) = socket.recv_with_fd(&mut hello)?;
-    let backing = backing.ok_or(GuestMemoryFromUffdError::NoBackingFile)?;
-    if hello_len != UFFD_MINOR_BACKING_HELLO_V1.len()
-        || &hello[..hello_len] != UFFD_MINOR_BACKING_HELLO_V1
-    {
-        return Err(GuestMemoryFromUffdError::InvalidBackingHandshake);
+    receive_uffd_minor_backing_with_timeout(socket, UFFD_MINOR_BACKING_HANDSHAKE_TIMEOUT)
+}
+
+fn receive_uffd_minor_backing_with_timeout(
+    socket: &UnixStream,
+    timeout: Duration,
+) -> Result<File, GuestMemoryFromUffdError> {
+    let previous_timeout = socket.read_timeout()?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(GuestMemoryFromUffdError::BackingHandshakeTimeout)?;
+
+    let result = (|| {
+        // One extra byte makes an overlong greeting fail closed instead of accepting a valid
+        // prefix. UnixStream does not preserve sendmsg boundaries, so accumulate fragments while
+        // retaining the descriptor delivered with any one of them.
+        let mut hello = [0u8; UFFD_MINOR_BACKING_HELLO_V1.len() + 1];
+        let mut hello_len = 0;
+        let mut backing = None;
+
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|duration| !duration.is_zero())
+                .ok_or(GuestMemoryFromUffdError::BackingHandshakeTimeout)?;
+            socket.set_read_timeout(Some(remaining))?;
+
+            let (fragment_len, fragment_backing) =
+                match socket.recv_with_fd(&mut hello[hello_len..]) {
+                    Ok(fragment) => fragment,
+                    Err(err)
+                        if matches!(
+                            io::Error::from_raw_os_error(err.errno()).kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        return Err(GuestMemoryFromUffdError::BackingHandshakeTimeout);
+                    }
+                    Err(err) => return Err(GuestMemoryFromUffdError::Send(err)),
+                };
+
+            if let Some(fragment_backing) = fragment_backing {
+                if backing.is_some() {
+                    return Err(GuestMemoryFromUffdError::InvalidBackingHandshake);
+                }
+                backing = Some(fragment_backing);
+            }
+
+            hello_len += fragment_len;
+            if hello_len > UFFD_MINOR_BACKING_HELLO_V1.len()
+                || hello[..hello_len] != UFFD_MINOR_BACKING_HELLO_V1[..hello_len]
+            {
+                return Err(GuestMemoryFromUffdError::InvalidBackingHandshake);
+            }
+            if fragment_len == 0 || hello_len == UFFD_MINOR_BACKING_HELLO_V1.len() {
+                break;
+            }
+        }
+
+        let backing = backing.ok_or(GuestMemoryFromUffdError::NoBackingFile)?;
+        if hello_len != UFFD_MINOR_BACKING_HELLO_V1.len() {
+            return Err(GuestMemoryFromUffdError::InvalidBackingHandshake);
+        }
+        Ok(backing)
+    })();
+
+    let restore_result = socket.set_read_timeout(previous_timeout);
+    match (result, restore_result) {
+        (Ok(backing), Ok(())) => Ok(backing),
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(GuestMemoryFromUffdError::Connect(err)),
     }
-    Ok(backing)
 }
 
 fn map_uffd_minor_backing(
@@ -1019,6 +1084,71 @@ mod tests {
             .read(&mut restored, MemoryRegionAddress(0))
             .unwrap();
         assert!(restored.iter().all(|byte| *byte == 0x5a));
+    }
+
+    fn wait_until_socket_input_is_drained(socket: &UnixStream) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let mut queued_bytes: libc::c_int = 0;
+            // SAFETY: `socket` owns a valid Unix socket descriptor and `queued_bytes` points to
+            // writable storage of the type required by FIONREAD.
+            let result = unsafe {
+                libc::ioctl(
+                    socket.as_raw_fd(),
+                    libc::FIONREAD,
+                    std::ptr::addr_of_mut!(queued_bytes),
+                )
+            };
+            assert_eq!(result, 0, "FIONREAD failed: {}", io::Error::last_os_error());
+            if queued_bytes == 0 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "receiver did not consume the first greeting fragment"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn test_uffd_minor_accepts_fragmented_greeting() {
+        let (firecracker, mut handler) = UnixStream::pair().unwrap();
+        let observer = firecracker.try_clone().unwrap();
+        let backing = TempFile::new().unwrap().into_file();
+        backing.set_len(0x20_000).unwrap();
+        let split = UFFD_MINOR_BACKING_HELLO_V1.len() / 2;
+
+        handler
+            .send_with_fd(&UFFD_MINOR_BACKING_HELLO_V1[..split], backing.as_raw_fd())
+            .unwrap();
+        let receiver = std::thread::spawn(move || receive_uffd_minor_backing(&firecracker));
+
+        // Wait for recvmsg to consume the descriptor-bearing fragment before sending the rest.
+        // This makes the stream fragmentation deterministic instead of depending on scheduling.
+        wait_until_socket_input_is_drained(&observer);
+        handler
+            .write_all(&UFFD_MINOR_BACKING_HELLO_V1[split..])
+            .unwrap();
+
+        let received = receiver.join().unwrap().unwrap();
+        assert_eq!(received.metadata().unwrap().len(), 0x20_000);
+        assert_eq!(observer.read_timeout().unwrap(), None);
+    }
+
+    #[test]
+    fn test_uffd_minor_backing_handshake_times_out() {
+        let (firecracker, _handler) = UnixStream::pair().unwrap();
+        let previous_timeout = Duration::from_secs(7);
+        firecracker
+            .set_read_timeout(Some(previous_timeout))
+            .unwrap();
+
+        assert!(matches!(
+            receive_uffd_minor_backing_with_timeout(&firecracker, Duration::from_millis(10)),
+            Err(GuestMemoryFromUffdError::BackingHandshakeTimeout)
+        ));
+        assert_eq!(firecracker.read_timeout().unwrap(), Some(previous_timeout));
     }
 
     #[test]
