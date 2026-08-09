@@ -1394,12 +1394,11 @@ mod tests {
         let local_port = 1026;
         let peer_port_first = 1025;
         let mut listener = ctx.create_local_listener(local_port);
-        let mut streams: Vec<UnixStream> = Vec::new();
 
         for peer_port in peer_port_first..peer_port_first + defs::MUXER_RXQ_SIZE {
             ctx.init_tx_pkt(local_port, peer_port, uapi::VSOCK_OP_REQUEST);
             ctx.send();
-            streams.push(listener.accept());
+            drop(listener.accept());
         }
 
         // The muxer RX queue should now be full (with connection reponses), but still
