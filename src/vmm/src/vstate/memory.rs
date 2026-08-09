@@ -822,7 +822,12 @@ impl GuestMemoryRegion for GuestRegionMmapExt {
     }
 }
 
-/// Creates a `Vec` of `GuestRegionMmap` with the given configuration
+/// Creates a `Vec` of `GuestRegionMmap` with the given configuration.
+///
+/// `mmap_flags` are passed through verbatim. Callers that want an overcommit-friendly
+/// mapping must include `MAP_NORESERVE` themselves. Omitting it for a private hugetlbfs
+/// mapping reserves backing at mmap time, so an unservable mapping fails with `ENOMEM`
+/// instead of a running guest receiving `SIGBUS` on a copy-on-write fault.
 pub fn create(
     regions: impl Iterator<Item = (GuestAddress, usize)>,
     mmap_flags: libc::c_int,
@@ -838,7 +843,7 @@ pub fn create(
                 start,
                 size,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_NORESERVE | mmap_flags,
+                mmap_flags,
                 file.as_ref()
                     .map(|file| FileOffset::from_arc(Arc::clone(file), offset)),
                 track_dirty_pages,
@@ -875,7 +880,7 @@ pub fn memfd_backed(
 
     create(
         regions.iter().copied(),
-        libc::MAP_SHARED | huge_pages.mmap_flags(),
+        libc::MAP_NORESERVE | libc::MAP_SHARED | huge_pages.mmap_flags(),
         Some(memfd_file),
         track_dirty_pages,
         huge_pages.madvise_flags(),
@@ -890,20 +895,34 @@ pub fn anonymous(
 ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
     create(
         regions,
-        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | huge_pages.mmap_flags(),
+        libc::MAP_NORESERVE | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | huge_pages.mmap_flags(),
         None,
         track_dirty_pages,
         huge_pages.madvise_flags(),
     )
 }
 
-/// Creates a GuestMemoryMmap given a `file` containing the data
-/// and a `state` containing mapping information.
+fn snapshot_file_mmap_flags(reserve: bool) -> libc::c_int {
+    if reserve {
+        libc::MAP_PRIVATE
+    } else {
+        libc::MAP_NORESERVE | libc::MAP_PRIVATE
+    }
+}
+
+/// Creates a GuestMemoryMmap given a `file` containing the data and a `state` containing
+/// mapping information.
+///
+/// `reserve` omits `MAP_NORESERVE`. This is required for the UFFD-minor hugetlbfs backend:
+/// reserving all private CoW backing makes pool exhaustion fail at restore mmap with `ENOMEM`
+/// rather than delivering `SIGBUS` to a running guest. File and shmem-backed restores pass
+/// `false`, retaining their existing overcommit behavior.
 pub fn snapshot_file(
     file: File,
     regions: impl Iterator<Item = (GuestAddress, usize)>,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
+    reserve: bool,
 ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
     let regions: Vec<_> = regions.collect();
     let memory_size = regions
@@ -920,7 +939,7 @@ pub fn snapshot_file(
 
     create(
         regions.into_iter(),
-        libc::MAP_PRIVATE,
+        snapshot_file_mmap_flags(reserve),
         Some(file),
         track_dirty_pages,
         huge_pages.madvise_flags(),
@@ -1261,6 +1280,7 @@ mod tests {
                 regions.into_iter(),
                 dirty_page_tracking,
                 HugePageConfig::None,
+                false,
             )
             .unwrap();
             assert_eq!(guest_regions.len(), 1);
@@ -1283,8 +1303,14 @@ mod tests {
             (GuestAddress(0x10000), page_size),
             (GuestAddress(0x20000), page_size),
         ];
-        let guest_regions =
-            snapshot_file(file, regions.into_iter(), false, HugePageConfig::None).unwrap();
+        let guest_regions = snapshot_file(
+            file,
+            regions.into_iter(),
+            false,
+            HugePageConfig::None,
+            false,
+        )
+        .unwrap();
         assert_eq!(guest_regions.len(), 3);
     }
 
@@ -1296,8 +1322,46 @@ mod tests {
         file.write_all(&vec![0x42u8; page_size]).unwrap();
 
         let regions = vec![(GuestAddress(0), 2 * page_size)];
-        let result = snapshot_file(file, regions.into_iter(), false, HugePageConfig::None);
+        let result = snapshot_file(
+            file,
+            regions.into_iter(),
+            false,
+            HugePageConfig::None,
+            false,
+        );
         assert!(matches!(result.unwrap_err(), MemoryError::OffsetTooLarge));
+    }
+
+    #[test]
+    fn test_snapshot_file_reservation_flags() {
+        assert_eq!(snapshot_file_mmap_flags(true), libc::MAP_PRIVATE);
+        assert_eq!(
+            snapshot_file_mmap_flags(false),
+            libc::MAP_PRIVATE | libc::MAP_NORESERVE
+        );
+    }
+
+    #[test]
+    fn test_create_preserves_explicit_noreserve_choice() {
+        fn create_file_mapping(flags: libc::c_int) -> GuestRegionMmap {
+            let file = TempFile::new().unwrap().into_file();
+            file.set_len(host_page_size() as u64).unwrap();
+            create(
+                std::iter::once((GuestAddress(0), host_page_size())),
+                flags,
+                Some(file),
+                false,
+                libc::MADV_NORMAL,
+            )
+            .unwrap()
+            .pop()
+            .unwrap()
+        }
+
+        let reserved = create_file_mapping(libc::MAP_PRIVATE);
+        let noreserve = create_file_mapping(libc::MAP_PRIVATE | libc::MAP_NORESERVE);
+        assert!(!vma_has_vm_flag(reserved.as_ptr() as usize, "nr"));
+        assert!(vma_has_vm_flag(noreserve.as_ptr() as usize, "nr"));
     }
 
     #[test]
@@ -1492,6 +1556,7 @@ mod tests {
                 memory_state.regions(),
                 false,
                 HugePageConfig::None,
+                false,
             )
             .unwrap(),
         );
@@ -1559,7 +1624,14 @@ mod tests {
 
         // We can restore from this because this is the first dirty dump.
         let restored_guest_memory = into_region_ext(
-            snapshot_file(file, memory_state.regions(), false, HugePageConfig::None).unwrap(),
+            snapshot_file(
+                file,
+                memory_state.regions(),
+                false,
+                HugePageConfig::None,
+                false,
+            )
+            .unwrap(),
         );
 
         // Check that the region contents are the same.
@@ -1785,6 +1857,7 @@ mod tests {
                 std::iter::once((GuestAddress(0), 2 * page_size)),
                 false,
                 HugePageConfig::None,
+                false,
             )
             .unwrap(),
         );
@@ -2226,6 +2299,33 @@ mod tests {
             }
         }
         None
+    }
+
+    fn vma_has_vm_flag(addr: usize, expected_flag: &str) -> bool {
+        use std::io::BufRead;
+
+        let smaps = std::fs::File::open("/proc/self/smaps").unwrap();
+        let mut in_target_vma = false;
+        for line in std::io::BufReader::new(smaps).lines() {
+            let line = line.unwrap();
+            if let Some(range) = line.split_whitespace().next()
+                && let Some((start, end)) = range.split_once('-')
+                && let (Ok(start), Ok(end)) = (
+                    usize::from_str_radix(start, 16),
+                    usize::from_str_radix(end, 16),
+                )
+            {
+                in_target_vma = addr >= start && addr < end;
+                continue;
+            }
+            if in_target_vma && line.starts_with("VmFlags:") {
+                return line
+                    .split_whitespace()
+                    .skip(1)
+                    .any(|flag| flag == expected_flag);
+            }
+        }
+        panic!("mapping containing address {addr:#x} has no VmFlags entry")
     }
 
     #[test]

@@ -25,12 +25,19 @@ pub enum SnapshotType {
 /// 1) A file that contains the guest memory to be loaded,
 /// 2) An UDS where a custom page-fault handler process is listening for the UFFD set up by
 ///    Firecracker to handle its guest memory page faults.
+/// 3) An UDS over which a handler process first hands Firecracker a shared backing file
+///    and then serves minor faults on it.
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 pub enum MemBackendType {
     /// Guest memory contents will be loaded from a file.
     File,
     /// Guest memory will be served through UFFD by a separate process.
     Uffd,
+    /// Guest memory is mapped `MAP_PRIVATE` over a backing file received from the handler
+    /// over the UDS. The userfaultfd is registered in `UFFDIO_REGISTER_MODE_MINOR`, so the
+    /// handler resolves faults with `UFFDIO_CONTINUE`. Clean pages are shared through the
+    /// page cache and guest writes use ordinary copy-on-write memory.
+    UffdMinor,
 }
 
 /// Stores the configuration that will be used for creating a snapshot.
@@ -147,4 +154,19 @@ pub enum VmState {
 pub struct Vm {
     /// The microVM state, which can be `paused` or `resumed`.
     pub state: VmState,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_uffd_minor_backend_request() {
+        let config: MemBackendConfig = serde_json::from_str(
+            r#"{"backend_path":"/run/fcvm/uffd.sock","backend_type":"UffdMinor"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.backend_type, MemBackendType::UffdMinor);
+        assert_eq!(config.backend_path, PathBuf::from("/run/fcvm/uffd.sock"));
+    }
 }

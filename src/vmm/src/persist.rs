@@ -46,6 +46,10 @@ use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
 use crate::{EventManager, Vmm, vstate};
 
+// The existing fcvm wire greeting is declared protocol V1 here. Any incompatible future
+// handshake must use a new magic rather than accepting ambiguous payloads on this stream.
+const UFFD_MINOR_BACKING_HELLO_V1: &[u8] = b"FCVM_UFFD_MINOR_BACKING";
+
 /// Holds information related to the VM that is not part of VmState.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct VmInfo {
@@ -469,6 +473,13 @@ pub fn restore_from_snapshot(
             vm_resources.machine_config.huge_pages,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
+        MemBackendType::UffdMinor => guest_memory_from_uffd_minor(
+            mem_backend_path,
+            mem_state,
+            track_dirty_pages,
+            vm_resources.machine_config.huge_pages,
+        )
+        .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
     };
     builder::build_microvm_from_snapshot(
         instance_info,
@@ -523,8 +534,13 @@ fn guest_memory_from_file(
     huge_pages: HugePageConfig,
 ) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromFileError> {
     let mem_file = File::open(mem_file_path)?;
-    let guest_mem =
-        memory::snapshot_file(mem_file, mem_state.regions(), track_dirty_pages, huge_pages)?;
+    let guest_mem = memory::snapshot_file(
+        mem_file,
+        mem_state.regions(),
+        track_dirty_pages,
+        huge_pages,
+        false,
+    )?;
     Ok(guest_mem)
 }
 
@@ -541,6 +557,10 @@ pub enum GuestMemoryFromUffdError {
     Connect(#[from] std::io::Error),
     /// Failed to sends file descriptor: {0}
     Send(#[from] vmm_sys_util::errno::Error),
+    /// The UFFD handler did not send a guest memory backing file descriptor.
+    NoBackingFile,
+    /// The UFFD handler sent an invalid minor-backing protocol greeting.
+    InvalidBackingHandshake,
 }
 
 fn guest_memory_from_uffd(
@@ -572,9 +592,121 @@ fn guest_memory_from_uffd(
             .map_err(GuestMemoryFromUffdError::Register)?;
     }
 
-    send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
+    let socket = UnixStream::connect(mem_uds_path)?;
+    send_uffd_handshake(socket, &backend_mappings, &uffd)?;
 
     Ok((guest_memory, Some(uffd)))
+}
+
+/// Restores guest memory from a handler-supplied shared backing file.
+///
+/// Firecracker connects once to `mem_uds_path`. The handler first sends the backing file
+/// descriptor on that connection. Firecracker maps every memory region `MAP_PRIVATE`, registers
+/// the mappings with `UFFDIO_REGISTER_MODE_MINOR`, and replies with the standard mappings JSON
+/// and userfaultfd on the same connection. `UFFDIO_CONTINUE` then maps clean page-cache folios
+/// read-only; guest writes use normal copy-on-write memory and never modify the backing file.
+fn guest_memory_from_uffd_minor(
+    mem_uds_path: &Path,
+    mem_state: &GuestMemoryState,
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
+    let socket = UnixStream::connect(mem_uds_path)?;
+
+    let backing = receive_uffd_minor_backing(&socket)?;
+
+    // A hugetlbfs private mapping must reserve its CoW backing up front. Without a
+    // reservation, pool exhaustion surfaces as SIGBUS after the guest has started. Reserving
+    // converts it to a clean ENOMEM during restore and guarantees admitted guests can CoW every
+    // page. Regular shmem mappings retain MAP_NORESERVE because their CoW pages are reclaimable
+    // anonymous memory.
+    let guest_memory = map_uffd_minor_backing(backing, mem_state, track_dirty_pages, huge_pages)?;
+    let backend_mappings = create_backend_mappings(&guest_memory, huge_pages);
+
+    let mut uffd_builder = UffdBuilder::new();
+    uffd_builder.require_features(FeatureFlags::EVENT_REMOVE);
+    let uffd = uffd_builder
+        .close_on_exec(true)
+        .non_blocking(true)
+        // KVM and vhost fault guest memory from kernel context. USER_MODE_ONLY would make
+        // those faults fail with EFAULT instead of being delivered to the handler.
+        .user_mode_only(false)
+        .create()
+        .map_err(GuestMemoryFromUffdError::Create)?;
+
+    register_uffd_minor_regions(&uffd, &guest_memory)
+        .map_err(GuestMemoryFromUffdError::Register)?;
+
+    send_uffd_handshake(socket, &backend_mappings, &uffd)?;
+
+    Ok((guest_memory, Some(uffd)))
+}
+
+fn receive_uffd_minor_backing(socket: &UnixStream) -> Result<File, GuestMemoryFromUffdError> {
+    // One extra byte makes an overlong greeting fail closed instead of accepting a valid
+    // prefix. The sender emits the entire V1 greeting and descriptor in one sendmsg call.
+    let mut hello = [0u8; UFFD_MINOR_BACKING_HELLO_V1.len() + 1];
+    let (hello_len, backing) = socket.recv_with_fd(&mut hello)?;
+    let backing = backing.ok_or(GuestMemoryFromUffdError::NoBackingFile)?;
+    if hello_len != UFFD_MINOR_BACKING_HELLO_V1.len()
+        || &hello[..hello_len] != UFFD_MINOR_BACKING_HELLO_V1
+    {
+        return Err(GuestMemoryFromUffdError::InvalidBackingHandshake);
+    }
+    Ok(backing)
+}
+
+fn map_uffd_minor_backing(
+    backing: File,
+    mem_state: &GuestMemoryState,
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+    memory::snapshot_file(
+        backing,
+        mem_state.regions(),
+        track_dirty_pages,
+        huge_pages,
+        huge_pages.is_hugetlbfs(),
+    )
+}
+
+trait UffdRegistrar {
+    type Error;
+
+    fn register_with_mode(
+        &self,
+        address: *mut libc::c_void,
+        len: usize,
+        mode: userfaultfd::RegisterMode,
+    ) -> Result<(), Self::Error>;
+}
+
+impl UffdRegistrar for Uffd {
+    type Error = userfaultfd::Error;
+
+    fn register_with_mode(
+        &self,
+        address: *mut libc::c_void,
+        len: usize,
+        mode: userfaultfd::RegisterMode,
+    ) -> Result<(), Self::Error> {
+        Uffd::register_with_mode(self, address, len, mode).map(|_| ())
+    }
+}
+
+fn register_uffd_minor_regions<R: UffdRegistrar>(
+    registrar: &R,
+    guest_memory: &[GuestRegionMmap],
+) -> Result<(), R::Error> {
+    for mem_region in guest_memory {
+        registrar.register_with_mode(
+            mem_region.as_ptr().cast(),
+            mem_region.size(),
+            userfaultfd::RegisterMode::MINOR,
+        )?;
+    }
+    Ok(())
 }
 
 fn create_guest_memory(
@@ -583,9 +715,17 @@ fn create_guest_memory(
     huge_pages: HugePageConfig,
 ) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
     let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
+    let backend_mappings = create_backend_mappings(&guest_memory, huge_pages);
+    Ok((guest_memory, backend_mappings))
+}
+
+fn create_backend_mappings(
+    guest_memory: &[GuestRegionMmap],
+    huge_pages: HugePageConfig,
+) -> Vec<GuestRegionUffdMapping> {
     let mut backend_mappings = Vec::with_capacity(guest_memory.len());
     let mut offset = 0;
-    for mem_region in guest_memory.iter() {
+    for mem_region in guest_memory {
         #[allow(deprecated)]
         backend_mappings.push(GuestRegionUffdMapping {
             base_host_virt_addr: mem_region.as_ptr() as u64,
@@ -596,12 +736,11 @@ fn create_guest_memory(
         });
         offset += mem_region.size() as u64;
     }
-
-    Ok((guest_memory, backend_mappings))
+    backend_mappings
 }
 
 fn send_uffd_handshake(
-    mem_uds_path: &Path,
+    socket: UnixStream,
     backend_mappings: &[GuestRegionUffdMapping],
     uffd: &impl AsRawFd,
 ) -> Result<(), GuestMemoryFromUffdError> {
@@ -609,7 +748,6 @@ fn send_uffd_handshake(
     // (i.e GuestRegionUffdMapping entries).
     let backend_mappings = serde_json::to_string(backend_mappings).unwrap();
 
-    let socket = UnixStream::connect(mem_uds_path)?;
     socket.send_with_fd(
         backend_mappings.as_bytes(),
         // In the happy case we can close the fd since the other process has it open and is
@@ -655,8 +793,10 @@ fn send_uffd_handshake(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::os::unix::net::UnixListener;
 
+    use vm_memory::{Bytes, GuestAddress, MemoryRegionAddress};
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
@@ -827,7 +967,8 @@ mod tests {
 
         let listener = UnixListener::bind(uds_path).expect("Cannot bind to socket path");
 
-        send_uffd_handshake(uds_path, &uffd_regions, &std::io::stdin()).unwrap();
+        let socket = UnixStream::connect(uds_path).expect("Cannot connect to socket path");
+        send_uffd_handshake(socket, &uffd_regions, &std::io::stdin()).unwrap();
 
         let (stream, _) = listener.accept().expect("Cannot listen on UDS socket");
 
@@ -841,5 +982,149 @@ mod tests {
             serde_json::from_slice(&message_buf).unwrap();
 
         assert_eq!(uffd_regions, deserialized);
+    }
+
+    #[test]
+    fn test_uffd_minor_same_stream_backing_and_reply() {
+        let (firecracker, handler) = UnixStream::pair().unwrap();
+        let mut backing = TempFile::new().unwrap().into_file();
+        let mem_size = 0x20_000usize;
+        backing.set_len(u64::try_from(mem_size).unwrap()).unwrap();
+        backing.write_all(&vec![0x5a; mem_size]).unwrap();
+        handler
+            .send_with_fd(UFFD_MINOR_BACKING_HELLO_V1, backing.as_raw_fd())
+            .unwrap();
+
+        let received = receive_uffd_minor_backing(&firecracker).unwrap();
+        let mem_state = GuestMemoryState {
+            regions: vec![GuestMemoryRegionState {
+                base_address: 0,
+                size: mem_size,
+                region_type: GuestRegionType::Dram,
+                plugged: vec![true],
+            }],
+        };
+        let guest_memory =
+            map_uffd_minor_backing(received, &mem_state, false, HugePageConfig::None).unwrap();
+        let mappings = create_backend_mappings(&guest_memory, HugePageConfig::None);
+
+        send_uffd_handshake(firecracker, &mappings, &std::io::stdin()).unwrap();
+
+        let mut reply = [0u8; 4096];
+        let (reply_len, uffd_fd) = handler.recv_with_fd(&mut reply).unwrap();
+        assert!(uffd_fd.is_some());
+        let decoded: Vec<GuestRegionUffdMapping> =
+            serde_json::from_slice(&reply[..reply_len]).unwrap();
+        assert_eq!(decoded, mappings);
+
+        let mut restored = vec![0; mem_size];
+        guest_memory[0]
+            .read(&mut restored, MemoryRegionAddress(0))
+            .unwrap();
+        assert!(restored.iter().all(|byte| *byte == 0x5a));
+    }
+
+    #[test]
+    fn test_uffd_minor_rejects_missing_backing_fd() {
+        let (firecracker, mut handler) = UnixStream::pair().unwrap();
+        handler.write_all(UFFD_MINOR_BACKING_HELLO_V1).unwrap();
+        assert!(matches!(
+            receive_uffd_minor_backing(&firecracker),
+            Err(GuestMemoryFromUffdError::NoBackingFile)
+        ));
+    }
+
+    #[test]
+    fn test_uffd_minor_rejects_invalid_or_overlong_greeting() {
+        for greeting in [
+            b"NOT_FCVM_UFFD_MINOR".as_slice(),
+            b"FCVM_UFFD_MINOR_BACKING!".as_slice(),
+        ] {
+            let (firecracker, handler) = UnixStream::pair().unwrap();
+            let backing = TempFile::new().unwrap().into_file();
+            handler.send_with_fd(greeting, backing.as_raw_fd()).unwrap();
+            assert!(matches!(
+                receive_uffd_minor_backing(&firecracker),
+                Err(GuestMemoryFromUffdError::InvalidBackingHandshake)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_uffd_minor_rejects_undersized_backing() {
+        let backing = TempFile::new().unwrap().into_file();
+        backing.set_len(0x1000).unwrap();
+        let mem_state = GuestMemoryState {
+            regions: vec![GuestMemoryRegionState {
+                base_address: 0,
+                size: 0x2000,
+                region_type: GuestRegionType::Dram,
+                plugged: vec![true],
+            }],
+        };
+        assert!(matches!(
+            map_uffd_minor_backing(backing, &mem_state, false, HugePageConfig::None),
+            Err(MemoryError::OffsetTooLarge)
+        ));
+    }
+
+    #[test]
+    fn test_uffd_minor_registration_mode_and_error_propagation() {
+        struct RecordingRegistrar {
+            calls: RefCell<Vec<(usize, usize, userfaultfd::RegisterMode)>>,
+            fail_at: Option<usize>,
+        }
+
+        impl UffdRegistrar for RecordingRegistrar {
+            type Error = &'static str;
+
+            fn register_with_mode(
+                &self,
+                address: *mut libc::c_void,
+                len: usize,
+                mode: userfaultfd::RegisterMode,
+            ) -> Result<(), Self::Error> {
+                let mut calls = self.calls.borrow_mut();
+                let index = calls.len();
+                calls.push((address as usize, len, mode));
+                if self.fail_at == Some(index) {
+                    Err("register failed")
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let guest_memory = memory::anonymous(
+            [(GuestAddress(0), 0x1000), (GuestAddress(0x2000), 0x2000)].into_iter(),
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap();
+        let registrar = RecordingRegistrar {
+            calls: RefCell::new(Vec::new()),
+            fail_at: None,
+        };
+        register_uffd_minor_regions(&registrar, &guest_memory).unwrap();
+        let calls = registrar.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].1, 0x1000);
+        assert_eq!(calls[1].1, 0x2000);
+        assert!(
+            calls
+                .iter()
+                .all(|(_, _, mode)| *mode == userfaultfd::RegisterMode::MINOR)
+        );
+        drop(calls);
+
+        let failing = RecordingRegistrar {
+            calls: RefCell::new(Vec::new()),
+            fail_at: Some(1),
+        };
+        assert_eq!(
+            register_uffd_minor_regions(&failing, &guest_memory),
+            Err("register failed")
+        );
+        assert_eq!(failing.calls.borrow().len(), 2);
     }
 }
