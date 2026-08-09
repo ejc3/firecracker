@@ -319,6 +319,7 @@ pub fn build_microvm_for_boot(
         entry_point,
         &initrd,
         boot_cmdline,
+        vm_resources.nv2_enabled,
     )?;
 
     let vmm = Vmm {
@@ -467,7 +468,6 @@ pub fn build_microvm_from_snapshot(
             }
         }
     }
-
     // Restore vCPU KVM state. On Arm the VM-wide counter offset must be
     // installed after every vCPU is initialized but before even the SVE
     // pre-finalization register is replayed.

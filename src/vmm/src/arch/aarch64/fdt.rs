@@ -72,6 +72,7 @@ pub fn create_fdt(
     device_manager: &DeviceManager,
     gic_device: &GICDevice,
     initrd: &Option<InitrdConfig>,
+    nested_virt: bool,
 ) -> Result<Vec<u8>, FdtError> {
     // Allocate stuff necessary for storing the blob.
     let mut fdt_writer = FdtWriter::new()?;
@@ -96,7 +97,7 @@ pub fn create_fdt(
     create_gic_node(&mut fdt_writer, gic_device)?;
     create_timer_node(&mut fdt_writer)?;
     create_clock_node(&mut fdt_writer)?;
-    create_psci_node(&mut fdt_writer)?;
+    create_psci_node(&mut fdt_writer, nested_virt)?;
     create_devices_node(&mut fdt_writer, device_manager)?;
     create_vmgenid_node(&mut fdt_writer, device_manager.acpi_devices.vmgenid())?;
     create_vmclock_node(&mut fdt_writer, device_manager.acpi_devices.vmclock())?;
@@ -385,15 +386,21 @@ fn create_timer_node(fdt: &mut FdtWriter) -> Result<(), FdtError> {
     Ok(())
 }
 
-fn create_psci_node(fdt: &mut FdtWriter) -> Result<(), FdtError> {
+fn psci_method(use_smc: bool) -> &'static str {
+    if use_smc { "smc" } else { "hvc" }
+}
+
+fn create_psci_node(fdt: &mut FdtWriter, use_smc: bool) -> Result<(), FdtError> {
     let compatible = "arm,psci-0.2";
 
     let psci = fdt.begin_node("psci")?;
     fdt.property_string("compatible", compatible)?;
     // Two methods available: hvc and smc.
-    // As per documentation, PSCI calls between a guest and hypervisor may use the HVC conduit
-    // instead of SMC. So, since we are using kvm, we need to use hvc.
-    fdt.property_string("method", "hvc")?;
+    // When nested virtualization is enabled (guest has EL2), we MUST use SMC.
+    // HVC would trap to the guest's virtual EL2 which has no handler.
+    // SMC goes to the host's EL3 emulation (KVM's secure monitor) which handles PSCI.
+    // When nested virt is disabled, either method works, but we use HVC for compatibility.
+    fdt.property_string("method", psci_method(use_smc))?;
     fdt.end_node(psci)?;
 
     Ok(())
@@ -568,6 +575,12 @@ mod tests {
     use crate::{EventManager, Kvm};
 
     #[test]
+    fn test_psci_method_tracks_nested_virtualization() {
+        assert_eq!(psci_method(false), "hvc");
+        assert_eq!(psci_method(true), "smc");
+    }
+
+    #[test]
     fn test_create_fdt() {
         let mem = arch_mem(FDT_MAX_SIZE + 0x1000);
         let mut event_manager = EventManager::new().unwrap();
@@ -575,10 +588,10 @@ mod tests {
         let kvm = Kvm::new(vec![]).unwrap();
         let vm = KvmVm::new(kvm).unwrap();
         let gic = create_gic(vm.fd(), 1, None).unwrap();
-        let initrd = InitrdConfig {
+        let initrd = Some(InitrdConfig {
             address: GuestAddress(0x1000_0000),
             size: 0x1000,
-        };
+        });
 
         let mut cmdline = Cmdline::new(4096).unwrap();
         cmdline.insert("console", "/dev/tty0").unwrap();
@@ -604,7 +617,8 @@ mod tests {
             CString::new("console=tty0").unwrap(),
             &device_manager,
             &gic,
-            &Some(initrd),
+            &initrd,
+            false, // nested_virt - false to match saved DTB
         )
         .unwrap();
         let generated_fdt = device_tree::DeviceTree::load(&dtb_bytes).unwrap();
@@ -630,5 +644,39 @@ mod tests {
             .map(|c| &c.name)
             .collect();
         assert_eq!(&generated_root_names, &expected_root_nodes);
+
+        let psci = generated_fdt.find("/psci").unwrap();
+        assert_eq!(
+            psci.props
+                .iter()
+                .find(|(name, _)| name == "method")
+                .unwrap()
+                .1
+                .as_slice(),
+            b"hvc\0"
+        );
+
+        let nested_dtb_bytes = create_fdt(
+            &mem,
+            vec![0],
+            CString::new("console=tty0").unwrap(),
+            &device_manager,
+            &gic,
+            &initrd,
+            true,
+        )
+        .unwrap();
+        let nested_fdt = device_tree::DeviceTree::load(&nested_dtb_bytes).unwrap();
+        let nested_psci = nested_fdt.find("/psci").unwrap();
+        assert_eq!(
+            nested_psci
+                .props
+                .iter()
+                .find(|(name, _)| name == "method")
+                .unwrap()
+                .1
+                .as_slice(),
+            b"smc\0"
+        );
     }
 }

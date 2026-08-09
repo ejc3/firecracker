@@ -11,16 +11,23 @@ use std::mem::offset_of;
 use kvm_bindings::*;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-#[allow(non_upper_case_globals)]
 /// PSR (Processor State Register) bits.
 /// Taken from arch/arm64/include/uapi/asm/ptrace.h.
+#[allow(non_upper_case_globals)]
 const PSR_MODE_EL1h: u64 = 0x0000_0005;
+#[allow(non_upper_case_globals)]
+const PSR_MODE_EL2h: u64 = 0x0000_0009;
 const PSR_F_BIT: u64 = 0x0000_0040;
 const PSR_I_BIT: u64 = 0x0000_0080;
 const PSR_A_BIT: u64 = 0x0000_0100;
 const PSR_D_BIT: u64 = 0x0000_0200;
 /// Taken from arch/arm64/kvm/inject_fault.c.
 pub const PSTATE_FAULT_BITS_64: u64 = PSR_MODE_EL1h | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
+/// PSTATE for EL2 boot (nested virtualization).
+/// When HAS_EL2 is enabled, the guest kernel should boot at EL2 so that
+/// `__boot_cpu_mode` is set correctly and `is_hyp_mode_available()` returns true.
+pub const PSTATE_FAULT_BITS_64_EL2: u64 =
+    PSR_MODE_EL2h | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
 
 /// Gets a core id.
 macro_rules! arm64_core_reg_id {
@@ -107,6 +114,28 @@ arm64_sys_reg!(KVM_REG_ARM_TIMER_CNT, 3, 3, 14, 3, 2);
 // https://developer.arm.com/documentation/ddi0601/2023-12/AArch64-Registers/CNTPCT-EL0--Counter-timer-Physical-Count-Register
 // https://elixir.bootlin.com/linux/v6.8/source/arch/arm64/include/asm/sysreg.h#L459
 arm64_sys_reg!(SYS_CNTPCT_EL0, 3, 3, 14, 0, 1);
+
+// Counter-timer Hypervisor Control register.
+// Used for nested virtualization to control timer access trapping.
+// https://developer.arm.com/documentation/ddi0601/2024-12/AArch64-Registers/CNTHCTL-EL2--Counter-timer-Hypervisor-Control-Register
+arm64_sys_reg!(SYS_CNTHCTL_EL2, 3, 4, 14, 1, 0);
+
+// Hypervisor Configuration Register.
+// https://developer.arm.com/documentation/ddi0601/2024-12/AArch64-Registers/HCR-EL2--Hypervisor-Configuration-Register
+arm64_sys_reg!(SYS_HCR_EL2, 3, 4, 1, 1, 0);
+
+// Virtualization Multiprocessor ID Register.
+// For nested virtualization (NV2), this register provides the MPIDR value
+// that the nested guest sees. Must be set explicitly as the kernel resets
+// it to unknown values.
+// https://developer.arm.com/documentation/ddi0601/2024-12/AArch64-Registers/VMPIDR-EL2--Virtualization-Multiprocessor-ID-Register
+arm64_sys_reg!(SYS_VMPIDR_EL2, 3, 4, 0, 0, 5);
+
+// Virtualization Processor ID Register.
+// For nested virtualization (NV2), this register provides the MIDR value
+// that the nested guest sees.
+// https://developer.arm.com/documentation/ddi0601/2024-12/AArch64-Registers/VPIDR-EL2--Virtualization-Processor-ID-Register
+arm64_sys_reg!(SYS_VPIDR_EL2, 3, 4, 0, 0, 0);
 
 // Translation Table Base Register
 // https://developer.arm.com/documentation/ddi0595/2021-03/AArch64-Registers/TTBR1-EL1--Translation-Table-Base-Register-1--EL1-

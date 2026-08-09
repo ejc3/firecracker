@@ -356,13 +356,67 @@ impl KvmVcpu {
         let kreg_off = offset_of!(kvm_regs, regs);
 
         // Get the register index of the PSTATE (Processor State) register.
+        // When nested virtualization is enabled (HAS_EL2), boot at EL2 so the guest
+        // kernel's is_hyp_mode_available() returns true.
         let pstate = offset_of!(user_pt_regs, pstate) + kreg_off;
         let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, pstate);
+        let has_el2 = (self.kvi.features[0] & (1 << KVM_ARM_VCPU_HAS_EL2)) != 0;
+        // HAS_EL2 without HAS_EL2_E2H0 selects VHE. Boot at EL2h so the guest kernel sees
+        // HYP mode and can initialize its nested KVM implementation.
+        // The guest kernel's is_hyp_mode_available() checks CurrentEL on boot - it must
+        // see EL2 or it will assume no hypervisor mode is available.
+        let pstate_value = if has_el2 {
+            PSTATE_FAULT_BITS_64_EL2
+        } else {
+            PSTATE_FAULT_BITS_64
+        };
         self.fd
-            .set_one_reg(id, &PSTATE_FAULT_BITS_64.to_le_bytes())
-            .map_err(|err| {
-                VcpuArchError::SetOneReg(id, format!("{PSTATE_FAULT_BITS_64:#x}"), err)
-            })?;
+            .set_one_reg(id, &pstate_value.to_le_bytes())
+            .map_err(|err| VcpuArchError::SetOneReg(id, format!("{pstate_value:#x}"), err))?;
+
+        // When HAS_EL2 is enabled, initialize EL2 system registers for VHE mode.
+        // For VHE (E2H=1), the guest kernel runs at EL2 and can use kvm-arm.mode=nested.
+        if has_el2 {
+            // Set HCR_EL2 with E2H=1 for VHE mode.
+            // HCR_EL2.E2H (bit 34) enables VHE, allowing the guest kernel to run at EL2.
+            // This is required for kvm-arm.mode=nested to work in the guest.
+            const HCR_E2H: u64 = 1 << 34;
+            // Also set VM bit (bit 0) to enable stage-2 translation
+            const HCR_VM: u64 = 1 << 0;
+            // And TGE (bit 27) for EL0 exceptions to route to EL2
+            const HCR_TGE: u64 = 1 << 27;
+            let hcr_el2_value = HCR_E2H | HCR_VM | HCR_TGE;
+            self.fd
+                .set_one_reg(SYS_HCR_EL2, &hcr_el2_value.to_le_bytes())
+                .map_err(|err| {
+                    VcpuArchError::SetOneReg(SYS_HCR_EL2, format!("{hcr_el2_value:#x}"), err)
+                })?;
+
+            // With HAS_EL2 (NV2), explicitly set VMPIDR_EL2 for the vCPU.
+            // KVM's NV2 implementation resets VMPIDR_EL2 to "unknown" (garbage values),
+            // causing the guest to read invalid MPIDR and fail to find boot CPU.
+            // VMPIDR_EL2 is what a nested guest sees when it reads MPIDR_EL1.
+            // Format: Aff3[39:32] | 1[31] | Aff2[23:16] | Aff1[15:8] | Aff0[7:0]
+            let expected_mpidr = 0x80000000u64 | (self.index as u64);
+            self.fd
+                .set_one_reg(SYS_VMPIDR_EL2, &expected_mpidr.to_le_bytes())
+                .map_err(|err| {
+                    VcpuArchError::SetOneReg(SYS_VMPIDR_EL2, format!("{expected_mpidr:#x}"), err)
+                })?;
+
+            // Also set VPIDR_EL2 to the host's MIDR value.
+            // This is what a nested guest sees when it reads MIDR_EL1.
+            let mut midr_bytes = [0u8; 8];
+            self.fd
+                .get_one_reg(MIDR_EL1, &mut midr_bytes)
+                .map_err(|err| VcpuArchError::GetOneReg(MIDR_EL1, err))?;
+            let midr_value = u64::from_le_bytes(midr_bytes);
+            self.fd
+                .set_one_reg(SYS_VPIDR_EL2, &midr_value.to_le_bytes())
+                .map_err(|err| {
+                    VcpuArchError::SetOneReg(SYS_VPIDR_EL2, format!("{midr_value:#x}"), err)
+                })?;
+        }
 
         // Other vCPUs are powered off initially awaiting PSCI wakeup.
         if self.index == 0 {
