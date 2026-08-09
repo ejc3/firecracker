@@ -18,6 +18,18 @@ KVM_GET_ONE_REG = 1_074_835_115
 KVM_ARM_SET_COUNTER_OFFSET = 1_074_835_125
 
 
+def _ioctl_rules_for_request(fc_filter, request):
+    """Return every thread and ioctl rule that permits the request."""
+
+    return [
+        (thread, rule)
+        for thread, thread_filter in fc_filter.items()
+        for rule in thread_filter["filter"]
+        if rule.get("syscall") == "ioctl"
+        and any(argument.get("val") == request for argument in rule.get("args", []))
+    ]
+
+
 @pytest.fixture
 def bin_test_syscall(tmp_path):
     """Build the test_syscall binary."""
@@ -89,30 +101,37 @@ def test_validate_filter(seccompiler, bin_test_syscall, monkeypatch, tmp_path):
                     assert outcome.returncode == 159
 
 
+def test_ioctl_rule_search_scans_every_thread():
+    """Find matching ioctl rules outside the VMM thread."""
+
+    test_request = 0xA5A5A5A5
+    vmm_rule = {
+        "syscall": "ioctl",
+        "args": [{"index": 1, "type": "dword", "op": "eq", "val": test_request}],
+    }
+    api_rule = {
+        "syscall": "ioctl",
+        "args": [{"index": 1, "type": "dword", "op": "eq", "val": test_request}],
+    }
+    fc_filter = {
+        "vmm": {"filter": [vmm_rule]},
+        "api": {"filter": [api_rule]},
+        "vcpu": {"filter": []},
+    }
+
+    assert _ioctl_rules_for_request(fc_filter, test_request) == [
+        ("vmm", vmm_rule),
+        ("api", api_rule),
+    ]
+
+
 def test_counter_ioctls_have_exact_vmm_rules():
     """Allow only the exact Arm counter ioctl requests required by the VMM."""
 
     fc_filter_path = Path(f"../resources/seccomp/{ARCH}-unknown-linux-musl.json")
     fc_filter = json.loads(fc_filter_path.read_text(encoding="ascii"))
-    offset_rules = [
-        (thread, rule)
-        for thread, thread_filter in fc_filter.items()
-        for rule in thread_filter["filter"]
-        if rule.get("syscall") == "ioctl"
-        and any(
-            argument.get("val") == KVM_ARM_SET_COUNTER_OFFSET
-            for argument in rule.get("args", [])
-        )
-    ]
-    get_one_reg_rules = [
-        (thread, rule)
-        for thread, thread_filter in fc_filter.items()
-        for rule in thread_filter["filter"]
-        if rule.get("syscall") == "ioctl"
-        and any(
-            argument.get("val") == KVM_GET_ONE_REG for argument in rule.get("args", [])
-        )
-    ]
+    offset_rules = _ioctl_rules_for_request(fc_filter, KVM_ARM_SET_COUNTER_OFFSET)
+    get_one_reg_rules = _ioctl_rules_for_request(fc_filter, KVM_GET_ONE_REG)
     vmm_ioctl_rules = [
         rule for rule in fc_filter["vmm"]["filter"] if rule.get("syscall") == "ioctl"
     ]
