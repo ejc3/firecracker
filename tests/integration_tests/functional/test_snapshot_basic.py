@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Basic tests scenarios for snapshot save/restore."""
 
+import base64
 import dataclasses
 import filecmp
 import logging
@@ -633,6 +634,10 @@ def test_snapshot_rename_vsock(
 
 
 SLEEP_SECONDS = 30
+PAUSE_SECONDS = 5
+SNAPSHOT_PAUSE_SECONDS = 8
+GUEST_TIMER_SECONDS = 12
+RESTORED_TIMER_PROBE_SECONDS = 6
 
 CLOCK_SOURCES = {"x86_64": ["tsc", "kvm-clock"], "aarch64": ["arch_sys_counter"]}[
     global_props.cpu_architecture
@@ -655,13 +660,73 @@ def read_guest_clocksource(vm):
     return stdout.strip()
 
 
+def arm_guest_monotonic_timer(vm):
+    """Arm timerfd in the guest and wait for an explicit post-settime handshake."""
+    timer_program = f"""
+import ctypes
+import os
+from pathlib import Path
+
+
+class Timespec(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
+
+
+class Itimerspec(ctypes.Structure):
+    _fields_ = [("it_interval", Timespec), ("it_value", Timespec)]
+
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.timerfd_create.argtypes = [ctypes.c_int, ctypes.c_int]
+libc.timerfd_create.restype = ctypes.c_int
+libc.timerfd_settime.argtypes = [
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.POINTER(Itimerspec),
+    ctypes.POINTER(Itimerspec),
+]
+libc.timerfd_settime.restype = ctypes.c_int
+
+timer_fd = libc.timerfd_create(1, 0)  # CLOCK_MONOTONIC
+if timer_fd < 0:
+    error = ctypes.get_errno()
+    raise OSError(error, os.strerror(error))
+
+timer = Itimerspec(Timespec(0, 0), Timespec({GUEST_TIMER_SECONDS}, 0))
+if libc.timerfd_settime(timer_fd, 0, ctypes.byref(timer), None) != 0:
+    error = ctypes.get_errno()
+    raise OSError(error, os.strerror(error))
+
+# The marker is created only after timerfd_settime succeeds, so the host cannot
+# snapshot a process that has not armed its kernel timer yet.
+Path("/tmp/counter-timer-armed").touch()
+os.read(timer_fd, 8)
+Path("/tmp/counter-timer-fired").touch()
+"""
+    encoded_program = base64.b64encode(timer_program.encode("ascii")).decode("ascii")
+    vm.ssh.check_output(
+        "rm -f /tmp/counter-timer-armed /tmp/counter-timer-fired "
+        "/tmp/counter-timer.log /tmp/counter-timer.py; "
+        'python3 -c "import base64; '
+        "open('/tmp/counter-timer.py', 'wb').write("
+        f"base64.b64decode('{encoded_program}'))\"; "
+        "nohup python3 /tmp/counter-timer.py "
+        ">/tmp/counter-timer.log 2>&1 & timer_pid=$!; "
+        "for _ in $(seq 1 200); do "
+        "test -e /tmp/counter-timer-armed && exit 0; "
+        "kill -0 $timer_pid 2>/dev/null || "
+        "{ cat /tmp/counter-timer.log >&2; exit 1; }; "
+        "sleep 0.05; done; "
+        "cat /tmp/counter-timer.log >&2; exit 1"
+    )
+
+
 @pytest.mark.parametrize("clocksource", CLOCK_SOURCES)
 @pytest.mark.parametrize("clock_realtime", [False, True])
 def test_clocksource_snapshot_restore(
     uvm, microvm_factory, clocksource, clock_realtime
 ):
-    """Measure CLOCK_MONOTONIC before snapshot and after restore to determine
-    whether the clocksource jumps forward or resumes from where it left off."""
+    """Verify clock and timer continuity across pause and full snapshot restore."""
 
     if clock_realtime and clocksource != "kvm-clock":
         pytest.skip(f"Clocksource {clocksource} doesn't support clock_realtime flag")
@@ -688,10 +753,55 @@ def test_clocksource_snapshot_restore(
     if active != clocksource:
         pytest.skip(f"Clocksource {clocksource} not available")
 
+    # Exercise the runtime counter transition separately from restore. The
+    # repeated API requests prove an already-paused/already-running VM does not
+    # start a second counter interval or apply the pause delta twice.
+    if platform.machine() == "aarch64":
+        pause_before = read_guest_monotonic(vm)
+        pause_host_before = time.monotonic()
+        vm.pause()
+        vm.pause()
+        time.sleep(PAUSE_SECONDS)
+        vm.resume()
+        vm.resume()
+        pause_after = read_guest_monotonic(vm)
+        pause_host_after = time.monotonic()
+        pause_delta = pause_after - pause_before
+        pause_host_delta = pause_host_after - pause_host_before
+        excluded_delta = pause_host_delta - pause_delta
+        assert 0 <= pause_delta and excluded_delta > PAUSE_SECONDS / 2, (
+            f"Guest MONOTONIC advanced {pause_delta:.3f}s while host time advanced "
+            f"{pause_host_delta:.3f}s across a {PAUSE_SECONDS}s pause"
+        )
+
+        # This timerfd is a full-binary regression for the observed failure
+        # mode. The helper waits until timerfd_settime has succeeded, so the
+        # snapshot cannot race ahead of the timer actually being armed.
+        arm_guest_monotonic_timer(vm)
+
     guest_before = read_guest_monotonic(vm)
     host_before = time.monotonic()
 
+    if platform.machine() == "aarch64":
+        # Deliberately separate pause acknowledgement from state collection.
+        # The serialized counters must be normalized back to this exact pause
+        # point instead of aging by the host-side delay.
+        vm.pause()
+        time.sleep(SNAPSHOT_PAUSE_SECONDS)
+
     snapshot = vm.snapshot_full()
+
+    if platform.machine() == "aarch64":
+        # The source and every clone must continue from the same pause point.
+        vm.resume()
+        source_after = read_guest_monotonic(vm)
+        source_delta = source_after - guest_before
+        assert 0 <= source_delta < SNAPSHOT_PAUSE_SECONDS / 2, (
+            f"Source guest advanced {source_delta:.3f}s across a "
+            f"{SNAPSHOT_PAUSE_SECONDS}s snapshot pause"
+        )
+        vm.ssh.check_output("test ! -e /tmp/counter-timer-fired")
+
     vm.kill()
 
     print("Sleeping %ds between snapshot and restore...", SLEEP_SECONDS)
@@ -703,6 +813,14 @@ def test_clocksource_snapshot_restore(
 
     guest_after = read_guest_monotonic(restored_vm)
     host_after = time.monotonic()
+
+    if platform.machine() == "aarch64":
+        # Give an already-expired timer enough guest runtime to schedule its
+        # process; the fixed path still has half of its deadline left.
+        restored_vm.ssh.check_output(
+            f"sleep {RESTORED_TIMER_PROBE_SECONDS}; "
+            "test ! -e /tmp/counter-timer-fired"
+        )
 
     # Confirm clocksource survived the restore
     active_after = read_guest_clocksource(restored_vm)
@@ -732,3 +850,25 @@ def test_clocksource_snapshot_restore(
     assert (
         jumped == clock_realtime
     ), f"Clock {jumped_str} but clock_realtime was {"not" if clock_realtime else ""} set."
+
+    if platform.machine() == "aarch64":
+        assert 0 <= guest_delta < SNAPSHOT_PAUSE_SECONDS / 2, (
+            f"Restored guest advanced {guest_delta:.3f}s across a "
+            f"{SNAPSHOT_PAUSE_SECONDS}s snapshot pause"
+        )
+
+        # Restore the same snapshot again. A VM-wide domain must be rebuilt
+        # from the saved counter on every load, not inherited from the first
+        # restored process.
+        restored_vm.kill()
+        repeated_vm = microvm_factory.build_from_snapshot(snapshot)
+        repeated_guest = read_guest_monotonic(repeated_vm)
+        repeated_delta = repeated_guest - guest_before
+        assert (
+            0 <= repeated_delta < SNAPSHOT_PAUSE_SECONDS / 2
+        ), f"Guest MONOTONIC advanced {repeated_delta:.3f}s on repeated restore"
+        repeated_vm.ssh.check_output(
+            f"sleep {RESTORED_TIMER_PROBE_SECONDS}; "
+            "test ! -e /tmp/counter-timer-fired"
+        )
+        assert read_guest_clocksource(repeated_vm) == clocksource

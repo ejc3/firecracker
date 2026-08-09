@@ -1,7 +1,7 @@
 // Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use vmm::arch::aarch64::regs::{PC, RegSize, SYS_CNTPCT_EL0, SYS_CNTV_CVAL_EL0};
+use vmm::arch::aarch64::regs::{KVM_REG_ARM_TIMER_CNT, PC, RegSize, SYS_CNTPCT_EL0};
 use vmm::cpu_config::aarch64::custom_cpu_template::RegisterModifier;
 use vmm::cpu_config::templates::{CpuConfiguration, CustomCpuTemplate, RegisterValueFilter};
 use vmm::logger::warn;
@@ -39,9 +39,9 @@ pub fn config_to_template(cpu_config: &CpuConfiguration) -> CustomCpuTemplate {
 
 // List of register IDs excluded from the CPU configuration dump.
 const REG_EXCLUSION_LIST: [u64; 3] = [
-    // SYS_CNTV_CVAL_EL0 and SYS_CNTPCT_EL0 are timer registers and depend on the elapsed time.
+    // KVM_REG_ARM_TIMER_CNT and SYS_CNTPCT_EL0 are timer registers and depend on elapsed time.
     // This type of registers are not useful as guest CPU config dump.
-    SYS_CNTV_CVAL_EL0,
+    KVM_REG_ARM_TIMER_CNT,
     SYS_CNTPCT_EL0,
     // Program counter (PC) value is determined by the given kernel image. It should not be
     // overwritten by a custom CPU template and does not need to be tracked in a fingerprint file.

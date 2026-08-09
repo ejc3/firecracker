@@ -14,7 +14,7 @@ use crate::logger::warn;
 pub mod aarch64;
 
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::kvm::{Kvm, KvmArchError, OptionalCapabilities};
+pub use aarch64::kvm::{Kvm, KvmArchError};
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::vcpu::*;
 #[cfg(target_arch = "aarch64")]
