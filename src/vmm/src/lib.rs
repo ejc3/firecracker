@@ -253,6 +253,12 @@ pub enum VmmError {
     VcpuResume,
     /// Failed to message the vCPUs.
     VcpuMessage,
+    #[cfg(target_arch = "aarch64")]
+    /// Failed to maintain the VM-wide generic-counter domain: {0}
+    Counter(#[from] crate::arch::aarch64::CounterError),
+    #[cfg(target_arch = "aarch64")]
+    /// Failed to capture the paused counter ({0}) and to resume the vCPUs during rollback ({1}).
+    CounterPauseRollback(crate::arch::aarch64::CounterError, Box<VmmError>),
     /// Operation not supported on {0} VMs.
     NotSupportedOnVmType(&'static str),
     /// Cannot spawn Vcpu thread: {0}
@@ -465,8 +471,41 @@ impl Vmm {
             .vm
             .as_kvm()
             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
-        self.device_manager.kick_virtio_devices();
-        kvm_vm.resume_vcpus()?;
+
+        #[cfg(target_arch = "aarch64")]
+        kvm_vm.ensure_counter_healthy()?;
+
+        // Preserve the API's idempotent resume semantics. In particular, do
+        // not advance the Arm counter offset when the VM never entered a new
+        // pause interval.
+        #[cfg(target_arch = "aarch64")]
+        if self.instance_info.state == VmState::Running {
+            return Ok(());
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        match crate::arch::aarch64::counter::resume_in_order(
+            || kvm_vm.prepare_counter_resume(),
+            || self.device_manager.kick_virtio_devices(),
+            || kvm_vm.resume_vcpus(),
+            || kvm_vm.mark_counter_running(),
+            || kvm_vm.mark_counter_faulted(),
+        ) {
+            Ok(()) => {}
+            Err(crate::arch::aarch64::counter::ResumeTransitionError::Counter(error)) => {
+                return Err(VmmError::Counter(error));
+            }
+            Err(crate::arch::aarch64::counter::ResumeTransitionError::Resume(error)) => {
+                return Err(error);
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.device_manager.kick_virtio_devices();
+            kvm_vm.resume_vcpus()?;
+        }
+
         self.instance_info.state = VmState::Running;
         Ok(())
     }
@@ -477,7 +516,50 @@ impl Vmm {
             .vm
             .as_kvm()
             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
+
+        #[cfg(target_arch = "aarch64")]
+        kvm_vm.ensure_counter_healthy()?;
+
+        // Preserve the API's idempotent pause semantics. Re-capturing the Arm
+        // counter would otherwise move the start of the same pause interval.
+        #[cfg(target_arch = "aarch64")]
+        if self.instance_info.state == VmState::Paused {
+            return Ok(());
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        match crate::arch::aarch64::counter::pause_in_order(
+            || kvm_vm.ensure_counter_can_pause(),
+            || kvm_vm.pause_vcpus(),
+            || kvm_vm.record_counter_pause(),
+            || {
+                self.device_manager.kick_virtio_devices();
+                kvm_vm.resume_vcpus()
+            },
+            || kvm_vm.mark_counter_faulted(),
+        ) {
+            Ok(()) => {}
+            Err(crate::arch::aarch64::counter::PauseTransitionError::Counter(error)) => {
+                return Err(VmmError::Counter(error));
+            }
+            Err(crate::arch::aarch64::counter::PauseTransitionError::Pause(error)) => {
+                return Err(error);
+            }
+            Err(crate::arch::aarch64::counter::PauseTransitionError::Rollback(
+                counter_error,
+                resume_error,
+            )) => {
+                self.instance_info.state = VmState::Paused;
+                return Err(VmmError::CounterPauseRollback(
+                    counter_error,
+                    Box::new(resume_error),
+                ));
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
         kvm_vm.pause_vcpus()?;
+
         self.instance_info.state = VmState::Paused;
         Ok(())
     }
@@ -500,17 +582,35 @@ impl Vmm {
     pub fn save_state(&mut self, vm_info: &VmInfo) -> Result<MicrovmState, MicrovmStateError> {
         self.check_unsnapshottable_devices()?;
 
+        let kvm_vm = self
+            .vm
+            .as_kvm()
+            .ok_or_else(|| MicrovmStateError::NotAllowed("save_state requires KVM".into()))?;
+
+        #[cfg(target_arch = "aarch64")]
+        if self.instance_info.state != VmState::Paused {
+            return Err(MicrovmStateError::NotAllowed(
+                "save_state requires a paused VM".into(),
+            ));
+        }
+
+        // Arm snapshots must originate from a supported, coherent paused
+        // counter domain. Capture the exact pause point before collecting any
+        // device or KVM state, then reuse it below to remove pause-to-save
+        // drift from the existing serialized counter registers.
+        #[cfg(target_arch = "aarch64")]
+        let paused_counter = kvm_vm.paused_counter_for_snapshot()?;
+
         // We need to save device state before saving KVM state.
         // Some devices, (at the time of writing this comment block device with async engine)
         // might modify the VirtIO transport and send an interrupt to the guest. If we save KVM
         // state before we save device state, that interrupt will never be delivered to the guest
         // upon resuming from the snapshot.
         let device_states = self.device_manager.save();
-        let kvm_vm = self
-            .vm
-            .as_kvm()
-            .ok_or_else(|| MicrovmStateError::NotAllowed("save_state requires KVM".into()))?;
-        let vcpu_states = kvm_vm.save_vcpu_states()?;
+        #[allow(unused_mut)]
+        let mut vcpu_states = kvm_vm.save_vcpu_states()?;
+        #[cfg(target_arch = "aarch64")]
+        kvm_vm.normalize_snapshot_counters(&mut vcpu_states, paused_counter)?;
         let kvm_state = kvm_vm.kvm().save_state();
         let vm_state = {
             #[cfg(target_arch = "x86_64")]

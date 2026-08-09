@@ -361,16 +361,23 @@ For vendor-specific recommendations, please consult the resources below:
 - ARM:
   [Speculative Processor Vulnerability](https://developer.arm.com/support/arm-security-updates/speculative-processor-vulnerability)
 
-##### [ARM only] VM Physical counter behaviour
+##### [ARM only] VM generic-counter behaviour
 
-On ARM, Firecracker tries to reset the `CNTPCT` physical counter on VM boot.
-This is done in order to prevent VM from reading host physical counter value.
-Firecracker will only try to reset the counter if the host KVM contains
-`KVM_CAP_COUNTER_OFFSET` capability. This capability is only present in kernels
-containing
+When host KVM advertises `KVM_CAP_COUNTER_OFFSET`, Firecracker owns the VM-wide
+physical and virtual counter offsets through `KVM_ARM_SET_COUNTER_OFFSET`. It
+zero-bases both counter views before boot, freezes guest time while the VM is
+paused, and restores the same counter domain before replaying any saved vCPU
+register. Snapshot counter samples are normalized to the exact vCPU pause point,
+so time spent collecting or writing a snapshot does not age guest timers.
+
+The capability was introduced by
 [this](https://lore.kernel.org/all/20230330174800.2677007-1-maz@kernel.org/)
-patch series (starting from 6.4 and newer). For older kernels the counter value
-will be passed through from the host.
+patch series and is available starting with Linux 6.4, as well as kernels that
+backport it. A host without the capability can still boot a fresh microVM with
+the host counter view, but Firecracker rejects pause/snapshot and restore
+because it cannot preserve timer coherence. If KVM advertises the capability but
+a counter read or offset update fails, Firecracker reports the error instead of
+silently falling back to incoherent timer behavior.
 
 ##### Verification
 

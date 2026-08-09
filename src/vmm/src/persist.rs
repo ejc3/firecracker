@@ -138,6 +138,9 @@ pub enum MicrovmStateError {
     SaveVcpuState(vstate::vcpu::VcpuError),
     /// Cannot save KvmVm state: {0}
     SaveVmState(vstate::vm::KvmVmError),
+    #[cfg(target_arch = "aarch64")]
+    /// Cannot save the VM-wide generic-counter domain: {0}
+    Counter(#[from] crate::arch::aarch64::CounterError),
     /// Cannot signal Vcpu: {0}
     SignalVcpu(VcpuSendEventError),
     /// Vcpu is in unexpected state.
