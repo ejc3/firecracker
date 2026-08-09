@@ -1,12 +1,13 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::convert::{From, TryInto};
-use std::io;
-
 use serde::{Deserialize, Serialize};
 
+use crate::devices::virtio::device::VirtioDeviceType;
 use crate::rate_limiter::{BucketUpdate, RateLimiter, TokenBucket};
+use crate::vmm_config::drive::BlockDeviceConfig;
+use crate::vmm_config::net::NetworkInterfaceConfig;
+use crate::vmm_config::pmem::PmemConfig;
 
 /// Wrapper for configuring the balloon device.
 pub mod balloon;
@@ -36,14 +37,31 @@ pub mod snapshot;
 /// Wrapper for configuring the vsock devices attached to the microVM.
 pub mod vsock;
 
-// TODO: Migrate the VMM public-facing code (i.e. interface) to use stateless structures,
-// for receiving data/args, such as the below `RateLimiterConfig` and `TokenBucketConfig`.
-// Also todo: find a better suffix than `Config`; it should illustrate the static nature
-// of the enclosed data.
-// Currently, data is passed around using live/stateful objects. Switching to static/stateless
-// objects will simplify both the ownership model and serialization.
-// Public access would then be more tightly regulated via `VmmAction`s, consisting of tuples like
-// (entry-point-into-VMM-logic, stateless-args-structure).
+#[allow(missing_docs)]
+#[derive(Debug)]
+pub enum HotplugDeviceConfig {
+    Block(BlockDeviceConfig),
+    Pmem(PmemConfig),
+    Net(NetworkInterfaceConfig),
+}
+
+impl HotplugDeviceConfig {
+    pub(crate) fn device_id(&self) -> &str {
+        match self {
+            Self::Block(cfg) => &cfg.drive_id,
+            Self::Pmem(cfg) => &cfg.id,
+            Self::Net(cfg) => &cfg.iface_id,
+        }
+    }
+
+    pub(crate) fn device_type(&self) -> VirtioDeviceType {
+        match self {
+            Self::Block(_) => VirtioDeviceType::Block,
+            Self::Pmem(_) => VirtioDeviceType::Pmem,
+            Self::Net(_) => VirtioDeviceType::Net,
+        }
+    }
+}
 
 /// A public-facing, stateless structure, holding all the data we need to create a TokenBucket
 /// (live) object.
@@ -127,12 +145,10 @@ impl From<Option<RateLimiterConfig>> for RateLimiterUpdate {
     }
 }
 
-impl TryInto<RateLimiter> for RateLimiterConfig {
-    type Error = io::Error;
-
-    fn try_into(self) -> Result<RateLimiter, Self::Error> {
-        let bw = self.bandwidth.unwrap_or_default();
-        let ops = self.ops.unwrap_or_default();
+impl From<RateLimiterConfig> for RateLimiter {
+    fn from(cfg: RateLimiterConfig) -> Self {
+        let bw = cfg.bandwidth.unwrap_or_default();
+        let ops = cfg.ops.unwrap_or_default();
         RateLimiter::new(
             bw.size,
             bw.one_time_burst.unwrap_or(0),
@@ -187,7 +203,7 @@ mod tests {
                 refill_time: REFILL_TIME * 2,
             }),
         };
-        let rl: RateLimiter = rlconf.try_into().unwrap();
+        let rl: RateLimiter = rlconf.into();
         assert_eq!(rl.bandwidth().unwrap().capacity(), SIZE);
         assert_eq!(rl.bandwidth().unwrap().one_time_burst(), ONE_TIME_BURST);
         assert_eq!(rl.bandwidth().unwrap().refill_time_ms(), REFILL_TIME);
@@ -211,7 +227,7 @@ mod tests {
             bandwidth: Some(bw_tb_cfg),
             ops: None,
         };
-        let rl: RateLimiter = rl_conf.try_into().unwrap();
+        let rl: RateLimiter = rl_conf.into();
         let generated_rl_conf = RateLimiterConfig::from(&rl);
         assert_eq!(generated_rl_conf, rl_conf);
         assert_eq!(generated_rl_conf.into_option(), Some(rl_conf));

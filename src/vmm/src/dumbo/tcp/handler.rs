@@ -18,8 +18,6 @@ use crate::dumbo::pdu::tcp::{Flags as TcpFlags, TcpError as TcpSegmentError, Tcp
 use crate::dumbo::tcp::endpoint::Endpoint;
 use crate::dumbo::tcp::{NextSegmentStatus, RstConfig};
 
-// TODO: This is currently IPv4 specific. Maybe change it to a more generic implementation.
-
 /// Describes events which may occur when the handler receives packets.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RecvEvent {
@@ -349,7 +347,6 @@ impl TcpIPv4Handler {
         }
     }
 
-    // TODO: I guess this should be refactored at some point to also remove the endpoint if found.
     fn find_evictable_connection(&self) -> Option<ConnectionTuple> {
         for (tuple, endpoint) in self.connections.iter() {
             if endpoint.is_evictable() {
@@ -821,5 +818,49 @@ mod tests {
         assert_eq!(drain_packets(&mut h, local_addr, remote_addr), Ok(1));
         assert_eq!(h.connections.len(), 1);
         assert_eq!(h.active_connections.len(), 0);
+    }
+
+    #[test]
+    fn test_syn_with_unusable_mss() {
+        let local_addr = Ipv4Addr::new(169, 254, 169, 254);
+        let local_port = 80;
+        let remote_addr = Ipv4Addr::new(10, 0, 0, 1);
+        let remote_port = 1012;
+
+        let mut h = TcpIPv4Handler::new(
+            local_addr,
+            local_port,
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        );
+
+        let mut buf = [0u8; 100];
+        let mut p =
+            IPv4Packet::write_header(buf.as_mut(), PROTOCOL_TCP, remote_addr, local_addr).unwrap();
+        let segment_len = TcpSegment::write_segment::<[u8]>(
+            p.inner_mut().payload_mut(),
+            remote_port,
+            local_port,
+            123,
+            0,
+            TcpFlags::SYN,
+            10000,
+            Some(u16::MAX),
+            u16::MAX,
+            None,
+            None,
+        )
+        .unwrap()
+        .len();
+        let p = p.with_payload_len_unchecked(segment_len, false);
+
+        // No connection is created, and nothing is sent in response.
+        assert_eq!(
+            h.receive_packet(&p, mock_callback),
+            Ok(RecvEvent::FailedNewConnection)
+        );
+        assert_eq!(h.connections.len(), 0);
+        assert_eq!(h.next_segment_status(), NextSegmentStatus::Nothing);
+        assert_eq!(drain_packets(&mut h, local_addr, remote_addr), Ok(0));
     }
 }

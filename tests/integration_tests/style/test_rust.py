@@ -1,10 +1,9 @@
 # Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Tests ensuring codebase style compliance for Rust."""
-from collections import defaultdict
 
 from framework import utils
-from host_tools.fcmetrics import extract_fields, find_metrics_files, is_metric_used
+from host_tools.fcmetrics import find_unused_metrics
 
 
 def test_rust_order():
@@ -18,11 +17,8 @@ def test_rust_order():
 
 def test_rust_style():
     """Test that rust code passes style checks."""
-
-    #  ../src/io_uring/src/bindings.rs
-    config = open("fmt.toml", encoding="utf-8").read().replace("\n", ",")
     # Check that the output is empty.
-    _, stdout, _ = utils.check_output(f"cargo fmt --all -- --check --config {config}")
+    _, stdout, _ = utils.check_output("cargo fmt --all -- --check")
 
     # rustfmt prepends `"Diff in"` to the reported output.
     assert "Diff in" not in stdout
@@ -31,21 +27,8 @@ def test_rust_style():
 def test_unused_metrics():
     """Tests that all metrics defined in Firecracker's metrics.rs files actually have code
     paths that increment them."""
-    metrics_files = find_metrics_files()
-    unused = defaultdict(list)
+    unused = find_unused_metrics()
 
-    assert metrics_files
-
-    for file_path in metrics_files:
-        fields = extract_fields(file_path)
-        if not fields:
-            continue
-
-        for field, ty in fields:
-            if not is_metric_used(field, ty):
-                unused[file_path].append((field, ty))
-
-    # Grouped output
     for file_path, fields in unused.items():
         print(f"📄 Defined in: {file_path}")
         print("Possibly Unused: \n")

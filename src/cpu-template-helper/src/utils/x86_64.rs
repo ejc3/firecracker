@@ -186,7 +186,9 @@ macro_rules! msr_modifier {
     };
 }
 
-pub(crate) use {cpuid_leaf_modifier, cpuid_reg_modifier, msr_modifier};
+pub(crate) use cpuid_leaf_modifier;
+pub(crate) use cpuid_reg_modifier;
+pub(crate) use msr_modifier;
 
 #[cfg(test)]
 mod tests {
@@ -194,7 +196,6 @@ mod tests {
     use vmm::cpu_config::x86_64::custom_cpu_template::CpuidRegisterModifier;
 
     use super::*;
-    use crate::utils::x86_64::{cpuid_leaf_modifier, cpuid_reg_modifier, msr_modifier};
 
     macro_rules! cpuid_modifier_map {
         ($leaf:expr, $subleaf:expr, $flags:expr, $register:expr, $value:expr) => {

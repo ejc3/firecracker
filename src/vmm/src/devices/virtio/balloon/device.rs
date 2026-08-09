@@ -5,7 +5,6 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
-use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use utils::time::TimerFd;
 use vmm_sys_util::eventfd::EventFd;
@@ -28,12 +27,11 @@ use super::{
     VIRTIO_BALLOON_S_OOM_KILL, VIRTIO_BALLOON_S_SWAP_IN, VIRTIO_BALLOON_S_SWAP_OUT,
 };
 use crate::devices::virtio::balloon::BalloonError;
-use crate::devices::virtio::device::ActiveState;
+use crate::devices::virtio::device::{ActiveState, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
-use crate::devices::virtio::generated::virtio_ids::VIRTIO_ID_BALLOON;
 use crate::devices::virtio::queue::InvalidAvailIdx;
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
-use crate::logger::{IncMetric, log_dev_preview_warning};
+use crate::logger::{IncMetric, debug, error, info, log_dev_preview_warning, warn};
 use crate::utils::u64_to_usize;
 use crate::vstate::memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestMemoryExtension, GuestMemoryMmap,
@@ -42,6 +40,16 @@ use crate::{impl_device_type, mem_size_mib};
 
 const SIZE_OF_U32: usize = std::mem::size_of::<u32>();
 const SIZE_OF_STAT: usize = std::mem::size_of::<BalloonStat>();
+/// Upper bound on the number of stats tags a guest may report.
+/// The VirtIO spec currently defines 16, but newer kernel versions can
+/// add more (e.g. Linux 6.12 added several, see 74c025c5d7e4). We use a
+/// generous limit that still bounds computation without breaking on future
+/// kernels.
+const MAX_STATS_TAGS: u32 = 256;
+/// Maximum valid stats descriptor length in bytes.
+/// Descriptors exceeding this are rejected to prevent unbounded iteration.
+#[allow(clippy::cast_possible_truncation)]
+const MAX_STATS_DESC_LEN: u32 = MAX_STATS_TAGS * std::mem::size_of::<BalloonStat>() as u32;
 
 fn mib_to_pages(amount_mib: u32) -> Result<u32, BalloonError> {
     amount_mib
@@ -84,7 +92,7 @@ fn default_ack_on_stop() -> bool {
     true
 }
 
-/// Command recieved from the API to start a hinting run
+/// Command received from the API to start a hinting run
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct StartHintingCmd {
     /// If we should automatically acknowledge end of the run after stop.
@@ -392,7 +400,7 @@ impl Balloon {
                 let max_len = MAX_PAGES_IN_DESC * SIZE_OF_U32;
                 valid_descs_found = true;
 
-                if !head.is_write_only() && len % SIZE_OF_U32 == 0 {
+                if !head.is_write_only() && len.is_multiple_of(SIZE_OF_U32) {
                     // Check descriptor pfn count.
                     if len > max_len {
                         error!(
@@ -489,7 +497,24 @@ impl Balloon {
                 // the protocol, but return it if we find one.
                 error!("balloon: driver is not compliant, more than one stats buffer received");
                 self.queues[STATS_INDEX].add_used(prev_stats_desc, 0)?;
+                self.queues[STATS_INDEX].advance_used_ring_idx();
+                self.signal_used_queue(STATS_INDEX)?;
             }
+
+            // Reject oversized descriptors to prevent a guest from causing
+            // excessive iteration on the VMM event loop.
+            // We still hold onto the descriptor (via stats_desc_index below)
+            // so that the stats request/response protocol is preserved and
+            // trigger_stats_update can return it to the guest later.
+            if head.len > MAX_STATS_DESC_LEN {
+                warn!(
+                    "balloon: stats descriptor too large: {} > {}, skipping",
+                    head.len, MAX_STATS_DESC_LEN
+                );
+                self.stats_desc_index = Some(head.index);
+                continue;
+            }
+
             for index in (0..head.len).step_by(SIZE_OF_STAT) {
                 // Read the address at position `index`. The only case
                 // in which this fails is if there is overflow,
@@ -666,12 +691,13 @@ impl Balloon {
             return Err(err);
         }
 
-        Ok(())
-    }
+        // Under fuzzing, also process the stats queue since we can't use the timer-driven path.
+        #[cfg(feature = "fuzzing")]
+        if self.stats_enabled() {
+            _ = self.process_stats_queue();
+        }
 
-    /// Provides the ID of this balloon device.
-    pub fn id(&self) -> &str {
-        BALLOON_DEV_ID
+        Ok(())
     }
 
     fn trigger_stats_update(&mut self) -> Result<(), BalloonError> {
@@ -863,7 +889,11 @@ impl Balloon {
 }
 
 impl VirtioDevice for Balloon {
-    impl_device_type!(VIRTIO_ID_BALLOON);
+    impl_device_type!(VirtioDeviceType::Balloon);
+
+    fn id(&self) -> &str {
+        BALLOON_DEV_ID
+    }
 
     fn avail_features(&self) -> u64 {
         self.avail_features
@@ -897,13 +927,8 @@ impl VirtioDevice for Balloon {
             .deref()
     }
 
-    fn read_config(&self, offset: u64, data: &mut [u8]) {
-        if let Some(config_space_bytes) = self.config_space.as_slice().get(u64_to_usize(offset)..) {
-            let len = config_space_bytes.len().min(data.len());
-            data[..len].copy_from_slice(&config_space_bytes[..len]);
-        } else {
-            error!("Failed to read config space");
-        }
+    fn config_as_bytes(&self) -> &[u8] {
+        self.config_space.as_slice()
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
@@ -914,7 +939,12 @@ impl VirtioDevice for Balloon {
             .zip(end)
             .and_then(|(start, end)| config_space_bytes.get_mut(start..end))
         else {
-            error!("Failed to write config space");
+            warn!(
+                "virtio-balloon: guest driver attempted to write device config out of bounds \
+                 (offset={:#x}, len={:#x})",
+                offset,
+                data.len()
+            );
             return;
         };
 
@@ -926,6 +956,8 @@ impl VirtioDevice for Balloon {
         mem: GuestMemoryMmap,
         interrupt: Arc<dyn VirtioInterrupt>,
     ) -> Result<(), ActivateError> {
+        assert!(!self.is_activated());
+
         for q in self.queues.iter_mut() {
             q.initialize(&mem)
                 .map_err(ActivateError::QueueMemoryError)?;
@@ -949,17 +981,31 @@ impl VirtioDevice for Balloon {
         self.device_state.is_activated()
     }
 
+    fn deactivate(&mut self) {
+        self.device_state = DeviceState::Inactive;
+    }
+
+    fn _reset(&mut self) -> bool {
+        self.config_space.actual_pages = 0;
+        self.config_space.free_page_hint_cmd_id = FREE_PAGE_HINT_STOP;
+        self.stats_timer.arm(Duration::ZERO, None);
+        self.stats_desc_index = None;
+        self.latest_stats = BalloonStats::default();
+        self.hinting_state = Default::default();
+        true
+    }
+
     fn kick(&mut self) {
-        // If device is activated, kick the balloon queue(s) to make up for any
-        // pending or in-flight epoll events we may have not captured in snapshot.
-        // Stats queue doesn't need kicking as it is notified via a `timer_fd`.
         if self.is_activated() {
-            info!("kick balloon {}.", self.id());
             if self.free_page_hinting() {
-                // On restore we reset back to DONE to ensure everythign is freed
+                info!(
+                    "[{:?}:{}] resetting free page hinting to DONE",
+                    self.device_type(),
+                    self.id()
+                );
                 self.update_free_page_hint_cmd(FREE_PAGE_HINT_DONE);
             }
-            self.process_virtio_queues();
+            self.notify_queue_events();
         }
     }
 }
@@ -971,7 +1017,6 @@ pub(crate) mod tests {
     use super::super::BALLOON_CONFIG_SPACE_SIZE;
     use super::*;
     use crate::arch::host_page_size;
-    use crate::check_metric_after_block;
     use crate::devices::virtio::balloon::report_balloon_event_fail;
     use crate::devices::virtio::balloon::test_utils::{
         check_request_completion, invoke_handler_for_queue_event, set_request,
@@ -982,8 +1027,8 @@ pub(crate) mod tests {
     };
     use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt, default_mem};
     use crate::test_utils::single_region_mem;
-    use crate::utils::align_up;
     use crate::vstate::memory::GuestAddress;
+    use crate::{align_up, check_metric_after_block};
 
     impl VirtioTestDevice for Balloon {
         fn set_queues(&mut self, queues: Vec<Queue>) {
@@ -1125,7 +1170,7 @@ pub(crate) mod tests {
         for (reporting, hinting, deflate_on_oom, stats_interval) in combinations {
             let mut balloon =
                 Balloon::new(0, *deflate_on_oom, *stats_interval, *hinting, *reporting).unwrap();
-            assert_eq!(balloon.device_type(), VIRTIO_ID_BALLOON);
+            assert_eq!(balloon.device_type(), VirtioDeviceType::Balloon);
 
             let features: u64 = (1u64 << VIRTIO_F_VERSION_1)
                 | (u64::from(*deflate_on_oom) << VIRTIO_BALLOON_F_DEFLATE_ON_OOM)
@@ -1151,7 +1196,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_virtio_read_config() {
+    fn test_config_as_bytes() {
         let balloon = Balloon::new(0x10, true, 0, false, false).unwrap();
 
         let cfg = BalloonConfig {
@@ -1163,29 +1208,14 @@ pub(crate) mod tests {
         };
         assert_eq!(balloon.config(), cfg);
 
-        let mut actual_config_space = [0u8; BALLOON_CONFIG_SPACE_SIZE];
-        balloon.read_config(0, &mut actual_config_space);
-        // The first 4 bytes are num_pages, the last 4 bytes are actual_pages.
-        // The config space is little endian.
-        // 0x10 MB in the constructor corresponds to 0x1000 pages in the
-        // config space.
-        let expected_config_space: [u8; BALLOON_CONFIG_SPACE_SIZE] = [
+        let config = balloon.config_as_bytes();
+        assert_eq!(config.len(), BALLOON_CONFIG_SPACE_SIZE);
+        // The first 4 bytes are num_pages (LE), the last 4 bytes are actual_pages.
+        // 0x10 MB = 0x1000 pages.
+        let expected: [u8; BALLOON_CONFIG_SPACE_SIZE] = [
             0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
-        assert_eq!(actual_config_space, expected_config_space);
-
-        // Invalid read.
-        let expected_config_space: [u8; BALLOON_CONFIG_SPACE_SIZE] = [
-            0xd, 0xe, 0xa, 0xd, 0xb, 0xe, 0xe, 0xf, 0x00, 0x00, 0x00, 0x00,
-        ];
-        actual_config_space = expected_config_space;
-        balloon.read_config(
-            BALLOON_CONFIG_SPACE_SIZE as u64 + 1,
-            &mut actual_config_space,
-        );
-
-        // Validate read failed (the config space was not updated).
-        assert_eq!(actual_config_space, expected_config_space);
+        assert_eq!(config, expected);
     }
 
     #[test]
@@ -1558,7 +1588,7 @@ pub(crate) mod tests {
         let page_size_chain = page_size as u32;
         let reporting_idx = th.device().free_page_reporting_idx();
 
-        let safe_addr = align_up(th.data_address(), page_size);
+        let safe_addr = align_up!(th.data_address(), page_size);
 
         th.add_scatter_gather(reporting_idx, 0, &[(0, safe_addr, page_size_chain, 0)]);
         check_metric_after_block!(
@@ -1613,7 +1643,7 @@ pub(crate) mod tests {
 
             let page_size = host_page_size() as u64;
             let hinting_idx = th.device().free_page_hinting_idx();
-            let safe_addr = align_up(th.data_address(), page_size);
+            let safe_addr = align_up!(th.data_address(), page_size);
 
             // Ack the config set on start
             th.device()
@@ -1940,5 +1970,72 @@ pub(crate) mod tests {
         balloon.write_config(0, &expected_config);
         assert_eq!(balloon.num_pages(), 0x1122_3344);
         assert_eq!(balloon.actual_pages(), 0x1234_5678);
+    }
+
+    /// Test that process_stats_queue holds oversized descriptors without
+    /// updating stats, and updates stats for valid-length ones.
+    #[test]
+    fn test_stats_queue_oversized_descriptor_rejected() {
+        struct TestCase {
+            desc_len: u32,
+            stats_updated: bool,
+        }
+
+        let cases = [
+            TestCase {
+                desc_len: MAX_STATS_DESC_LEN + 1,
+                stats_updated: false,
+            },
+            TestCase {
+                desc_len: MAX_STATS_DESC_LEN,
+                stats_updated: true,
+            },
+        ];
+
+        let stat_addr: u64 = 0x1000;
+
+        for tc in &cases {
+            let mut balloon = Balloon::new(0, true, 1, false, false).unwrap();
+            let mem = default_mem();
+            let statsq = VirtQueue::new(GuestAddress(0), &mem, 16);
+            balloon.set_queue(INFLATE_INDEX, statsq.create_queue());
+            balloon.set_queue(DEFLATE_INDEX, statsq.create_queue());
+            balloon.set_queue(STATS_INDEX, statsq.create_queue());
+            balloon.activate(mem.clone(), default_interrupt()).unwrap();
+
+            // Fill the descriptor region with a recognisable stat value.
+            let n_stats = tc.desc_len as usize / SIZE_OF_STAT;
+            for i in 0..n_stats {
+                mem.write_obj::<BalloonStat>(
+                    BalloonStat {
+                        tag: VIRTIO_BALLOON_S_MEMFREE,
+                        val: 0xBEEF,
+                    },
+                    GuestAddress(stat_addr + (i * SIZE_OF_STAT) as u64),
+                )
+                .unwrap();
+            }
+
+            set_request(&statsq, 0, stat_addr, tc.desc_len, VIRTQ_DESC_F_NEXT);
+            balloon.queue_events()[STATS_INDEX].write(1).unwrap();
+            balloon.process_stats_queue_event().unwrap();
+
+            // The descriptor should always be held (stats protocol preserved)
+            // regardless of whether the stats were updated.
+            assert!(
+                balloon.stats_desc_index.is_some(),
+                "desc_len={}: descriptor should be held",
+                tc.desc_len,
+            );
+
+            // Verify stats were only updated for valid descriptors.
+            assert_eq!(
+                balloon.latest_stats.free_memory.is_some(),
+                tc.stats_updated,
+                "desc_len={}: expected stats_updated={}",
+                tc.desc_len,
+                tc.stats_updated,
+            );
+        }
     }
 }

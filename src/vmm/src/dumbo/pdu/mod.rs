@@ -18,7 +18,6 @@ pub mod bytes;
 pub mod ethernet;
 pub mod ipv4;
 pub mod tcp;
-pub mod udp;
 
 /// This is the baseline definition of the `Incomplete` struct, which wraps a PDU that does is
 /// still missing some values or content.
@@ -96,7 +95,7 @@ fn compute_checksum<T: NetworkBytes + Debug>(
         sum += usize::from(bytes.ntohs_unchecked(i * 2));
     }
 
-    if len % 2 != 0 {
+    if !len.is_multiple_of(2) {
         sum += usize::from(bytes[len - 1]) << 8;
     }
 

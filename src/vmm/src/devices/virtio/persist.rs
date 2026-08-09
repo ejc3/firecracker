@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use super::queue::{InvalidAvailIdx, QueueError};
 use super::transport::mmio::IrqTrigger;
-use crate::devices::virtio::device::VirtioDevice;
+use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use crate::devices::virtio::queue::Queue;
 use crate::devices::virtio::transport::mmio::MmioTransport;
@@ -114,10 +114,10 @@ impl Persist<'_> for Queue {
 }
 
 /// State of a VirtioDevice.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtioDeviceState {
     /// Device type.
-    pub device_type: u32,
+    pub device_type: VirtioDeviceType,
     /// Available virtio features.
     pub avail_features: u64,
     /// Negotiated virtio features.
@@ -145,7 +145,7 @@ impl VirtioDeviceState {
     pub fn build_queues_checked(
         &self,
         mem: &GuestMemoryMmap,
-        expected_device_type: u32,
+        expected_device_type: VirtioDeviceType,
         expected_num_queues: usize,
         expected_queue_max_size: u16,
     ) -> Result<Vec<Queue>, PersistError> {
@@ -268,7 +268,6 @@ mod tests {
     use crate::devices::virtio::test_utils::default_mem;
     use crate::devices::virtio::transport::mmio::tests::DummyDevice;
     use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
-    use crate::snapshot::Snapshot;
 
     const DEFAULT_QUEUE_MAX_SIZE: u16 = 256;
     impl Default for QueueState {
@@ -290,31 +289,45 @@ mod tests {
     #[test]
     fn test_virtiodev_sanity_checks() {
         let max_size = DEFAULT_QUEUE_MAX_SIZE;
-        let mut state = VirtioDeviceState::default();
+        let mut state = VirtioDeviceState {
+            device_type: VirtioDeviceType::Net,
+            avail_features: 0,
+            acked_features: 0,
+            queues: vec![],
+            activated: false,
+        };
         let mem = default_mem();
         // Valid checks.
-        state.build_queues_checked(&mem, 0, 0, max_size).unwrap();
+        state
+            .build_queues_checked(&mem, VirtioDeviceType::Net, 0, max_size)
+            .unwrap();
         // Invalid dev-type.
         state
-            .build_queues_checked(&mem, 1, 0, max_size)
+            .build_queues_checked(&mem, VirtioDeviceType::Block, 0, max_size)
             .unwrap_err();
         // Invalid num-queues.
         state
-            .build_queues_checked(&mem, 0, 1, max_size)
+            .build_queues_checked(&mem, VirtioDeviceType::Net, 1, max_size)
             .unwrap_err();
         // Unavailable features acked.
         state.acked_features = 1;
         state
-            .build_queues_checked(&mem, 0, 0, max_size)
+            .build_queues_checked(&mem, VirtioDeviceType::Net, 0, max_size)
             .unwrap_err();
 
         // Validate queue sanity checks.
-        let mut state = VirtioDeviceState::default();
+        let mut state = VirtioDeviceState {
+            device_type: VirtioDeviceType::Net,
+            avail_features: 0,
+            acked_features: 0,
+            queues: vec![],
+            activated: false,
+        };
         let good_q = QueueState::default();
         state.queues = vec![good_q];
         // Valid.
         state
-            .build_queues_checked(&mem, 0, state.queues.len(), max_size)
+            .build_queues_checked(&mem, VirtioDeviceType::Net, state.queues.len(), max_size)
             .unwrap();
 
         // Invalid max queue size.
@@ -324,7 +337,7 @@ mod tests {
         };
         state.queues = vec![bad_q];
         state
-            .build_queues_checked(&mem, 0, state.queues.len(), max_size)
+            .build_queues_checked(&mem, VirtioDeviceType::Net, state.queues.len(), max_size)
             .unwrap_err();
 
         // Invalid: size > max.
@@ -335,7 +348,7 @@ mod tests {
         state.queues = vec![bad_q];
         state.activated = true;
         state
-            .build_queues_checked(&mem, 0, state.queues.len(), max_size)
+            .build_queues_checked(&mem, VirtioDeviceType::Net, state.queues.len(), max_size)
             .unwrap_err();
 
         // activated && !q.is_valid()
@@ -343,7 +356,7 @@ mod tests {
         state.queues = vec![bad_q];
         state.activated = true;
         state
-            .build_queues_checked(&mem, 0, state.queues.len(), max_size)
+            .build_queues_checked(&mem, VirtioDeviceType::Net, state.queues.len(), max_size)
             .unwrap_err();
     }
 
@@ -356,23 +369,15 @@ mod tests {
         queue.size = queue.max_size;
         queue.initialize(&mem).unwrap();
 
-        let mut bytes = vec![0; 4096];
-
-        Snapshot::new(queue.save())
-            .save(&mut bytes.as_mut_slice())
-            .unwrap();
+        let queue_state = queue.save();
+        let serialized_data = bitcode::serialize(&queue_state).unwrap();
 
         let ca = QueueConstructorArgs {
             mem,
             is_activated: true,
         };
-        let restored_queue = Queue::restore(
-            ca,
-            &Snapshot::load_without_crc_check(bytes.as_slice())
-                .unwrap()
-                .data,
-        )
-        .unwrap();
+        let restored_state = bitcode::deserialize(&serialized_data).unwrap();
+        let restored_queue = Queue::restore(ca, &restored_state).unwrap();
 
         assert_eq!(restored_queue, queue);
     }
@@ -380,14 +385,11 @@ mod tests {
     #[test]
     fn test_virtio_device_state_serde() {
         let dummy = DummyDevice::new();
-        let mut mem = vec![0; 4096];
 
         let state = VirtioDeviceState::from_device(&dummy);
-        Snapshot::new(&state).save(&mut mem.as_mut_slice()).unwrap();
+        let serialized_data = bitcode::serialize(&state).unwrap();
 
-        let restored_state: VirtioDeviceState = Snapshot::load_without_crc_check(mem.as_slice())
-            .unwrap()
-            .data;
+        let restored_state: VirtioDeviceState = bitcode::deserialize(&serialized_data).unwrap();
         assert_eq!(restored_state, state);
     }
 
@@ -412,11 +414,8 @@ mod tests {
         mem: GuestMemoryMmap,
         device: Arc<Mutex<dyn VirtioDevice>>,
     ) {
-        let mut buf = vec![0; 4096];
-
-        Snapshot::new(mmio_transport.save())
-            .save(&mut buf.as_mut_slice())
-            .unwrap();
+        let transport_state = mmio_transport.save();
+        let serialized_data = bitcode::serialize(&transport_state).unwrap();
 
         let restore_args = MmioTransportConstructorArgs {
             mem,
@@ -424,13 +423,9 @@ mod tests {
             device,
             is_vhost_user: false,
         };
-        let restored_mmio_transport = MmioTransport::restore(
-            restore_args,
-            &Snapshot::load_without_crc_check(buf.as_slice())
-                .unwrap()
-                .data,
-        )
-        .unwrap();
+        let restored_state = bitcode::deserialize(&serialized_data).unwrap();
+        let restored_mmio_transport =
+            MmioTransport::restore(restore_args, &restored_state).unwrap();
 
         assert_eq!(restored_mmio_transport, mmio_transport);
     }

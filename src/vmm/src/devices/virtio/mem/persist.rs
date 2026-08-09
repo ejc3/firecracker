@@ -9,7 +9,7 @@ use bitvec::vec::BitVec;
 use serde::{Deserialize, Serialize};
 use vm_memory::Address;
 
-use crate::Vm;
+use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::generated::virtio_ids::VIRTIO_ID_MEM;
 use crate::devices::virtio::generated::virtio_mem::virtio_mem_config;
 use crate::devices::virtio::mem::{MEM_NUM_QUEUES, VirtioMem, VirtioMemError};
@@ -18,6 +18,7 @@ use crate::devices::virtio::queue::FIRECRACKER_MAX_QUEUE_SIZE;
 use crate::snapshot::Persist;
 use crate::utils::usize_to_u64;
 use crate::vstate::memory::{GuestMemoryMmap, GuestRegionMmap};
+use crate::vstate::vm::KvmVm;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VirtioMemState {
@@ -33,11 +34,11 @@ pub struct VirtioMemState {
 
 #[derive(Debug)]
 pub struct VirtioMemConstructorArgs {
-    vm: Arc<Vm>,
+    vm: Arc<KvmVm>,
 }
 
 impl VirtioMemConstructorArgs {
-    pub fn new(vm: Arc<Vm>) -> Self {
+    pub fn new(vm: Arc<KvmVm>) -> Self {
         Self { vm }
     }
 }
@@ -74,7 +75,7 @@ impl Persist<'_> for VirtioMem {
     ) -> Result<Self, Self::Error> {
         let queues = state.virtio_state.build_queues_checked(
             constructor_args.vm.guest_memory(),
-            VIRTIO_ID_MEM,
+            VirtioDeviceType::Mem,
             MEM_NUM_QUEUES,
             FIRECRACKER_MAX_QUEUE_SIZE,
         )?;
@@ -136,7 +137,7 @@ mod tests {
         let state = original_dev.save();
 
         // Create a "new" VM for restore
-        let (_, vm) = setup_vm_with_memory(0x1000);
+        let vm = setup_vm_with_memory(0x1000);
         let vm = Arc::new(vm);
         let constructor_args = VirtioMemConstructorArgs::new(vm);
         let restored_dev = VirtioMem::restore(constructor_args, &state).unwrap();

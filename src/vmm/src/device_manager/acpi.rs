@@ -1,62 +1,110 @@
 // Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use acpi_tables::{Aml, aml};
-use vm_memory::GuestMemoryError;
-
-use crate::Vm;
 #[cfg(target_arch = "x86_64")]
-use crate::devices::acpi::vmclock::VmClock;
-use crate::devices::acpi::vmgenid::VmGenId;
-use crate::vstate::resources::ResourceAllocator;
+use acpi_tables::{Aml, aml};
+
+use crate::devices::acpi::vmclock::{VmClock, VmClockError};
+use crate::devices::acpi::vmgenid::{VmGenId, VmGenIdError};
+use crate::vstate::memory::GuestMemoryMmap;
+use crate::vstate::vm::KvmVm;
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum ACPIDeviceError {
-    /// Could not register GSI with KVM: {0}
+    /// VMGenID: {0}
+    VmGenId(#[from] VmGenIdError),
+    /// VMClock: {0}
+    VmClock(#[from] VmClockError),
+    /// Could not register IRQ with KVM: {0}
     RegisterIrq(#[from] kvm_ioctls::Error),
-    /// Could not write to guest memory: {0}
-    WriteGuestMemory(#[from] GuestMemoryError),
+    /// Resource allocator error: {0}
+    ResourceAllocator(#[from] vm_allocator::Error),
 }
 
-#[derive(Debug)]
+// Although both VMGenID and VMClock devices are always present, they should be instantiated when
+// they are attached to preserve the existing ordering of GSI allocation.
+#[derive(Debug, Default)]
 pub struct ACPIDeviceManager {
     /// VMGenID device
-    pub vmgenid: VmGenId,
+    vmgenid: Option<VmGenId>,
     /// VMclock device
-    #[cfg(target_arch = "x86_64")]
-    pub vmclock: VmClock,
+    vmclock: Option<VmClock>,
 }
 
 impl ACPIDeviceManager {
     /// Create a new ACPIDeviceManager object
-    pub fn new(resource_allocator: &mut ResourceAllocator) -> Self {
+    pub fn new(vmgenid: VmGenId, vmclock: VmClock) -> Self {
         ACPIDeviceManager {
-            vmgenid: VmGenId::new(resource_allocator),
-            #[cfg(target_arch = "x86_64")]
-            vmclock: VmClock::new(resource_allocator),
+            vmgenid: Some(vmgenid),
+            vmclock: Some(vmclock),
         }
     }
 
-    pub fn attach_vmgenid(&self, vm: &Vm) -> Result<(), ACPIDeviceError> {
-        vm.register_irq(&self.vmgenid.interrupt_evt, self.vmgenid.gsi)?;
-        self.vmgenid.activate(vm.guest_memory())?;
+    pub fn attach_vmgenid(&mut self, vm: &KvmVm) -> Result<(), ACPIDeviceError> {
+        self.vmgenid = Some(VmGenId::new(&mut vm.resource_allocator())?);
         Ok(())
     }
 
-    #[cfg(target_arch = "x86_64")]
-    pub fn attach_vmclock(&self, vm: &Vm) -> Result<(), ACPIDeviceError> {
-        self.vmclock.activate(vm.guest_memory())?;
+    pub fn attach_vmclock(&mut self, vm: &KvmVm) -> Result<(), ACPIDeviceError> {
+        self.vmclock = Some(VmClock::new(&mut vm.resource_allocator())?);
+        Ok(())
+    }
+
+    pub fn vmgenid(&self) -> &VmGenId {
+        self.vmgenid.as_ref().expect("Missing VMGenID device")
+    }
+
+    pub fn vmclock(&self) -> &VmClock {
+        self.vmclock.as_ref().expect("Missing VMClock device")
+    }
+
+    pub fn activate_vmgenid(&self, vm: &KvmVm) -> Result<(), ACPIDeviceError> {
+        vm.register_irq(&self.vmgenid().interrupt_evt, self.vmgenid().gsi)?;
+        self.vmgenid().activate(vm.guest_memory())?;
+        Ok(())
+    }
+
+    pub fn activate_vmclock(&self, vm: &KvmVm) -> Result<(), ACPIDeviceError> {
+        vm.register_irq(&self.vmclock().interrupt_evt, self.vmclock().gsi)?;
+        self.vmclock().activate(vm.guest_memory())?;
+        Ok(())
+    }
+
+    pub fn replay_gsi_allocations(&self, vm: &KvmVm) -> Result<(), ACPIDeviceError> {
+        let mut resource_allocator = vm.resource_allocator();
+        resource_allocator
+            .gsi_legacy_allocator
+            .allocate_id_at(self.vmgenid().gsi)?;
+        resource_allocator
+            .gsi_legacy_allocator
+            .allocate_id_at(self.vmclock().gsi)?;
+        Ok(())
+    }
+
+    pub fn do_post_restore_vmgenid(&self) -> Result<(), ACPIDeviceError> {
+        self.vmgenid().do_post_restore()?;
+        Ok(())
+    }
+
+    pub fn do_post_restore_vmclock(
+        &mut self,
+        mem: &GuestMemoryMmap,
+    ) -> Result<(), ACPIDeviceError> {
+        self.vmclock
+            .as_mut()
+            .expect("Missing VMClock device")
+            .do_post_restore(mem)?;
         Ok(())
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 impl Aml for ACPIDeviceManager {
     fn append_aml_bytes(&self, v: &mut Vec<u8>) -> Result<(), aml::AmlError> {
         // AML for [`VmGenId`] device.
-        self.vmgenid.append_aml_bytes(v)?;
+        self.vmgenid().append_aml_bytes(v)?;
         // AML for [`VmClock`] device.
-        #[cfg(target_arch = "x86_64")]
-        self.vmclock.append_aml_bytes(v)?;
+        self.vmclock().append_aml_bytes(v)?;
 
         // Create the AML for the GED interrupt handler
         aml::Device::new(
@@ -65,30 +113,38 @@ impl Aml for ACPIDeviceManager {
                 &aml::Name::new("_HID".try_into()?, &"ACPI0013")?,
                 &aml::Name::new(
                     "_CRS".try_into()?,
-                    &aml::ResourceTemplate::new(vec![&aml::Interrupt::new(
-                        true,
-                        true,
-                        false,
-                        false,
-                        self.vmgenid.gsi,
-                    )]),
+                    &aml::ResourceTemplate::new(vec![
+                        &aml::Interrupt::new(true, true, false, false, self.vmgenid().gsi),
+                        &aml::Interrupt::new(true, true, false, false, self.vmclock().gsi),
+                    ]),
                 )?,
+                // We know that the maximum IRQ number fits in a u8. We have up to
+                // 32 IRQs in x86 and up to 128 in ARM (look into
+                // `vmm::crate::arch::layout::GSI_LEGACY_END`). Both `vmgenid.gsi`
+                // and `vmclock.gsi` can safely be cast to `u8` without truncation,
+                // so we let clippy know.
                 &aml::Method::new(
                     "_EVT".try_into()?,
                     1,
                     true,
-                    vec![&aml::If::new(
-                        // We know that the maximum IRQ number fits in a u8. We have up to
-                        // 32 IRQs in x86 and up to 128 in
-                        // ARM (look into
-                        // `vmm::crate::arch::layout::GSI_LEGACY_END`)
-                        #[allow(clippy::cast_possible_truncation)]
-                        &aml::Equal::new(&aml::Arg(0), &(self.vmgenid.gsi as u8)),
-                        vec![&aml::Notify::new(
-                            &aml::Path::new("\\_SB_.VGEN")?,
-                            &0x80usize,
-                        )],
-                    )],
+                    vec![
+                        &aml::If::new(
+                            #[allow(clippy::cast_possible_truncation)]
+                            &aml::Equal::new(&aml::Arg(0), &(self.vmgenid().gsi as u8)),
+                            vec![&aml::Notify::new(
+                                &aml::Path::new("\\_SB_.VGEN")?,
+                                &0x80usize,
+                            )],
+                        ),
+                        &aml::If::new(
+                            #[allow(clippy::cast_possible_truncation)]
+                            &aml::Equal::new(&aml::Arg(0), &(self.vmclock().gsi as u8)),
+                            vec![&aml::Notify::new(
+                                &aml::Path::new("\\_SB_.VCLK")?,
+                                &0x80usize,
+                            )],
+                        ),
+                    ],
                 ),
             ],
         )

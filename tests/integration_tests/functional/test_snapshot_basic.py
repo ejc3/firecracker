@@ -19,8 +19,11 @@ import host_tools.cargo_build as host
 import host_tools.drive as drive_tools
 import host_tools.network as net_tools
 from framework import utils
+from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel, pin_rootfs_mode
+from framework.microvm import HugePagesConfig
 from framework.properties import global_props
 from framework.utils import check_filesystem, check_output
+from framework.utils_cpu_templates import ALL_CPU_TEMPLATES, pin_cpu_template
 from framework.utils_vsock import (
     ECHO_SERVER_PORT,
     VSOCK_UDS_PATH,
@@ -56,15 +59,22 @@ def _get_guest_drive_size(ssh_connection, guest_dev_name="/dev/vdb"):
     return lines[1].strip()
 
 
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
 @pytest.mark.parametrize("resume_at_restore", [True, False])
-def test_resume(uvm_nano, microvm_factory, resume_at_restore):
+@pytest.mark.parametrize(
+    "huge_pages",
+    [HugePagesConfig.NONE, HugePagesConfig.TRANSPARENT],
+    indirect=True,
+)
+def test_resume(uvm_configured, microvm_factory, resume_at_restore, huge_pages):
     """Tests snapshot is resumable at or after restoration.
 
     Check that a restored microVM is resumable by either
     a. PUT /snapshot/load with `resume_vm=False`, then calling PATCH /vm resume=True
     b. PUT /snapshot/load with `resume_vm=True`
     """
-    vm = uvm_nano
+    vm = uvm_configured
+    assert vm.huge_pages == huge_pages
     vm.add_net_iface()
     vm.start()
     snapshot = vm.snapshot_full()
@@ -78,7 +88,8 @@ def test_resume(uvm_nano, microvm_factory, resume_at_restore):
     restored_vm.ssh.check_output("true")
 
 
-def test_snapshot_current_version(uvm_nano):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_snapshot_current_version(uvm_configured):
     """Tests taking a snapshot at the version specified in Cargo.toml
 
     Check that it is possible to take a snapshot at the version of the upcoming
@@ -87,13 +98,13 @@ def test_snapshot_current_version(uvm_nano):
     only be able to test once the x.y binary has been uploaded to S3, at which
     point it is too late, see also the 1.3 release).
     """
-    vm = uvm_nano
+    vm = uvm_configured
     vm.start()
 
     snapshot = vm.snapshot_full()
 
     # Fetch Firecracker binary for the latest version
-    fc_binary = uvm_nano.fc_binary_path
+    fc_binary = uvm_configured.fc_binary_path
     # Get supported snapshot version from Firecracker binary
     snapshot_version = (
         check_output(f"{fc_binary} --snapshot-version").stdout.strip().splitlines()[0]
@@ -111,15 +122,16 @@ def test_snapshot_current_version(uvm_nano):
 # - Rootfs: Ubuntu 18.04
 # - Microvm: 2vCPU with 512 MB RAM
 # TODO: Multiple microvm sizes must be tested in the async pipeline.
+@pin_cpu_template(ALL_CPU_TEMPLATES)
 @pytest.mark.parametrize("use_snapshot_editor", [False, True])
 def test_cycled_snapshot_restore(
     bin_vsock_path,
     tmp_path,
-    uvm_plain_any,
+    uvm,
     microvm_factory,
     snapshot_type,
     use_snapshot_editor,
-    cpu_template_any,
+    cpu_template,
 ):
     """
     Run a cycle of VM restoration and VM snapshot creation where new VM is
@@ -131,14 +143,14 @@ def test_cycled_snapshot_restore(
 
     logger = logging.getLogger("snapshot_sequence")
 
-    vm = uvm_plain_any
+    vm = uvm
     vm.spawn()
     vm.basic_config(
         vcpu_count=2,
         mem_size_mib=512,
         track_dirty_pages=snapshot_type.needs_dirty_page_tracking,
     )
-    vm.set_cpu_template(cpu_template_any)
+    vm.set_cpu_template(cpu_template)
     vm.add_net_iface()
     vm.api.vsock.put(vsock_id="vsock0", guest_cid=3, uds_path=VSOCK_UDS_PATH)
     vm.start()
@@ -155,12 +167,11 @@ def test_cycled_snapshot_restore(
     snapshot = vm.make_snapshot(snapshot_type)
     vm.kill()
 
+    local_port_last = (1 << 30) - 1
+
     for microvm in microvm_factory.build_n_from_snapshot(
         snapshot, cycles, incremental=True, use_snapshot_editor=use_snapshot_editor
     ):
-        # FIXME: This and the sleep below reduce the rate of vsock/ssh connection
-        # related spurious test failures, although we do not know why this is the case.
-        time.sleep(2)
         # Test vsock guest-initiated connections.
         path = os.path.join(
             microvm.path, make_host_port_path(VSOCK_UDS_PATH, ECHO_SERVER_PORT)
@@ -169,21 +180,26 @@ def test_cycled_snapshot_restore(
         # Test vsock host-initiated connections.
         path = os.path.join(microvm.jailer.chroot_path(), VSOCK_UDS_PATH)
         check_host_connections(path, blob_path, blob_hash)
+        m = re.findall(
+            r"vsock muxer: RX pkt: VsockPacketHeader {.*, src_port: (\d+),.*, op: 1,.*}",
+            microvm.log_data,
+        )
+        assert int(m[0]) == local_port_last + 1
+        local_port_last = int(m[-1])
 
         # Check that the root device is not corrupted.
         check_filesystem(microvm.ssh, "squashfs", "/dev/vda")
 
-        time.sleep(2)
 
-
-def test_patch_drive_snapshot(uvm_nano, microvm_factory):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_patch_drive_snapshot(uvm_configured, microvm_factory):
     """
     Test that a patched drive is correctly used by guests loaded from snapshot.
     """
     logger = logging.getLogger("snapshot_sequence")
 
     # Use a predefined vm instance.
-    basevm = uvm_nano
+    basevm = uvm_configured
     basevm.add_net_iface()
 
     # Add a scratch 128MB RW non-root block device.
@@ -214,11 +230,12 @@ def test_patch_drive_snapshot(uvm_nano, microvm_factory):
     assert guest_drive_size == str(scratch_disk2.size())
 
 
-def test_load_snapshot_failure_handling(uvm_plain):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_load_snapshot_failure_handling(uvm):
     """
     Test error case of loading empty snapshot files.
     """
-    vm = uvm_plain
+    vm = uvm
     vm.spawn(log_level="Info")
 
     # Create two empty files for snapshot state and snapshot memory
@@ -236,15 +253,13 @@ def test_load_snapshot_failure_handling(uvm_plain):
     jailed_vmstate = vm.create_jailed_resource(snapshot_vmstate)
 
     # Load the snapshot
-    with pytest.raises(
-        RuntimeError, match="An error occured during bincode decoding: UnexpectedEnd"
-    ):
+    with pytest.raises(RuntimeError, match="IO Error: File too short to contain CRC"):
         vm.api.snapshot_load.put(mem_file_path=jailed_mem, snapshot_path=jailed_vmstate)
 
     vm.mark_killed()
 
 
-def test_cmp_full_and_first_diff_mem(uvm_plain_any):
+def test_cmp_full_and_first_diff_mem(uvm):
     """
     Compare memory of 2 consecutive full and diff snapshots.
 
@@ -255,7 +270,7 @@ def test_cmp_full_and_first_diff_mem(uvm_plain_any):
     """
     logger = logging.getLogger("snapshot_sequence")
 
-    vm = uvm_plain_any
+    vm = uvm
     vm.spawn()
     vm.basic_config(
         vcpu_count=2,
@@ -277,11 +292,12 @@ def test_cmp_full_and_first_diff_mem(uvm_plain_any):
     assert filecmp.cmp(full_snapshot.mem, diff_snapshot.mem, shallow=False)
 
 
-def test_negative_postload_api(uvm_plain, microvm_factory):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_negative_postload_api(uvm, microvm_factory):
     """
     Test APIs fail after loading from snapshot.
     """
-    basevm = uvm_plain
+    basevm = uvm
     basevm.spawn()
     basevm.basic_config(track_dirty_pages=True)
     basevm.add_net_iface()
@@ -302,11 +318,13 @@ def test_negative_postload_api(uvm_plain, microvm_factory):
         microvm.basic_config()
 
 
-def test_negative_snapshot_permissions(uvm_plain_rw, microvm_factory):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+@pin_rootfs_mode("rw")
+def test_negative_snapshot_permissions(uvm, microvm_factory):
     """
     Test missing permission error scenarios.
     """
-    basevm = uvm_plain_rw
+    basevm = uvm
     basevm.spawn()
     basevm.basic_config()
     basevm.add_net_iface()
@@ -373,11 +391,12 @@ def test_negative_snapshot_permissions(uvm_plain_rw, microvm_factory):
     microvm.mark_killed()
 
 
-def test_negative_snapshot_create(uvm_nano):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_negative_snapshot_create(uvm_configured):
     """
     Test create snapshot before pause.
     """
-    vm = uvm_nano
+    vm = uvm_configured
     vm.start()
 
     with pytest.raises(RuntimeError, match="save/restore unavailable while running"):
@@ -386,7 +405,8 @@ def test_negative_snapshot_create(uvm_nano):
         )
 
 
-def test_create_large_diff_snapshot(uvm_plain):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_create_large_diff_snapshot(uvm):
     """
     Create large diff snapshot seccomp regression test.
 
@@ -395,7 +415,7 @@ def test_create_large_diff_snapshot(uvm_plain):
     filter allows it.
     @issue: https://github.com/firecracker-microvm/firecracker/discussions/2811
     """
-    vm = uvm_plain
+    vm = uvm
     vm.spawn()
     vm.basic_config(mem_size_mib=16 * 1024, track_dirty_pages=True)
     vm.start()
@@ -410,14 +430,15 @@ def test_create_large_diff_snapshot(uvm_plain):
     # process would have been taken down.
 
 
-def test_diff_snapshot_overlay(uvm_plain_any, microvm_factory):
+@pytest.mark.parametrize("mem_size", [256, 4096])
+def test_diff_snapshot_overlay(uvm, microvm_factory, mem_size):
     """
     Tests that if we take a diff snapshot and direct firecracker to write it on
     top of an existing snapshot file, it will successfully merge them.
     """
-    basevm = uvm_plain_any
+    basevm = uvm
     basevm.spawn()
-    basevm.basic_config(track_dirty_pages=True)
+    basevm.basic_config(track_dirty_pages=True, mem_size_mib=mem_size)
     basevm.add_net_iface()
     basevm.start()
 
@@ -447,7 +468,7 @@ def test_diff_snapshot_overlay(uvm_plain_any, microvm_factory):
     # Check that the restored VM works
 
 
-def test_snapshot_overwrite_self(uvm_plain_any, microvm_factory):
+def test_snapshot_overwrite_self(uvm, microvm_factory):
     """Tests that if we try to take a snapshot that would overwrite the
     very file from which the current VM is stored, nothing happens.
 
@@ -455,7 +476,7 @@ def test_snapshot_overwrite_self(uvm_plain_any, microvm_factory):
     of mmap does not specify what should happen if the file is changed after being
     mmap'd (https://man7.org/linux/man-pages/man2/mmap.2.html). It seems that
     these changes can propagate to the mmap'd memory region."""
-    base_vm = uvm_plain_any
+    base_vm = uvm
     base_vm.spawn()
     base_vm.basic_config()
     base_vm.add_net_iface()
@@ -479,11 +500,12 @@ def test_snapshot_overwrite_self(uvm_plain_any, microvm_factory):
     # restored, with a new snapshot of this vm, does not break the VM
 
 
-def test_vmgenid(uvm_plain_6_1, microvm_factory, snapshot_type):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_vmgenid(uvm, microvm_factory, snapshot_type):
     """
     Test VMGenID device upon snapshot resume
     """
-    base_vm = uvm_plain_6_1
+    base_vm = uvm
     base_vm.spawn()
     base_vm.basic_config(track_dirty_pages=True)
     base_vm.add_net_iface()
@@ -509,7 +531,8 @@ def test_vmgenid(uvm_plain_6_1, microvm_factory, snapshot_type):
     ),
     reason="This test requires aarch64 and either kernel 6.4+ or Amazon Linux",
 )
-def test_physical_counter_reset_aarch64(uvm_nano):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_physical_counter_reset_aarch64(uvm_configured):
     """
     Test that the CNTPCT_EL0 register is reset on VM boot.
     We assume the smallest VM will not consume more than
@@ -520,7 +543,7 @@ def test_physical_counter_reset_aarch64(uvm_nano):
     will be a copy of host value. The host value in its turn will be huge because
     it will include host OS boot + CI prep + other CI tests ...
     """
-    vm = uvm_nano
+    vm = uvm_configured
     vm.add_net_iface()
     vm.start()
 
@@ -559,12 +582,13 @@ def test_physical_counter_reset_aarch64(uvm_nano):
         raise RuntimeError("Did not find CNTPCT_EL0 register in snapshot")
 
 
-def test_snapshot_rename_interface(uvm_nano, microvm_factory):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_snapshot_rename_interface(uvm_configured, microvm_factory):
     """
     Test that we can restore a snapshot and point its interface to a
     different host interface.
     """
-    vm = uvm_nano
+    vm = uvm_configured
     base_iface = vm.add_net_iface()
     vm.start()
     snapshot = vm.snapshot_full()
@@ -583,3 +607,128 @@ def test_snapshot_rename_interface(uvm_nano, microvm_factory):
         rename_interfaces={iface_override.dev_name: iface_override.tap_name},
         resume=True,
     )
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_snapshot_rename_vsock(
+    uvm_configured,
+    microvm_factory,
+):
+    """
+    Test that we can restore a snapshot and point its vsock device to a
+    different unix socket.
+    """
+
+    vm = uvm_configured
+    vm.api.vsock.put(vsock_id="vsock0", guest_cid=3, uds_path="/v.sock1")
+    vm.add_net_iface()
+    vm.start()
+
+    snapshot = vm.snapshot_full()
+
+    restored_vm = microvm_factory.build()
+    restored_vm.spawn()
+
+    restored_vm.restore_from_snapshot(snapshot, vsock_override="/v.sock2", resume=True)
+
+
+SLEEP_SECONDS = 30
+
+CLOCK_SOURCES = {"x86_64": ["tsc", "kvm-clock"], "aarch64": ["arch_sys_counter"]}[
+    global_props.cpu_architecture
+]
+
+
+def read_guest_monotonic(vm):
+    """Read CLOCK_MONOTONIC inside the guest"""
+    _, stdout, _ = vm.ssh.check_output(
+        "python3 -c 'import time; print(time.monotonic())'"
+    )
+    return float(stdout.strip())
+
+
+def read_guest_clocksource(vm):
+    """Read the active clocksource inside the guest"""
+    _, stdout, _ = vm.ssh.check_output(
+        "cat /sys/devices/system/clocksource/clocksource0/current_clocksource"
+    )
+    return stdout.strip()
+
+
+@pytest.mark.parametrize("clocksource", CLOCK_SOURCES)
+@pytest.mark.parametrize("clock_realtime", [False, True])
+def test_clocksource_snapshot_restore(
+    uvm, microvm_factory, clocksource, clock_realtime
+):
+    """Measure CLOCK_MONOTONIC before snapshot and after restore to determine
+    whether the clocksource jumps forward or resumes from where it left off."""
+
+    if clock_realtime and clocksource != "kvm-clock":
+        pytest.skip(f"Clocksource {clocksource} doesn't support clock_realtime flag")
+    if clock_realtime and global_props.host_linux_version_tpl < (5, 16):
+        pytest.skip("clock_realtime is not supported on Linux < 5.16")
+
+    boot_args = (
+        "reboot=k panic=1 nomodule swiotlb=noforce console=ttyS0"
+        f" clocksource={clocksource}"
+    )
+
+    vm = uvm
+    vm.spawn()
+    vm.basic_config(vcpu_count=2, mem_size_mib=256, boot_args=boot_args)
+    vm.add_net_iface()
+    vm.start()
+
+    # Confirm the clocksource took effect
+    active = read_guest_clocksource(vm)
+    _, avail_out, _ = vm.ssh.check_output(
+        "cat /sys/devices/system/clocksource/clocksource0/available_clocksource"
+    )
+    print("Available clocksources: %s", avail_out.strip())
+    if active != clocksource:
+        pytest.skip(f"Clocksource {clocksource} not available")
+
+    guest_before = read_guest_monotonic(vm)
+    host_before = time.monotonic()
+
+    snapshot = vm.snapshot_full()
+    vm.kill()
+
+    print("Sleeping %ds between snapshot and restore...", SLEEP_SECONDS)
+    time.sleep(SLEEP_SECONDS)
+
+    restored_vm = microvm_factory.build_from_snapshot(
+        snapshot, clock_realtime=clock_realtime
+    )
+
+    guest_after = read_guest_monotonic(restored_vm)
+    host_after = time.monotonic()
+
+    # Confirm clocksource survived the restore
+    active_after = read_guest_clocksource(restored_vm)
+    assert (
+        active_after == clocksource
+    ), f"Clocksource changed after restore: {clocksource} -> {active_after}"
+
+    guest_delta = guest_after - guest_before
+    host_delta = host_after - host_before
+
+    # If guest_delta is close to host_delta, the clock jumped forward
+    # (suspend/resume behavior). If it's near 0, it resumed from where
+    # it left off.
+    jumped = abs(guest_delta - host_delta) < 5.0
+
+    jumped_str = "JUMPED" if jumped else "RESUMED"
+
+    print(
+        f"Host kernel:    {global_props.host_linux_version}\n"
+        f"Clocksource:    {clocksource}\n"
+        f"Guest MONOTONIC before: {guest_before:.3f} s\n"
+        f"Guest MONOTONIC after:  {guest_after:.3f} s\n"
+        f"Guest delta:    {guest_delta:.3f} s\n"
+        f"Host delta:     {host_delta:.3f} s\n"
+        f"Behavior:       {jumped_str}\n"
+    )
+    assert (
+        jumped == clock_realtime
+    ), f"Clock {jumped_str} but clock_realtime was {"not" if clock_realtime else ""} set."

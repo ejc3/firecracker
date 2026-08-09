@@ -4,9 +4,10 @@
 use std::fmt;
 use std::sync::LazyLock;
 
-use log::warn;
 use serde::{Deserialize, Serialize};
 use vm_memory::GuestAddress;
+
+use crate::logger::warn;
 
 /// Module for aarch64 related functionality.
 #[cfg(target_arch = "aarch64")]
@@ -17,7 +18,7 @@ pub use aarch64::kvm::{Kvm, KvmArchError, OptionalCapabilities};
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::vcpu::*;
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::vm::{ArchVm, ArchVmError, VmState};
+pub use aarch64::vm::{KvmVm, KvmVmError, VmState};
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{
     ConfigurationError, arch_memory_regions, configure_system_for_boot, get_kernel_start,
@@ -33,7 +34,7 @@ pub use x86_64::kvm::{Kvm, KvmArchError};
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::vcpu::*;
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::vm::{ArchVm, ArchVmError, VmState};
+pub use x86_64::vm::{KvmVm, KvmVmError, VmState};
 
 #[cfg(target_arch = "x86_64")]
 pub use crate::arch::x86_64::{
@@ -109,6 +110,10 @@ pub struct EntryPoint {
     pub entry_addr: GuestAddress,
     /// Specifies which boot protocol to use
     pub protocol: BootProtocol,
+    /// Setup header from a bzImage kernel, used to seed the zero page.
+    /// `None` for ELF (`vmlinux`) kernels.
+    #[cfg(target_arch = "x86_64")]
+    pub setup_header: Option<linux_loader::loader::bootparam::setup_header>,
 }
 
 /// Adds in [`regions`] the valid memory regions suitable for RAM taking into account a gap in the

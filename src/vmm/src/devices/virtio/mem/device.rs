@@ -7,18 +7,17 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
 use bitvec::vec::BitVec;
-use log::info;
 use serde::{Deserialize, Serialize};
 use vm_memory::{
-    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryRegion, GuestUsize,
+    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryBackend, GuestMemoryError,
+    GuestMemoryRegion, GuestUsize,
 };
 use vmm_sys_util::eventfd::EventFd;
 
 use super::{MEM_NUM_QUEUES, MEM_QUEUE};
 use crate::devices::virtio::ActivateError;
-use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice};
+use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
-use crate::devices::virtio::generated::virtio_ids::VIRTIO_ID_MEM;
 use crate::devices::virtio::generated::virtio_mem::{
     self, VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE, virtio_mem_config,
 };
@@ -30,14 +29,14 @@ use crate::devices::virtio::queue::{
     DescriptorChain, FIRECRACKER_MAX_QUEUE_SIZE, InvalidAvailIdx, Queue, QueueError,
 };
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
-use crate::logger::{IncMetric, debug, error};
+use crate::impl_device_type;
+use crate::logger::{IncMetric, debug, error, info, warn};
 use crate::utils::{bytes_to_mib, mib_to_bytes, u64_to_usize, usize_to_u64};
 use crate::vstate::interrupts::InterruptError;
 use crate::vstate::memory::{
     ByteValued, GuestMemoryExtension, GuestMemoryMmap, GuestRegionMmap, GuestRegionType,
 };
-use crate::vstate::vm::VmError;
-use crate::{Vm, impl_device_type};
+use crate::vstate::vm::{KvmVm, VmError};
 
 // SAFETY: virtio_mem_config only contains plain data types
 unsafe impl ByteValued for virtio_mem_config {}
@@ -99,7 +98,7 @@ pub struct VirtioMem {
     pub(crate) slot_size: usize,
     // Bitmap to track which blocks are plugged
     pub(crate) plugged_blocks: BitVec,
-    vm: Arc<Vm>,
+    vm: Arc<KvmVm>,
 }
 
 /// Memory hotplug device status information.
@@ -120,7 +119,7 @@ pub struct VirtioMemStatus {
 
 impl VirtioMem {
     pub fn new(
-        vm: Arc<Vm>,
+        vm: Arc<KvmVm>,
         addr: GuestAddress,
         total_size_mib: usize,
         block_size_mib: usize,
@@ -145,7 +144,7 @@ impl VirtioMem {
     }
 
     pub fn from_state(
-        vm: Arc<Vm>,
+        vm: Arc<KvmVm>,
         queues: Vec<Queue>,
         config: virtio_mem_config,
         slot_size: usize,
@@ -168,10 +167,6 @@ impl VirtioMem {
             slot_size,
             plugged_blocks,
         })
-    }
-
-    pub fn id(&self) -> &str {
-        VIRTIO_MEM_DEV_ID
     }
 
     pub fn guest_address(&self) -> GuestAddress {
@@ -516,7 +511,7 @@ impl VirtioMem {
                 updated_range.addr,
                 self.nb_blocks_to_len(updated_range.nb_blocks),
             )
-            .try_for_each(|slot| {
+            .try_for_each(|(slot, _)| {
                 let slot_range = RequestedRange {
                     addr: slot.guest_addr,
                     nb_blocks: slot.slice.len() / u64_to_usize(self.config.block_size),
@@ -545,6 +540,10 @@ impl VirtioMem {
         self.config.plugged_size -= usize_to_u64(self.nb_blocks_to_len(plugged_before));
         self.config.plugged_size += usize_to_u64(self.nb_blocks_to_len(plugged_after));
 
+        // Update kvm slots before doing any discards to prevent guest from re-faulting just
+        // discarded memory.
+        self.update_kvm_slots(range)?;
+
         // If unplugging, discard the range
         if !plug {
             self.guest_memory()
@@ -556,8 +555,7 @@ impl VirtioMem {
                     error!("virtio-mem: Failed to discard memory range: {}", err);
                 });
         }
-
-        self.update_kvm_slots(range)
+        Ok(())
     }
 
     /// Updates the requested size of the virtio-mem device.
@@ -570,7 +568,7 @@ impl VirtioMem {
             return Err(VirtioMemError::DeviceNotActive);
         }
 
-        if requested_size % self.config.block_size != 0 {
+        if !requested_size.is_multiple_of(self.config.block_size) {
             return Err(VirtioMemError::InvalidSize(requested_size));
         }
         if requested_size > self.config.region_size {
@@ -602,7 +600,11 @@ impl VirtioMem {
 }
 
 impl VirtioDevice for VirtioMem {
-    impl_device_type!(VIRTIO_ID_MEM);
+    impl_device_type!(VirtioDeviceType::Mem);
+
+    fn id(&self) -> &str {
+        VIRTIO_MEM_DEV_ID
+    }
 
     fn queues(&self) -> &[Queue] {
         &self.queues
@@ -636,26 +638,35 @@ impl VirtioDevice for VirtioMem {
         self.acked_features = acked_features;
     }
 
-    fn read_config(&self, offset: u64, data: &mut [u8]) {
-        let offset = u64_to_usize(offset);
-        self.config
-            .as_slice()
-            .get(offset..offset + data.len())
-            .map(|s| data.copy_from_slice(s))
-            .unwrap_or_else(|| {
-                error!(
-                    "virtio-mem: Config read offset+length {offset}+{} out of bounds",
-                    data.len()
-                )
-            })
+    fn config_as_bytes(&self) -> &[u8] {
+        self.config.as_slice()
     }
 
-    fn write_config(&mut self, offset: u64, _data: &[u8]) {
-        error!("virtio-mem: Attempted write to read-only config space at offset {offset}");
+    fn write_config(&mut self, offset: u64, data: &[u8]) {
+        warn!(
+            "virtio-mem: guest driver attempted to write device config (offset={:#x}, len={:#x})",
+            offset,
+            data.len()
+        );
     }
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    fn deactivate(&mut self) {
+        self.device_state = DeviceState::Inactive;
+    }
+
+    fn _reset(&mut self) -> bool {
+        // Virtio spec, section 5.15.5.2:
+        // The device MUST NOT change the state of memory blocks during device
+        // reset. The device MUST NOT modify memory or memory properties of
+        // plugged memory blocks during device reset.
+        //
+        // Note: the Linux virtio-mem driver does not support rebinding when
+        // memory is plugged
+        true
     }
 
     fn activate(
@@ -663,6 +674,8 @@ impl VirtioDevice for VirtioMem {
         mem: GuestMemoryMmap,
         interrupt: Arc<dyn VirtioInterrupt>,
     ) -> Result<(), ActivateError> {
+        assert!(!self.is_activated());
+
         if (self.acked_features & (1 << VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE)) == 0 {
             error!(
                 "virtio-mem: VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE feature not acknowledged by guest"
@@ -716,7 +729,7 @@ pub(crate) mod test_utils {
     }
 
     pub(crate) fn default_virtio_mem() -> VirtioMem {
-        let (_, mut vm) = setup_vm_with_memory(0x1000);
+        let mut vm = setup_vm_with_memory(0x1000);
         let addr = GuestAddress(512 << 30);
         vm.register_hotpluggable_memory_region(
             memory::anonymous(
@@ -743,7 +756,7 @@ mod tests {
     use vm_memory::mmap::MmapRegionBuilder;
 
     use super::*;
-    use crate::devices::virtio::device::VirtioDevice;
+    use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
     use crate::devices::virtio::mem::device::test_utils::default_virtio_mem;
     use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
     use crate::devices::virtio::test_utils::test::VirtioTestHelper;
@@ -757,7 +770,7 @@ mod tests {
         assert_eq!(mem.block_size_mib(), 2);
         assert_eq!(mem.plugged_size_mib(), 0);
         assert_eq!(mem.id(), VIRTIO_MEM_DEV_ID);
-        assert_eq!(mem.device_type(), VIRTIO_ID_MEM);
+        assert_eq!(mem.device_type(), VirtioDeviceType::Mem);
 
         let features = (1 << VIRTIO_F_VERSION_1) | (1 << VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE);
         assert_eq!(mem.avail_features(), features);
@@ -771,7 +784,7 @@ mod tests {
 
     #[test]
     fn test_from_state() {
-        let (_, vm) = setup_vm_with_memory(0x1000);
+        let vm = setup_vm_with_memory(0x1000);
         let vm = Arc::new(vm);
         let queues = vec![Queue::new(FIRECRACKER_MAX_QUEUE_SIZE); MEM_NUM_QUEUES];
         let addr = 512 << 30;
@@ -809,38 +822,23 @@ mod tests {
     }
 
     #[test]
-    fn test_read_config() {
+    fn test_config_as_bytes() {
         let mem = default_virtio_mem();
-        let mut data = [0u8; 8];
+        let config = mem.config_as_bytes();
 
-        mem.read_config(0, &mut data);
+        assert_eq!(config.len(), std::mem::size_of::<virtio_mem_config>());
         assert_eq!(
-            u64::from_le_bytes(data),
+            u64::from_le_bytes(config[0..8].try_into().unwrap()),
             mib_to_bytes(mem.block_size_mib()) as u64
         );
-
-        mem.read_config(16, &mut data);
-        assert_eq!(u64::from_le_bytes(data), 512 << 30);
-
-        mem.read_config(24, &mut data);
         assert_eq!(
-            u64::from_le_bytes(data),
+            u64::from_le_bytes(config[16..24].try_into().unwrap()),
+            512 << 30
+        );
+        assert_eq!(
+            u64::from_le_bytes(config[24..32].try_into().unwrap()),
             mib_to_bytes(mem.total_size_mib()) as u64
         );
-    }
-
-    #[test]
-    fn test_read_config_out_of_bounds() {
-        let mem = default_virtio_mem();
-
-        let mut data = [0u8; 8];
-        let config_size = std::mem::size_of::<virtio_mem_config>();
-        mem.read_config(config_size as u64, &mut data);
-        assert_eq!(data, [0u8; 8]); // Should remain unchanged
-
-        let mut data = vec![0u8; config_size];
-        mem.read_config(8, &mut data);
-        assert_eq!(data, vec![0u8; config_size]); // Should remain unchanged
     }
 
     #[test]

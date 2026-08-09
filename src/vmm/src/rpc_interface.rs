@@ -14,13 +14,16 @@ use super::{Vmm, VmmError};
 use crate::EventManager;
 use crate::builder::StartMicrovmError;
 use crate::cpu_config::templates::{CustomCpuTemplate, GuestConfigError};
+use crate::device_manager::pci_mngr::PciManagerError;
 use crate::devices::virtio::balloon::device::{HintingStatus, StartHintingCmd};
+use crate::devices::virtio::device::VirtioDeviceId;
 use crate::devices::virtio::mem::VirtioMemStatus;
 use crate::logger::{LoggerConfig, info, warn, *};
-use crate::mmds::data_store::{self, Mmds};
+use crate::mmds::data_store::{self, Mmds, MmdsDatastoreError};
 use crate::persist::{CreateSnapshotError, RestoreFromSnapshotError, VmInfo};
 use crate::resources::VmmConfig;
 use crate::seccomp::BpfThreadMap;
+use crate::vmm_config::HotplugDeviceConfig;
 use crate::vmm_config::balloon::{
     BalloonConfigError, BalloonDeviceConfig, BalloonStats, BalloonUpdateConfig,
     BalloonUpdateStatsConfig,
@@ -38,7 +41,7 @@ use crate::vmm_config::mmds::{MmdsConfig, MmdsConfigError};
 use crate::vmm_config::net::{
     NetworkInterfaceConfig, NetworkInterfaceError, NetworkInterfaceUpdateConfig,
 };
-use crate::vmm_config::pmem::{PmemConfig, PmemConfigError};
+use crate::vmm_config::pmem::{PmemConfig, PmemConfigError, PmemDeviceUpdateConfig};
 use crate::vmm_config::serial::SerialConfig;
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, SnapshotType};
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
@@ -83,6 +86,8 @@ pub enum VmmAction {
     InsertBlockDevice(BlockDeviceConfig),
     /// Add a virtio-pmem device.
     InsertPmemDevice(PmemConfig),
+    /// Update an existing pmem device's rate limiter.
+    UpdatePmemDevice(PmemDeviceUpdateConfig),
     /// Add a new network interface config or update one that already exists using the
     /// `NetworkInterfaceConfig` as input. This action can only be called before the microVM has
     /// booted.
@@ -146,6 +151,8 @@ pub enum VmmAction {
     /// Update the microVM configuration (memory & vcpu) using `VmUpdateConfig` as input. This
     /// action can only be called before the microVM has booted.
     UpdateMachineConfiguration(MachineConfigUpdate),
+    /// Hot-unplug a device.
+    HotUnplugDevice(VirtioDeviceId),
 }
 
 /// Wrapper for all errors associated with VMM actions.
@@ -163,10 +170,10 @@ pub enum VmmActionError {
     ConfigureCpu(#[from] GuestConfigError),
     /// Drive config error: {0}
     DriveConfig(#[from] DriveError),
-    /// Entropy device error: {0}
-    EntropyDevice(#[from] EntropyDeviceError),
-    /// Pmem device error: {0}
-    PmemDevice(#[from] PmemConfigError),
+    /// Entropy config error: {0}
+    EntropyConfig(#[from] EntropyDeviceError),
+    /// Pmem config error: {0}
+    PmemConfig(#[from] PmemConfigError),
     /// Memory hotplug config error: {0}
     MemoryHotplugConfig(#[from] MemoryHotplugConfigError),
     /// Memory hotplug update error: {0}
@@ -201,6 +208,16 @@ pub enum VmmActionError {
     StartMicrovm(#[from] StartMicrovmError),
     /// Vsock config error: {0}
     VsockConfig(#[from] VsockConfigError),
+    /// Device ID in use
+    DeviceIdInUse,
+    /// Device not found
+    DeviceNotFound,
+    /// Cannot unplug root device
+    CannotUnplugRootDevice,
+    /// PCI is not enabled
+    PciNotEnabled,
+    /// PCI manager error: {0}
+    PciManager(#[from] PciManagerError),
 }
 
 /// The enum represents the response sent by the VMM in case of success. The response is either
@@ -230,43 +247,36 @@ pub enum VmmData {
     HintingStatus(HintingStatus),
 }
 
-/// Trait used for deduplicating the MMDS request handling across the two ApiControllers.
-/// The methods get a mutable reference to self because the methods should initialise the data
-/// store with the defaults if it's not already initialised.
-trait MmdsRequestHandler {
-    fn mmds(&mut self) -> Result<MutexGuard<'_, Mmds>, VmmActionError>;
+fn mmds_patch_data(
+    mut mmds: MutexGuard<'_, Mmds>,
+    value: serde_json::Value,
+) -> Result<VmmData, VmmActionError> {
+    mmds.patch_data(value)
+        .map(|()| VmmData::Empty)
+        .map_err(|err| match err {
+            data_store::MmdsDatastoreError::DataStoreLimitExceeded => {
+                VmmActionError::MmdsLimitExceeded(
+                    data_store::MmdsDatastoreError::DataStoreLimitExceeded,
+                )
+            }
+            _ => VmmActionError::Mmds(err),
+        })
+}
 
-    fn get_mmds(&mut self) -> Result<VmmData, VmmActionError> {
-        Ok(VmmData::MmdsValue(self.mmds()?.data_store_value()))
-    }
-
-    fn patch_mmds(&mut self, value: serde_json::Value) -> Result<VmmData, VmmActionError> {
-        self.mmds()?
-            .patch_data(value)
-            .map(|()| VmmData::Empty)
-            .map_err(|err| match err {
-                data_store::MmdsDatastoreError::DataStoreLimitExceeded => {
-                    VmmActionError::MmdsLimitExceeded(
-                        data_store::MmdsDatastoreError::DataStoreLimitExceeded,
-                    )
-                }
-                _ => VmmActionError::Mmds(err),
-            })
-    }
-
-    fn put_mmds(&mut self, value: serde_json::Value) -> Result<VmmData, VmmActionError> {
-        self.mmds()?
-            .put_data(value)
-            .map(|()| VmmData::Empty)
-            .map_err(|err| match err {
-                data_store::MmdsDatastoreError::DataStoreLimitExceeded => {
-                    VmmActionError::MmdsLimitExceeded(
-                        data_store::MmdsDatastoreError::DataStoreLimitExceeded,
-                    )
-                }
-                _ => VmmActionError::Mmds(err),
-            })
-    }
+fn mmds_put_data(
+    mut mmds: MutexGuard<'_, Mmds>,
+    value: serde_json::Value,
+) -> Result<VmmData, VmmActionError> {
+    mmds.put_data(value)
+        .map(|()| VmmData::Empty)
+        .map_err(|err| match err {
+            data_store::MmdsDatastoreError::DataStoreLimitExceeded => {
+                VmmActionError::MmdsLimitExceeded(
+                    data_store::MmdsDatastoreError::DataStoreLimitExceeded,
+                )
+            }
+            _ => VmmActionError::Mmds(err),
+        })
 }
 
 /// Enables pre-boot setup and instantiation of a Firecracker VMM.
@@ -297,14 +307,6 @@ impl fmt::Debug for PrebootApiController<'_> {
             .field("boot_path", &self.boot_path)
             .field("fatal_error", &self.fatal_error)
             .finish()
-    }
-}
-
-impl MmdsRequestHandler for PrebootApiController<'_> {
-    fn mmds(&mut self) -> Result<MutexGuard<'_, Mmds>, VmmActionError> {
-        self.vm_resources
-            .locked_mmds_or_default()
-            .map_err(VmmActionError::MmdsConfig)
     }
 }
 
@@ -371,7 +373,7 @@ impl<'a> PrebootApiController<'a> {
         pci_enabled: bool,
         mmds_size_limit: usize,
         metadata_json: Option<&str>,
-    ) -> Result<(VmResources, Arc<Mutex<Vmm>>), BuildMicrovmFromRequestsError> {
+    ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromRequestsError> {
         let mut vm_resources = VmResources {
             boot_timer: boot_timer_enabled,
             mmds_size_limit,
@@ -424,7 +426,7 @@ impl<'a> PrebootApiController<'a> {
 
         // Safe to unwrap because previous loop cannot end on None.
         let vmm = preboot_controller.built_vmm.unwrap();
-        Ok((vm_resources, vmm))
+        Ok(vmm)
     }
 
     /// Handles the incoming preboot request and provides a response for it.
@@ -447,6 +449,7 @@ impl<'a> PrebootApiController<'a> {
                 .map_err(VmmActionError::Metrics),
             ConfigureSerial(serial_cfg) => {
                 self.vm_resources.serial_out_path = serial_cfg.serial_out_path;
+                self.vm_resources.serial_rate_limiter_cfg = serial_cfg.rate_limiter;
                 Ok(VmmData::Empty)
             }
             GetBalloonConfig => self.balloon_config(),
@@ -457,7 +460,12 @@ impl<'a> PrebootApiController<'a> {
                 );
                 Ok(VmmData::FullVmConfig((&*self.vm_resources).into()))
             }
-            GetMMDS => self.get_mmds(),
+            GetMMDS => Ok(VmmData::MmdsValue(
+                self.vm_resources
+                    .locked_mmds_or_default()
+                    .map_err(VmmActionError::MmdsConfig)?
+                    .data_store_value(),
+            )),
             GetVmMachineConfig => Ok(VmmData::MachineConfiguration(
                 self.vm_resources.machine_config.clone(),
             )),
@@ -469,11 +477,21 @@ impl<'a> PrebootApiController<'a> {
             LoadSnapshot(config) => self
                 .load_snapshot(&config)
                 .map_err(VmmActionError::LoadSnapshot),
-            PatchMMDS(value) => self.patch_mmds(value),
+            PatchMMDS(value) => mmds_patch_data(
+                self.vm_resources
+                    .locked_mmds_or_default()
+                    .map_err(VmmActionError::MmdsConfig)?,
+                value,
+            ),
             PutCpuConfiguration(custom_cpu_template) => {
                 self.set_custom_cpu_template(custom_cpu_template)
             }
-            PutMMDS(value) => self.put_mmds(value),
+            PutMMDS(value) => mmds_put_data(
+                self.vm_resources
+                    .locked_mmds_or_default()
+                    .map_err(VmmActionError::MmdsConfig)?,
+                value,
+            ),
             SetBalloonDevice(config) => self.set_balloon_device(config),
             SetVsockDevice(config) => self.set_vsock_device(config),
             SetMmdsConfiguration(config) => self.set_mmds_config(config),
@@ -493,9 +511,11 @@ impl<'a> PrebootApiController<'a> {
             | UpdateBlockDevice(_)
             | UpdateMemoryHotplugSize(_)
             | UpdateNetworkInterface(_)
+            | UpdatePmemDevice(_)
             | StartFreePageHinting(_)
             | GetFreePageHintingStatus
-            | StopFreePageHinting => Err(VmmActionError::OperationNotSupportedPreBoot),
+            | StopFreePageHinting
+            | HotUnplugDevice(_) => Err(VmmActionError::OperationNotSupportedPreBoot),
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => Err(VmmActionError::OperationNotSupportedPreBoot),
         }
@@ -533,7 +553,7 @@ impl<'a> PrebootApiController<'a> {
         self.vm_resources
             .build_pmem_device(cfg)
             .map(|()| VmmData::Empty)
-            .map_err(VmmActionError::PmemDevice)
+            .map_err(VmmActionError::PmemConfig)
     }
 
     fn set_balloon_device(&mut self, cfg: BalloonDeviceConfig) -> Result<VmmData, VmmActionError> {
@@ -670,20 +690,15 @@ impl<'a> PrebootApiController<'a> {
 #[derive(Debug)]
 pub struct RuntimeApiController {
     vmm: Arc<Mutex<Vmm>>,
-    vm_resources: VmResources,
-}
-
-impl MmdsRequestHandler for RuntimeApiController {
-    fn mmds(&mut self) -> Result<MutexGuard<'_, Mmds>, VmmActionError> {
-        self.vm_resources
-            .locked_mmds_or_default()
-            .map_err(VmmActionError::MmdsConfig)
-    }
 }
 
 impl RuntimeApiController {
     /// Handles the incoming runtime `VmmAction` request and provides a response for it.
-    pub fn handle_request(&mut self, request: VmmAction) -> Result<VmmData, VmmActionError> {
+    pub fn handle_request(
+        &mut self,
+        request: VmmAction,
+        event_manager: &mut EventManager,
+    ) -> Result<VmmData, VmmActionError> {
         use self::VmmAction::*;
         match request {
             // Supported operations allowed post-boot.
@@ -703,7 +718,9 @@ impl RuntimeApiController {
                 .latest_balloon_stats()
                 .map(VmmData::BalloonStats)
                 .map_err(VmmActionError::InternalVmm),
-            GetFullVmConfig => Ok(VmmData::FullVmConfig((&self.vm_resources).into())),
+            GetFullVmConfig => Ok(VmmData::FullVmConfig(
+                self.vmm.lock().expect("Poisoned lock").full_config(),
+            )),
             GetMemoryHotplugStatus => self
                 .vmm
                 .lock()
@@ -711,9 +728,22 @@ impl RuntimeApiController {
                 .memory_hotplug_status()
                 .map(VmmData::VirtioMemStatus)
                 .map_err(VmmActionError::InternalVmm),
-            GetMMDS => self.get_mmds(),
+            GetMMDS => Ok(VmmData::MmdsValue(
+                self.vmm
+                    .lock()
+                    .expect("Poisoned lock")
+                    .get_mmds()
+                    .ok_or(VmmActionError::Mmds(MmdsDatastoreError::NotInitialized))?
+                    .lock()
+                    .expect("Poisoned lock")
+                    .data_store_value(),
+            )),
             GetVmMachineConfig => Ok(VmmData::MachineConfiguration(
-                self.vm_resources.machine_config.clone(),
+                self.vmm
+                    .lock()
+                    .expect("Poisoned lock")
+                    .machine_config
+                    .clone(),
             )),
             GetVmInstanceInfo => Ok(VmmData::InstanceInformation(
                 self.vmm.lock().expect("Poisoned lock").instance_info(),
@@ -721,9 +751,51 @@ impl RuntimeApiController {
             GetVmmVersion => Ok(VmmData::VmmVersion(
                 self.vmm.lock().expect("Poisoned lock").version(),
             )),
-            PatchMMDS(value) => self.patch_mmds(value),
+            PatchMMDS(value) => mmds_patch_data(
+                self.vmm
+                    .lock()
+                    .expect("Poisoned lock")
+                    .get_mmds()
+                    .ok_or(VmmActionError::Mmds(MmdsDatastoreError::NotInitialized))?
+                    .lock()
+                    .expect("Poisoned lock"),
+                value,
+            ),
+            InsertBlockDevice(config) => self
+                .vmm
+                .lock()
+                .expect("Poisoned lock")
+                .hotplug_device(HotplugDeviceConfig::Block(config), event_manager)
+                .map(|()| VmmData::Empty),
+            InsertPmemDevice(config) => self
+                .vmm
+                .lock()
+                .expect("Poisoned lock")
+                .hotplug_device(HotplugDeviceConfig::Pmem(config), event_manager)
+                .map(|()| VmmData::Empty),
+            InsertNetworkDevice(config) => self
+                .vmm
+                .lock()
+                .expect("Poisoned lock")
+                .hotplug_device(HotplugDeviceConfig::Net(config), event_manager)
+                .map(|()| VmmData::Empty),
+            HotUnplugDevice(device_id) => self
+                .vmm
+                .lock()
+                .expect("Poisoned lock")
+                .hot_unplug_device(device_id, event_manager)
+                .map(|()| VmmData::Empty),
             Pause => self.pause(),
-            PutMMDS(value) => self.put_mmds(value),
+            PutMMDS(value) => mmds_put_data(
+                self.vmm
+                    .lock()
+                    .expect("Poisoned lock")
+                    .get_mmds()
+                    .ok_or(VmmActionError::Mmds(MmdsDatastoreError::NotInitialized))?
+                    .lock()
+                    .expect("Poisoned lock"),
+                value,
+            ),
             Resume => self.resume(),
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => self.send_ctrl_alt_del(),
@@ -764,6 +836,7 @@ impl RuntimeApiController {
                 .map_err(VmmActionError::BalloonUpdate),
             UpdateBlockDevice(new_cfg) => self.update_block_device(new_cfg),
             UpdateNetworkInterface(netif_update) => self.update_net_rate_limiters(netif_update),
+            UpdatePmemDevice(new_cfg) => self.update_pmem_device(new_cfg),
             UpdateMemoryHotplugSize(cfg) => self
                 .vmm
                 .lock()
@@ -776,9 +849,6 @@ impl RuntimeApiController {
             | ConfigureLogger(_)
             | ConfigureMetrics(_)
             | ConfigureSerial(_)
-            | InsertBlockDevice(_)
-            | InsertPmemDevice(_)
-            | InsertNetworkDevice(_)
             | LoadSnapshot(_)
             | PutCpuConfiguration(_)
             | SetBalloonDevice(_)
@@ -792,8 +862,8 @@ impl RuntimeApiController {
     }
 
     /// Creates a new `RuntimeApiController`.
-    pub fn new(vm_resources: VmResources, vmm: Arc<Mutex<Vmm>>) -> Self {
-        Self { vmm, vm_resources }
+    pub fn new(vmm: Arc<Mutex<Vmm>>) -> Self {
+        Self { vmm }
     }
 
     /// Pauses the microVM by pausing the vCPUs.
@@ -856,7 +926,7 @@ impl RuntimeApiController {
         }
 
         let mut locked_vmm = self.vmm.lock().unwrap();
-        let vm_info = VmInfo::from(&self.vm_resources);
+        let vm_info = VmInfo::from(&*locked_vmm);
         let create_start_us = get_time_us(ClockType::Monotonic);
 
         create_snapshot(&mut locked_vmm, &vm_info, create_params)?;
@@ -918,6 +988,25 @@ impl RuntimeApiController {
         Ok(VmmData::Empty)
     }
 
+    /// Updates the rate limiter for a pmem device.
+    fn update_pmem_device(
+        &mut self,
+        new_cfg: PmemDeviceUpdateConfig,
+    ) -> Result<VmmData, VmmActionError> {
+        if new_cfg.rate_limiter.is_some() {
+            self.vmm
+                .lock()
+                .expect("Poisoned lock")
+                .update_pmem_rate_limiter(
+                    &new_cfg.id,
+                    RateLimiterUpdate::from(new_cfg.rate_limiter).bandwidth,
+                    RateLimiterUpdate::from(new_cfg.rate_limiter).ops,
+                )
+                .map_err(PmemConfigError::DeviceUpdate)?;
+        }
+        Ok(VmmData::Empty)
+    }
+
     /// Updates configuration for an emulated net device as described in `new_cfg`.
     fn update_net_rate_limiters(
         &mut self,
@@ -946,7 +1035,6 @@ mod tests {
     use super::*;
     use crate::HTTP_MAX_PAYLOAD_SIZE;
     use crate::builder::tests::default_vmm;
-    use crate::devices::virtio::block::CacheType;
     use crate::mmds::data_store::MmdsVersion;
     use crate::seccomp::BpfThreadMap;
     use crate::vmm_config::snapshot::{MemBackendConfig, MemBackendType};
@@ -1001,10 +1089,12 @@ mod tests {
 
     #[test]
     fn test_runtime_get_mmds() {
-        assert_eq!(
-            runtime_request(VmmAction::GetMMDS).unwrap(),
-            VmmData::MmdsValue(Value::Null)
-        );
+        assert!(matches!(
+            runtime_request(VmmAction::GetMMDS),
+            Err(VmmActionError::Mmds(
+                data_store::MmdsDatastoreError::NotInitialized
+            ))
+        ));
     }
 
     #[test]
@@ -1036,39 +1126,6 @@ mod tests {
         ));
         assert_eq!(
             preboot_request_with_mmds(VmmAction::GetMMDS, mmds).unwrap(),
-            VmmData::MmdsValue(Value::String("string".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_runtime_put_mmds() {
-        let mmds = Arc::new(Mutex::new(Mmds::default()));
-
-        assert_eq!(
-            runtime_request_with_mmds(
-                VmmAction::PutMMDS(Value::String("string".to_string())),
-                mmds.clone()
-            )
-            .unwrap(),
-            VmmData::Empty
-        );
-        assert_eq!(
-            runtime_request_with_mmds(VmmAction::GetMMDS, mmds.clone()).unwrap(),
-            VmmData::MmdsValue(Value::String("string".to_string()))
-        );
-
-        let filling = (0..51300).map(|_| "X").collect::<String>();
-        let data = "{\"key\": \"".to_string() + &filling + "\"}";
-
-        assert!(matches!(
-            runtime_request_with_mmds(
-                VmmAction::PutMMDS(serde_json::from_str(&data).unwrap()),
-                mmds.clone()
-            ),
-            Err(VmmActionError::MmdsLimitExceeded(_))
-        ));
-        assert_eq!(
-            runtime_request_with_mmds(VmmAction::GetMMDS, mmds).unwrap(),
             VmmData::MmdsValue(Value::String("string".to_string()))
         );
     }
@@ -1139,70 +1196,6 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_patch_mmds() {
-        let mmds = Arc::new(Mutex::new(Mmds::default()));
-        // MMDS data store is not yet initialized.
-        let res = runtime_request(VmmAction::PatchMMDS(Value::String("string".to_string())));
-        assert!(
-            matches!(
-                res,
-                Err(VmmActionError::Mmds(
-                    data_store::MmdsDatastoreError::NotInitialized
-                ))
-            ),
-            "{:?}",
-            res
-        );
-
-        assert_eq!(
-            runtime_request_with_mmds(
-                VmmAction::PutMMDS(
-                    serde_json::from_str(r#"{"key1": "value1", "key2": "val2"}"#).unwrap(),
-                ),
-                mmds.clone()
-            )
-            .unwrap(),
-            VmmData::Empty
-        );
-        assert_eq!(
-            runtime_request_with_mmds(VmmAction::GetMMDS, mmds.clone()).unwrap(),
-            VmmData::MmdsValue(
-                serde_json::from_str(r#"{"key1": "value1", "key2": "val2"}"#).unwrap()
-            )
-        );
-        assert_eq!(
-            runtime_request_with_mmds(
-                VmmAction::PatchMMDS(
-                    serde_json::from_str(r#"{"key1": null, "key2": "value2"}"#).unwrap(),
-                ),
-                mmds.clone()
-            )
-            .unwrap(),
-            VmmData::Empty
-        );
-
-        assert_eq!(
-            runtime_request_with_mmds(VmmAction::GetMMDS, mmds.clone()).unwrap(),
-            VmmData::MmdsValue(serde_json::from_str(r#"{"key2": "value2"}"#).unwrap())
-        );
-
-        let filling = (0..HTTP_MAX_PAYLOAD_SIZE).map(|_| "X").collect::<String>();
-        let data = "{\"key\": \"".to_string() + &filling + "\"}";
-
-        assert!(matches!(
-            runtime_request_with_mmds(
-                VmmAction::PatchMMDS(serde_json::from_str(&data).unwrap()),
-                mmds.clone()
-            ),
-            Err(VmmActionError::MmdsLimitExceeded(_))
-        ));
-        assert_eq!(
-            runtime_request_with_mmds(VmmAction::GetMMDS, mmds).unwrap(),
-            VmmData::MmdsValue(serde_json::from_str(r#"{"key2": "value2"}"#).unwrap())
-        );
-    }
-
-    #[test]
     fn test_preboot_disallowed() {
         fn check_unsupported(res: Result<VmmData, VmmActionError>) {
             assert!(
@@ -1232,6 +1225,9 @@ mod tests {
         check_unsupported(preboot_request(VmmAction::UpdateBlockDevice(
             BlockDeviceUpdateConfig::default(),
         )));
+        check_unsupported(preboot_request(VmmAction::UpdatePmemDevice(
+            PmemDeviceUpdateConfig::default(),
+        )));
         check_unsupported(preboot_request(VmmAction::UpdateNetworkInterface(
             NetworkInterfaceUpdateConfig {
                 iface_id: String::new(),
@@ -1257,21 +1253,9 @@ mod tests {
 
     fn runtime_request(request: VmmAction) -> Result<VmmData, VmmActionError> {
         let vmm = Arc::new(Mutex::new(default_vmm()));
-        let mut runtime = RuntimeApiController::new(VmResources::default(), vmm.clone());
-        runtime.handle_request(request)
-    }
-
-    fn runtime_request_with_mmds(
-        request: VmmAction,
-        mmds: Arc<Mutex<Mmds>>,
-    ) -> Result<VmmData, VmmActionError> {
-        let vm_res = VmResources {
-            mmds: Some(mmds),
-            ..Default::default()
-        };
-        let vmm = Arc::new(Mutex::new(default_vmm()));
-        let mut runtime = RuntimeApiController::new(vm_res, vmm.clone());
-        runtime.handle_request(request)
+        let mut runtime = RuntimeApiController::new(vmm.clone());
+        let mut event_manager = EventManager::new().unwrap();
+        runtime.handle_request(request, &mut event_manager)
     }
 
     #[test]
@@ -1305,30 +1289,8 @@ mod tests {
         check_unsupported(runtime_request(VmmAction::ConfigureMetrics(
             MetricsConfig {
                 metrics_path: PathBuf::new(),
-            },
-        )));
-        check_unsupported(runtime_request(VmmAction::InsertBlockDevice(
-            BlockDeviceConfig {
-                drive_id: String::new(),
-                partuuid: None,
-                is_root_device: false,
-                cache_type: CacheType::Unsafe,
-
-                is_read_only: Some(false),
-                path_on_host: Some(String::new()),
-                rate_limiter: None,
-                file_engine_type: None,
-
-                socket: None,
-            },
-        )));
-        check_unsupported(runtime_request(VmmAction::InsertNetworkDevice(
-            NetworkInterfaceConfig {
-                iface_id: String::new(),
-                host_dev_name: String::new(),
-                guest_mac: None,
-                rx_rate_limiter: None,
-                tx_rate_limiter: None,
+                emit_id: false,
+                properties: None,
             },
         )));
         check_unsupported(runtime_request(VmmAction::SetVsockDevice(
@@ -1369,17 +1331,13 @@ mod tests {
                 track_dirty_pages: false,
                 resume_vm: false,
                 network_overrides: vec![],
+                vsock_override: None,
+                clock_realtime: false,
             },
         )));
         check_unsupported(runtime_request(VmmAction::SetEntropyDevice(
             EntropyDeviceConfig::default(),
         )));
-        check_unsupported(runtime_request(VmmAction::InsertPmemDevice(PmemConfig {
-            id: String::new(),
-            path_on_host: String::new(),
-            root_device: false,
-            read_only: false,
-        })));
         check_unsupported(runtime_request(VmmAction::SetMemoryHotplugDevice(
             MemoryHotplugConfig::default(),
         )));

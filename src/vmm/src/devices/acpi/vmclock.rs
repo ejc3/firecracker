@@ -6,23 +6,27 @@ use std::mem::offset_of;
 use std::sync::atomic::{Ordering, fence};
 
 use acpi_tables::{Aml, aml};
-use log::error;
 use serde::{Deserialize, Serialize};
 use vm_allocator::AllocPolicy;
 use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryError};
+use vm_superio::Trigger;
+use vmm_sys_util::eventfd::EventFd;
 
 use crate::devices::acpi::generated::vmclock_abi::{
-    VMCLOCK_COUNTER_INVALID, VMCLOCK_MAGIC, VMCLOCK_STATUS_UNKNOWN, vmclock_abi,
+    VMCLOCK_COUNTER_INVALID, VMCLOCK_FLAG_NOTIFICATION_PRESENT,
+    VMCLOCK_FLAG_VM_GEN_COUNTER_PRESENT, VMCLOCK_MAGIC, VMCLOCK_STATUS_UNKNOWN, vmclock_abi,
 };
+use crate::devices::legacy::EventFdTrigger;
+use crate::logger::debug;
 use crate::snapshot::Persist;
-use crate::vstate::memory::GuestMemoryMmap;
+use crate::vstate::memory::{GuestMemoryExtension, GuestMemoryMmap};
 use crate::vstate::resources::ResourceAllocator;
 
 // SAFETY: `vmclock_abi` is a POD
 unsafe impl ByteValued for vmclock_abi {}
 
 // We are reserving a physical page to expose the [`VmClock`] data
-const VMCLOCK_SIZE: u32 = 0x1000;
+pub const VMCLOCK_SIZE: u32 = 0x1000;
 
 // Write a value in `vmclock_abi` both in the Firecracker-managed state
 // and inside guest memory address that corresponds to it.
@@ -38,6 +42,20 @@ macro_rules! write_vmclock_field {
     };
 }
 
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum VmClockError {
+    /// Could not create EventFd: {0}
+    CreateEventFd(std::io::Error),
+    /// Could not allocate GSI: {0}
+    AllocateGsi(vm_allocator::Error),
+    /// Could not allocate guest memory: {0}
+    AllocateMemory(vm_allocator::Error),
+    /// Could not write VMClock data to guest memory: {0}
+    WriteGuestMemory(#[from] GuestMemoryError),
+    /// Could not notify guest: {0}
+    NotifyGuest(std::io::Error),
+}
+
 /// VMclock device
 ///
 /// This device emulates the VMclock device which allows passing information to the guest related
@@ -47,20 +65,34 @@ macro_rules! write_vmclock_field {
 pub struct VmClock {
     /// Guest address in which we will write the VMclock struct
     pub guest_address: GuestAddress,
+    /// Interrupt line for notifying the device about changes
+    pub interrupt_evt: EventFdTrigger,
+    /// GSI number allocated for the device.
+    pub gsi: u32,
     /// The [`VmClock`] state we are exposing to the guest
     inner: vmclock_abi,
 }
 
 impl VmClock {
     /// Create a new [`VmClock`] device for a newly booted VM
-    pub fn new(resource_allocator: &mut ResourceAllocator) -> VmClock {
+    pub fn new(resource_allocator: &mut ResourceAllocator) -> Result<VmClock, VmClockError> {
         let addr = resource_allocator
-            .allocate_system_memory(
+            .system_memory
+            .allocate(
                 VMCLOCK_SIZE as u64,
                 VMCLOCK_SIZE as u64,
                 AllocPolicy::LastMatch,
             )
-            .expect("vmclock: could not allocate guest memory for device");
+            .map_err(VmClockError::AllocateMemory)?
+            .start();
+
+        let gsi = resource_allocator
+            .allocate_gsi_legacy(1)
+            .map_err(VmClockError::AllocateGsi)?[0];
+
+        let interrupt_evt = EventFdTrigger::new(
+            EventFd::new(libc::EFD_NONBLOCK).map_err(VmClockError::CreateEventFd)?,
+        );
 
         let mut inner = vmclock_abi {
             magic: VMCLOCK_MAGIC,
@@ -68,23 +100,27 @@ impl VmClock {
             version: 1,
             clock_status: VMCLOCK_STATUS_UNKNOWN,
             counter_id: VMCLOCK_COUNTER_INVALID,
+            flags: VMCLOCK_FLAG_VM_GEN_COUNTER_PRESENT | VMCLOCK_FLAG_NOTIFICATION_PRESENT,
             ..Default::default()
         };
 
-        VmClock {
+        Ok(VmClock {
             guest_address: GuestAddress(addr),
+            interrupt_evt,
+            gsi,
             inner,
-        }
+        })
     }
 
     /// Activate [`VmClock`] device
-    pub fn activate(&self, mem: &GuestMemoryMmap) -> Result<(), GuestMemoryError> {
+    pub fn activate(&self, mem: &GuestMemoryMmap) -> Result<(), VmClockError> {
+        mem.check_range_plugged(self.guest_address, self.inner.as_slice().len())?;
         mem.write_slice(self.inner.as_slice(), self.guest_address)?;
         Ok(())
     }
 
-    /// Bump the VM generation counter
-    pub fn post_load_update(&mut self, mem: &GuestMemoryMmap) {
+    /// Bump the VM generation counter and notify guest after snapshot restore
+    pub fn do_post_restore(&mut self, mem: &GuestMemoryMmap) -> Result<(), VmClockError> {
         write_vmclock_field!(self, mem, seq_count, self.inner.seq_count | 1);
 
         // This fence ensures guest sees all previous writes. It is matched to a
@@ -98,11 +134,23 @@ impl VmClock {
             self.inner.disruption_marker.wrapping_add(1)
         );
 
-        // This fence ensures guest sees the `disruption_marker` update. It is matched to a
-        // read barrier in the guest.
+        write_vmclock_field!(
+            self,
+            mem,
+            vm_generation_counter,
+            self.inner.vm_generation_counter.wrapping_add(1)
+        );
+
+        // This fence ensures guest sees the `disruption_marker` and `vm_generation_counter`
+        // updates. It is matched to a read barrier in the guest.
         fence(Ordering::Release);
 
         write_vmclock_field!(self, mem, seq_count, self.inner.seq_count.wrapping_add(1));
+        self.interrupt_evt
+            .trigger()
+            .map_err(VmClockError::NotifyGuest)?;
+        debug!("vmclock: notifying guest about VMClock updates");
+        Ok(())
     }
 }
 
@@ -113,32 +161,35 @@ impl VmClock {
 pub struct VmClockState {
     /// Guest address in which we write the [`VmClock`] info
     pub guest_address: u64,
+    /// GSI used for notifying the guest about device changes
+    pub gsi: u32,
     /// Data we expose to the guest
     pub inner: vmclock_abi,
 }
 
 impl<'a> Persist<'a> for VmClock {
     type State = VmClockState;
-    type ConstructorArgs = &'a GuestMemoryMmap;
-    type Error = Infallible;
+    type ConstructorArgs = ();
+    type Error = VmClockError;
 
     fn save(&self) -> Self::State {
         VmClockState {
             guest_address: self.guest_address.0,
+            gsi: self.gsi,
             inner: self.inner,
         }
     }
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
-        let mut vmclock = VmClock {
+    fn restore(vm: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
+        let interrupt_evt = EventFdTrigger::new(
+            EventFd::new(libc::EFD_NONBLOCK).map_err(VmClockError::CreateEventFd)?,
+        );
+        Ok(VmClock {
             guest_address: GuestAddress(state.guest_address),
+            interrupt_evt,
+            gsi: state.gsi,
             inner: state.inner,
-        };
-        vmclock.post_load_update(constructor_args);
-        Ok(vmclock)
+        })
     }
 }
 
@@ -174,14 +225,19 @@ impl Aml for VmClock {
 #[cfg(test)]
 mod tests {
     use vm_memory::{Bytes, GuestAddress};
+    use vmm_sys_util::tempfile::TempFile;
 
-    use crate::arch;
+    #[cfg(target_arch = "x86_64")]
+    use crate::arch::x86_64::layout;
+    use crate::arch::{self, Kvm};
     use crate::devices::acpi::generated::vmclock_abi::vmclock_abi;
     use crate::devices::acpi::vmclock::{VMCLOCK_SIZE, VmClock};
-    use crate::snapshot::Persist;
+    use crate::devices::virtio::test_utils::default_mem;
+    use crate::snapshot::{Persist, Snapshot};
     use crate::test_utils::single_region_mem;
     use crate::utils::u64_to_usize;
     use crate::vstate::resources::ResourceAllocator;
+    use crate::vstate::vm::tests::setup_vm_with_memory;
 
     // We are allocating memory from the end of the system memory portion
     const VMCLOCK_TEST_GUEST_ADDR: GuestAddress =
@@ -189,7 +245,7 @@ mod tests {
 
     fn default_vmclock() -> VmClock {
         let mut resource_allocator = ResourceAllocator::new();
-        VmClock::new(&mut resource_allocator)
+        VmClock::new(&mut resource_allocator).unwrap()
     }
 
     #[test]
@@ -211,15 +267,17 @@ mod tests {
     #[test]
     fn test_device_save_restore() {
         let vmclock = default_vmclock();
+        // We're using memory inside the system memory portion of the guest RAM. So we need a
+        // memory region that includes it.
         let mem = single_region_mem(
             u64_to_usize(arch::SYSTEM_MEM_START) + u64_to_usize(arch::SYSTEM_MEM_SIZE),
         );
 
         vmclock.activate(&mem).unwrap();
-        let guest_data: vmclock_abi = mem.read_obj(VMCLOCK_TEST_GUEST_ADDR).unwrap();
 
         let state = vmclock.save();
-        let vmclock_new = VmClock::restore(&mem, &state).unwrap();
+        let mut vmclock_new = VmClock::restore((), &state).unwrap();
+        vmclock_new.do_post_restore(&mem);
 
         let guest_data_new: vmclock_abi = mem.read_obj(VMCLOCK_TEST_GUEST_ADDR).unwrap();
         assert_ne!(guest_data_new, vmclock.inner);
@@ -227,6 +285,10 @@ mod tests {
         assert_eq!(
             vmclock.inner.disruption_marker + 1,
             vmclock_new.inner.disruption_marker
+        );
+        assert_eq!(
+            vmclock.inner.vm_generation_counter + 1,
+            vmclock_new.inner.vm_generation_counter
         );
     }
 }

@@ -14,22 +14,17 @@ use std::sync::{Arc, Barrier};
 
 use event_manager::{EventOps, Events, MutEventSubscriber};
 use libc::EFD_NONBLOCK;
-use log::{error, warn};
 use serde::Serialize;
-use vm_superio::serial::{Error as SerialError, SerialEvents};
+use vm_superio::serial::{Error as SerialError, SerialEvents, SerialState};
 use vm_superio::{Serial, Trigger};
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::devices::legacy::EventFdTrigger;
-use crate::logger::{IncMetric, SharedIncMetric};
+use crate::logger::{IncMetric, SharedIncMetric, error, warn};
+use crate::rate_limiter::{BucketReduction, TokenBucket};
+use crate::utils::usize_to_u64;
 use crate::vstate::bus::BusDevice;
-
-/// Received Data Available interrupt - for letting the driver know that
-/// there is some pending data to be processed.
-pub const IER_RDA_BIT: u8 = 0b0000_0001;
-/// Received Data Available interrupt offset
-pub const IER_RDA_OFFSET: u8 = 1;
 
 /// Metrics specific to the UART device.
 #[derive(Debug, Serialize, Default)]
@@ -46,6 +41,8 @@ pub struct SerialDeviceMetrics {
     pub read_count: SharedIncMetric,
     /// Number of succeeded write calls.
     pub write_count: SharedIncMetric,
+    /// Total bytes dropped by the serial output rate limiter.
+    pub rate_limiter_dropped_bytes: SharedIncMetric,
 }
 impl SerialDeviceMetrics {
     /// Const default construction.
@@ -57,6 +54,7 @@ impl SerialDeviceMetrics {
             missed_write_count: SharedIncMetric::new(),
             read_count: SharedIncMetric::new(),
             write_count: SharedIncMetric::new(),
+            rate_limiter_dropped_bytes: SharedIncMetric::new(),
         }
     }
 }
@@ -127,25 +125,62 @@ impl SerialEvents for SerialEventsWrapper {
     }
 }
 
+/// The underlying output destination.
 #[derive(Debug)]
-pub enum SerialOut {
+pub enum SerialOutInner {
     Sink,
     Stdout(std::io::Stdout),
     File(File),
 }
+
+/// Output sink for the serial device, with optional rate limiting.
+#[derive(Debug)]
+pub struct SerialOut {
+    inner: SerialOutInner,
+    /// Optional rate limiter for serial output bandwidth.
+    rate_limiter: Option<TokenBucket>,
+}
+
+impl SerialOut {
+    /// Create a new `SerialOut` with the given inner sink and optional rate limiter.
+    pub fn new(inner: SerialOutInner, rate_limiter: Option<TokenBucket>) -> Self {
+        Self {
+            inner,
+            rate_limiter,
+        }
+    }
+}
+
 impl std::io::Write for SerialOut {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Sink => Ok(buf.len()),
-            Self::Stdout(stdout) => stdout.write(buf),
-            Self::File(file) => file.write(buf),
+        if let SerialOutInner::Sink = self.inner {
+            return Ok(buf.len());
+        }
+
+        // Check rate limiter if configured.
+        if let Some(ref mut rl) = self.rate_limiter {
+            match rl.reduce(usize_to_u64(buf.len())) {
+                BucketReduction::Failure | BucketReduction::OverConsumption(_) => {
+                    METRICS
+                        .rate_limiter_dropped_bytes
+                        .add(usize_to_u64(buf.len()));
+                    return Ok(buf.len());
+                }
+                BucketReduction::Success => {}
+            }
+        }
+
+        match &mut self.inner {
+            SerialOutInner::Stdout(stdout) => stdout.write(buf),
+            SerialOutInner::File(file) => file.write(buf),
+            SerialOutInner::Sink => Ok(buf.len()),
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Self::Sink => Ok(()),
-            Self::Stdout(stdout) => stdout.flush(),
-            Self::File(file) => file.flush(),
+        match &mut self.inner {
+            SerialOutInner::Sink => Ok(()),
+            SerialOutInner::Stdout(stdout) => stdout.flush(),
+            SerialOutInner::File(file) => file.flush(),
         }
     }
 }
@@ -230,17 +265,26 @@ impl<I: Read + AsRawFd + Send + Debug> SerialWrapper<EventFdTrigger, SerialEvent
 pub type SerialDevice = SerialWrapper<EventFdTrigger, SerialEventsWrapper, Stdin>;
 
 impl SerialDevice {
-    pub fn new(serial_in: Option<Stdin>, serial_out: SerialOut) -> Result<Self, std::io::Error> {
+    pub fn new(
+        serial_in: Option<Stdin>,
+        serial_out: SerialOut,
+        state: Option<&SerialState>,
+    ) -> Result<Self, std::io::Error> {
         let interrupt_evt = EventFdTrigger::new(EventFd::new(EFD_NONBLOCK)?);
         let buffer_read_event_fd = EventFdTrigger::new(EventFd::new(EFD_NONBLOCK)?);
+        let events = SerialEventsWrapper {
+            buffer_ready_event_fd: Some(buffer_read_event_fd),
+        };
 
-        let serial = Serial::with_events(
-            interrupt_evt,
-            SerialEventsWrapper {
-                buffer_ready_event_fd: Some(buffer_read_event_fd),
-            },
-            serial_out,
-        );
+        let serial =
+            match state {
+                Some(state) => Serial::from_state(state, interrupt_evt, events, serial_out)
+                    .map_err(|err| match err {
+                        SerialError::Trigger(e) | SerialError::IOError(e) => e,
+                        SerialError::FullFifo => std::io::Error::other("FIFO buffer too large"),
+                    })?,
+                None => Serial::with_events(interrupt_evt, events, serial_out),
+            };
 
         Ok(SerialDevice {
             serial,
@@ -398,6 +442,12 @@ mod tests {
 
     use super::*;
     use crate::logger::IncMetric;
+    use crate::rate_limiter::TokenBucket;
+
+    /// Helper to create a `SerialOut` with `Sink` inner and no rate limiter for tests.
+    fn test_serial_out_sink() -> SerialOut {
+        SerialOut::new(SerialOutInner::Sink, None)
+    }
 
     #[test]
     fn test_serial_bus_read() {
@@ -411,7 +461,7 @@ mod tests {
                 SerialEventsWrapper {
                     buffer_ready_event_fd: None,
                 },
-                SerialOut::Sink,
+                test_serial_out_sink(),
             ),
             input: None::<std::io::Stdin>,
         };
@@ -431,6 +481,24 @@ mod tests {
         let invalid_reads_after_2 = metrics.missed_read_count.count();
         // The `invalid_read_count` metric should be the same as before the one-byte reads.
         assert_eq!(invalid_reads_after_2, invalid_reads_after);
+    }
+
+    #[test]
+    fn test_restore_from_state() {
+        let mut serial = SerialDevice::new(None, test_serial_out_sink(), None).unwrap();
+        serial.serial.raw_input(b"abc").unwrap();
+
+        let state = serial.serial.state();
+        let mut restored = SerialDevice::new(None, test_serial_out_sink(), Some(&state)).unwrap();
+
+        // Make sure we read back what we previously injected
+        let mut buf = [0u8; 1];
+        restored.read(0, 0, &mut buf);
+        assert_eq!(buf[0], b'a');
+        restored.read(0, 0, &mut buf);
+        assert_eq!(buf[0], b'b');
+        restored.read(0, 0, &mut buf);
+        assert_eq!(buf[0], b'c');
     }
 
     #[test]
@@ -463,5 +531,62 @@ mod tests {
         assert_eq!(serial_metrics_local, serial_metrics_global);
         serial_metrics.read_count.inc();
         assert_eq!(serial_metrics.read_count.count(), 1);
+    }
+
+    #[test]
+    fn test_serial_out_write_within_budget() {
+        let tmp = vmm_sys_util::tempfile::TempFile::new().unwrap();
+        let file = tmp.into_file();
+        let mut serial_out = SerialOut::new(
+            SerialOutInner::File(file.try_clone().unwrap()),
+            Some(TokenBucket::new(1024, 0, 1000).unwrap()),
+        );
+
+        let data = b"hello";
+        let result = serial_out.write(data).unwrap();
+        assert_eq!(result, data.len());
+
+        use std::io::Seek;
+        let mut file = file;
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"hello");
+    }
+
+    #[test]
+    fn test_serial_out_write_over_budget() {
+        let tmp = vmm_sys_util::tempfile::TempFile::new().unwrap();
+        let file = tmp.into_file();
+        let mut serial_out = SerialOut::new(
+            SerialOutInner::File(file.try_clone().unwrap()),
+            Some(TokenBucket::new(4, 0, 1000).unwrap()),
+        );
+
+        let result = serial_out.write(b"abcd").unwrap();
+        assert_eq!(result, 4);
+
+        let dropped_before = METRICS.rate_limiter_dropped_bytes.count();
+        let big_data = vec![b'X'; 1024];
+        let result = serial_out.write(&big_data).unwrap();
+        assert_eq!(result, 1024);
+        let dropped_delta = METRICS.rate_limiter_dropped_bytes.count() - dropped_before;
+        assert!(dropped_delta >= 1024);
+
+        use std::io::Seek;
+        let mut file = file;
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"abcd");
+    }
+
+    #[test]
+    fn test_serial_out_sink_discards_everything() {
+        let mut serial_out = test_serial_out_sink();
+        let dropped_before = METRICS.rate_limiter_dropped_bytes.count();
+        let result = serial_out.write(b"anything").unwrap();
+        assert_eq!(result, 8);
+        assert_eq!(METRICS.rate_limiter_dropped_bytes.count(), dropped_before);
     }
 }

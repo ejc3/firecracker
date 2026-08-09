@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests ensuring codebase style compliance for Rust and Python."""
 
-
 import platform
 
 import pytest
@@ -22,4 +21,6 @@ def test_rust_clippy(target):
     """
     Test that clippy does not generate any errors/warnings.
     """
-    cargo("clippy", f"--target {target} --all --all-targets", "-D warnings")
+    cargo(
+        "clippy", f"--target {target} --all --all-targets --all-features", "-D warnings"
+    )

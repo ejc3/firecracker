@@ -7,10 +7,11 @@
 
 use std::num::Wrapping;
 use std::sync::atomic::{Ordering, fence};
+use vm_memory::GuestMemoryBackend;
 
 use crate::logger::error;
 use crate::utils::u64_to_usize;
-use crate::vstate::memory::{Bitmap, ByteValued, GuestAddress, GuestMemory};
+use crate::vstate::memory::{Bitmap, ByteValued, GuestAddress, GuestMemoryMmap};
 
 pub const VIRTQ_DESC_F_NEXT: u16 = 0x1;
 pub const VIRTQ_DESC_F_WRITE: u16 = 0x2;
@@ -315,7 +316,7 @@ impl Queue {
             + std::mem::size_of::<u16>()
     }
 
-    fn get_aligned_slice_ptr<T, M: GuestMemory>(
+    fn get_aligned_slice_ptr<T, M: GuestMemoryBackend>(
         &self,
         mem: &M,
         addr: GuestAddress,
@@ -339,7 +340,7 @@ impl Queue {
 
     /// Set up pointers to the queue objects in the guest memory
     /// and mark memory dirty for those objects
-    pub fn initialize<M: GuestMemory>(&mut self, mem: &M) -> Result<(), QueueError> {
+    pub fn initialize<M: GuestMemoryBackend>(&mut self, mem: &M) -> Result<(), QueueError> {
         if !self.ready {
             return Err(QueueError::NotReady);
         }
@@ -645,6 +646,20 @@ impl Queue {
         self.uses_notif_suppression = true;
     }
 
+    /// Arm `avail_event` at the current `avail.idx` so the driver's next
+    /// publish produces a notification. Unlike [`Self::try_enable_notification`],
+    /// does not require the queue to be drained and does not recheck
+    /// `avail.idx`; only correct when the driver does not add to the avail
+    /// ring until it has observed our used-ring update.
+    pub fn enable_notification(&mut self) {
+        if !self.uses_notif_suppression {
+            return;
+        }
+
+        self.used_ring_avail_event_set(self.avail_ring_idx_get());
+        fence(Ordering::Release);
+    }
+
     /// Check if we need to kick the guest.
     ///
     /// Please note this method has side effects: once it returns `true`, it considers the
@@ -669,19 +684,6 @@ impl Queue {
 
         new - used_event - Wrapping(1) < new - old
     }
-
-    /// Resets the Virtio Queue
-    pub(crate) fn reset(&mut self) {
-        self.ready = false;
-        self.size = self.max_size;
-        self.desc_table_address = GuestAddress(0);
-        self.avail_ring_address = GuestAddress(0);
-        self.used_ring_address = GuestAddress(0);
-        self.next_avail = Wrapping(0);
-        self.next_used = Wrapping(0);
-        self.num_added = Wrapping(0);
-        self.uses_notif_suppression = false;
-    }
 }
 
 #[cfg(kani)]
@@ -690,10 +692,10 @@ mod verification {
     use std::mem::ManuallyDrop;
     use std::num::Wrapping;
 
-    use vm_memory::{GuestMemoryRegion, MemoryRegionAddress};
+    use vm_memory::{GuestMemoryBackend, GuestMemoryRegion, MemoryRegionAddress};
 
     use super::*;
-    use crate::vstate::memory::{Bytes, FileOffset, GuestAddress, GuestMemory, MmapRegion};
+    use crate::vstate::memory::{Bytes, FileOffset, GuestAddress, MmapRegion};
 
     /// A made-for-kani version of `vm_memory::GuestMemoryMmap`. Unlike the real
     /// `GuestMemoryMmap`, which manages a list of regions and then does a binary
@@ -706,7 +708,7 @@ mod verification {
         the_region: vm_memory::GuestRegionMmap,
     }
 
-    impl GuestMemory for ProofGuestMemory {
+    impl GuestMemoryBackend for ProofGuestMemory {
         type R = vm_memory::GuestRegionMmap;
 
         fn num_regions(&self) -> usize {

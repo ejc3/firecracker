@@ -24,7 +24,8 @@
 - [Snapshot security and uniqueness](#snapshot-security-and-uniqueness)
   - [Secure and insecure usage examples](#usage-examples)
   - [Reusing snapshotted states securely](#reusing-snapshotted-states-securely)
-- [Vsock device limitation](#vsock-device-limitation)
+  - [Userspace notifications of loading snapshots](#userspace-notifications-of-loading-snapshots)
+- [Vsock device reset](#vsock-device-reset)
 - [VMGenID device limitation](#vmgenid-device-limitation)
 - [Where can I resume my snapshots?](#where-can-i-resume-my-snapshots)
 
@@ -307,7 +308,7 @@ For creating a diff snapshot, you should use the same API command, but with
 >     -d '{
 >             "snapshot_type": "Diff",
 >             "snapshot_path": "./snapshot_file",
->             "mem_file_path": "./mem_file",
+>             "mem_file_path": "./mem_file"
 >     }'
 > ```
 
@@ -492,6 +493,11 @@ resumed with the guest OS wall-clock continuing from the moment of the snapshot
 creation. For this reason, the wall-clock should be updated to the current time,
 on the guest-side. More details on how you could do this can be found at a
 [related FAQ](../../FAQ.md#my-guest-wall-clock-is-drifting-how-can-i-fix-it).
+When using `kvm-clock` as clock source on `x86_64`, it's possible to optionally
+set the `clock_realtime: true` in the `LoadSnapshot` request to advance the
+clock on the guest at restore time (host Linux >= 5.16 is required to support
+this feature). Note that this may cause issues within the guest as the clock
+will appear to suddenly jump.
 
 ## Provisioning host disk space for snapshots
 
@@ -589,6 +595,50 @@ for randomness. State other than the guest kernel entropy pool, such as unique
 identifiers, cached random numbers, cryptographic tokens, etc **will** still be
 replicated across multiple microVMs resumed from the same snapshot. Users need
 to implement mechanisms for ensuring de-duplication of such state, where needed.
+
+## Userspace notifications of loading snapshots
+
+VMClock device
+([specification](https://uapi-group.org/specifications/specs/vmclock/)) is a
+device that enables efficient application clock synchronization against real
+wallclock time, for applications running inside virtual machines. VMClock also
+takes care situations where there is some sort disruption happens to the clock.
+It handles these through fields in the
+[`vmlcock_abi`](https://uapi-group.org/specifications/specs/vmclock/#the-vmclock_abi-structure).
+Currently, it handles two cases:
+
+1. Live migration through the `disruption_marker` field.
+1. Restore from snapshots through the `vm_generation_counter`.
+
+Whenever a VM starts from a snapshot VMClock will present a new (different that
+what was previously stored) value in the `vm_generation_counter`. This happens
+in an atomic way, i.e. `vm_generation_counter` will include the new value as
+soon as vCPUs are resumed post snapshot loading.
+
+User space libraries, e.g. userspace PRNGs can mmap() `vmclock_abi` and monitor
+changes in `vm_generation_counter` to observe when they need to adapt and/or
+recreate state.
+
+Moreover, VMClock allows processes to call poll() on the VMClock device and get
+notified about changes through an event loop.
+
+For reference, the C code used in our tests is available
+[here](https://github.com/firecracker-microvm/firecracker/blob/main/tests/host_tools/vmclock.c).
+
+> [!IMPORTANT]
+>
+> Support for `vm_generation_counter` and `poll()` is implemented in Linux
+> through the patches
+> [here](https://lore.kernel.org/all/20260130173704.12575-1-itazur@amazon.com/)
+> and was merged in Linux kernel v7.0. Users need to make sure that the linked
+> patches are applied on their kernels. These patches have been backported to
+> Amazon Linux v5.10 and v6.1 microVM kernels, starting from
+> [microvm-kernel-5.10.252-285.992.amzn2](https://github.com/amazonlinux/linux/tree/microvm-kernel-5.10.252-285.992.amzn2)
+> and
+> [microvm-kernel-6.1.167-27.319.amzn2023](https://github.com/amazonlinux/linux/tree/microvm-kernel-6.1.167-27.319.amzn2023)
+> respectively. These patched kernels will be automatically downloaded when
+> running the integration test suite, or they can be manually downloaded using
+> `tools/devtool download_ci_artifacts`.
 
 ## Vsock device reset
 

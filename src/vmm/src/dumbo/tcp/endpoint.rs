@@ -24,7 +24,7 @@ use crate::dumbo::tcp::connection::{Connection, PassiveOpenError, RecvStatusFlag
 use crate::dumbo::tcp::{MAX_WINDOW_SIZE, NextSegmentStatus, seq_after};
 use crate::logger::{IncMetric, METRICS};
 
-// TODO: These are currently expressed in cycles. Normally, they would be the equivalent of a
+// These are currently expressed in cycles. Normally, they would be the equivalent of a
 // certain duration, depending on the frequency of the CPU, but we still have a bit to go until
 // that functionality is available, so we just use some conservative-ish values. Even on a fast
 // 4GHz CPU, the first is roughly equal to 10 seconds, and the other is ~300 ms.
@@ -38,6 +38,8 @@ const CONNECTION_RTO_COUNT_MAX: u16 = 15;
 // TODO: Maybe at some point include this in the checks we do when populating the MMDS via the API,
 // since it effectively limits the size of the keys (URIs) we're willing to use.
 const RCV_BUF_MAX_SIZE: u32 = 2500;
+
+const _: () = assert!(RCV_BUF_MAX_SIZE <= MAX_WINDOW_SIZE);
 
 // Represents the local endpoint of a HTTP over TCP connection which carries GET requests
 // to the MMDS.
@@ -90,20 +92,12 @@ impl Endpoint {
     ///   unit.
     /// - `connection_rto_count_max`: How many consecutive timeout-based retransmission may occur
     ///   before the connection resets itself.
-    /// ## Panics:
-    /// - `assert!(RCV_BUF_MAX_SIZE <= MAX_WINDOW_SIZE as usize);`
     pub fn new<T: NetworkBytes + Debug>(
         segment: &TcpSegment<T>,
         eviction_threshold: NonZeroU64,
         connection_rto_period: NonZeroU64,
         connection_rto_count_max: NonZeroU16,
     ) -> Result<Self, PassiveOpenError> {
-        // This simplifies things, and is a very reasonable assumption.
-        #[allow(clippy::assertions_on_constants)]
-        {
-            assert!(RCV_BUF_MAX_SIZE <= MAX_WINDOW_SIZE);
-        }
-
         let connection = Connection::passive_open(
             segment,
             RCV_BUF_MAX_SIZE,
@@ -115,9 +109,6 @@ impl Endpoint {
             receive_buf: [0u8; RCV_BUF_MAX_SIZE as usize],
             receive_buf_left: 0,
             response_buf: Vec::new(),
-            // TODO: Using first_not_sent() makes sense here because a connection is currently
-            // created via passive open only, so this points to the sequence number right after
-            // the SYNACK. It might stop working like that if/when the implementation changes.
             response_seq: connection.first_not_sent(),
             initial_response_seq: connection.first_not_sent(),
             connection,
@@ -599,7 +590,7 @@ mod tests {
         assert_eq!(actual_response, expected_response);
 
         // Test invalid HTTP methods.
-        let invalid_methods = ["POST", "HEAD", "DELETE", "CONNECT", "OPTIONS", "TRACE"];
+        let invalid_methods = ["POST", "HEAD", "CONNECT", "OPTIONS", "TRACE"];
         for method in invalid_methods.iter() {
             let request_bytes = format!("{} http://169.254.169.255/ HTTP/1.0\r\n\r\n", method);
             let mut expected_response = Response::new(Version::Http11, StatusCode::NotImplemented);

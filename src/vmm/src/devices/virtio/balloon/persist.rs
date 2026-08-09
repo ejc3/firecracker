@@ -10,8 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 use crate::devices::virtio::balloon::device::{BalloonStats, ConfigSpace, HintingState};
-use crate::devices::virtio::device::{ActiveState, DeviceState};
-use crate::devices::virtio::generated::virtio_ids::VIRTIO_ID_BALLOON;
+use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDeviceType};
 use crate::devices::virtio::persist::VirtioDeviceState;
 use crate::devices::virtio::queue::FIRECRACKER_MAX_QUEUE_SIZE;
 use crate::devices::virtio::transport::VirtioInterrupt;
@@ -173,7 +172,7 @@ impl Persist<'_> for Balloon {
             .virtio_state
             .build_queues_checked(
                 &constructor_args.mem,
-                VIRTIO_ID_BALLOON,
+                VirtioDeviceType::Balloon,
                 num_queues,
                 FIRECRACKER_MAX_QUEUE_SIZE,
             )
@@ -207,30 +206,23 @@ mod tests {
     use super::*;
     use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::test_utils::{default_interrupt, default_mem};
-    use crate::snapshot::Snapshot;
 
     #[test]
     fn test_persistence() {
         let guest_mem = default_mem();
-        let mut mem = vec![0; 4096];
 
         // Create and save the balloon device.
         let balloon = Balloon::new(0x42, false, 2, false, false).unwrap();
 
-        Snapshot::new(balloon.save())
-            .save(&mut mem.as_mut_slice())
-            .unwrap();
+        let balloon_state = balloon.save();
+        let serialized_data = bitcode::serialize(&balloon_state).unwrap();
 
         // Deserialize and restore the balloon device.
-        let restored_balloon = Balloon::restore(
-            BalloonConstructorArgs { mem: guest_mem },
-            &Snapshot::load_without_crc_check(mem.as_slice())
-                .unwrap()
-                .data,
-        )
-        .unwrap();
+        let restored_state = bitcode::deserialize(&serialized_data).unwrap();
+        let restored_balloon =
+            Balloon::restore(BalloonConstructorArgs { mem: guest_mem }, &restored_state).unwrap();
 
-        assert_eq!(restored_balloon.device_type(), VIRTIO_ID_BALLOON);
+        assert_eq!(restored_balloon.device_type(), VirtioDeviceType::Balloon);
 
         assert_eq!(restored_balloon.acked_features, balloon.acked_features);
         assert_eq!(restored_balloon.avail_features, balloon.avail_features);

@@ -1,6 +1,7 @@
 # Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Check the well functioning af the RTC device on aarch64 platforms."""
+
 import platform
 import re
 
@@ -14,11 +15,11 @@ DMESG_LOG_REGEX = r"rtc-pl031\s+(\d+).rtc: setting system clock to"
 @pytest.mark.skipif(
     platform.machine() != "aarch64", reason="RTC exists only on aarch64."
 )
-def test_rtc(uvm_plain_any):
+def test_rtc(uvm):
     """
     Test RTC functionality on aarch64.
     """
-    vm = uvm_plain_any
+    vm = uvm
     vm.spawn()
     vm.memory_monitor = None
     vm.basic_config()

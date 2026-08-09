@@ -7,13 +7,13 @@ from pathlib import Path
 
 import pytest
 
+from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel
 from framework.utils import check_output
 from host_tools.fcmetrics import validate_fc_metrics
 
 
-def test_describe_snapshot_all_versions(
-    microvm_factory, guest_kernel, rootfs, firecracker_release
-):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_describe_snapshot(uvm):
     """
     Test `--describe-snapshot` correctness for all snapshot versions.
 
@@ -21,36 +21,31 @@ def test_describe_snapshot_all_versions(
     snapshot state file.
     """
 
-    target_version = firecracker_release.snapshot_version
-    vm = microvm_factory.build(
-        guest_kernel,
-        rootfs,
-        fc_binary_path=firecracker_release.path,
-        jailer_binary_path=firecracker_release.jailer,
-    )
-    # FIXME: Once only FC versions >= 1.12 are supported, drop log_level="warn"
-    vm.spawn(log_level="warn", serial_out_path=None)
+    vm = uvm
+    fc_binary = vm.fc_binary_path
+
+    cmd = [fc_binary, "--snapshot-version"]
+    snap_version_tuple = check_output(cmd).stdout.strip().split("\n")[0].split(".")
+    snap_version = ".".join(str(x) for x in snap_version_tuple)
+
+    vm.spawn()
     vm.basic_config(track_dirty_pages=True)
     vm.start()
     snapshot = vm.snapshot_diff()
-    print("========== Firecracker create snapshot log ==========")
-    print(vm.log_data)
     vm.kill()
 
-    # Fetch Firecracker binary
-    fc_binary = microvm_factory.fc_binary_path
-    # Verify the output of `--describe-snapshot` command line parameter
-    cmd = [fc_binary] + ["--describe-snapshot", snapshot.vmstate]
+    cmd = [fc_binary, "--describe-snapshot", snapshot.vmstate]
     _, stdout, stderr = check_output(cmd)
     assert stderr == ""
-    assert target_version in stdout
+    assert snap_version in stdout
 
 
-def test_cli_metrics_path(uvm_plain):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_cli_metrics_path(uvm):
     """
     Test --metrics-path parameter
     """
-    microvm = uvm_plain
+    microvm = uvm
     metrics_path = Path(microvm.path) / "my_metrics.ndjson"
     microvm.spawn(metrics_path=metrics_path)
     microvm.basic_config()
@@ -59,13 +54,14 @@ def test_cli_metrics_path(uvm_plain):
     validate_fc_metrics(metrics)
 
 
-def test_cli_metrics_path_if_metrics_initialized_twice_fail(uvm_plain):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_cli_metrics_path_if_metrics_initialized_twice_fail(uvm):
     """
     Given: a running firecracker with metrics configured with the CLI option
     When: Configure metrics via API
     Then: API returns an error
     """
-    microvm = uvm_plain
+    microvm = uvm
 
     # First configure the µvm metrics with --metrics-path
     metrics_path = Path(microvm.path) / "metrics.ndjson"
@@ -83,12 +79,13 @@ def test_cli_metrics_path_if_metrics_initialized_twice_fail(uvm_plain):
         )
 
 
-def test_cli_metrics_if_resume_no_metrics(uvm_plain, microvm_factory):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_cli_metrics_if_resume_no_metrics(uvm, microvm_factory):
     """
     Check that metrics configuration is not part of the snapshot
     """
     # Given: a snapshot of a FC with metrics configured with the CLI option
-    uvm1 = uvm_plain
+    uvm1 = uvm
     metrics_path = Path(uvm1.path) / "metrics.ndjson"
     metrics_path.touch()
     uvm1.spawn(metrics_path=metrics_path)

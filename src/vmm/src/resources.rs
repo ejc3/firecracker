@@ -9,12 +9,14 @@ use serde::{Deserialize, Serialize};
 use vm_memory::GuestAddress;
 
 use crate::cpu_config::templates::CustomCpuTemplate;
-use crate::logger::info;
+use crate::devices::virtio::device::VirtioDevice;
+use crate::logger::{LoggerConfig, info};
 use crate::mmds;
 use crate::mmds::data_store::{Mmds, MmdsVersion};
 use crate::mmds::ns::MmdsNetworkStack;
 use crate::utils::mib_to_bytes;
 use crate::utils::net::ipv4addr::is_link_local_valid;
+use crate::vmm_config::TokenBucketConfig;
 use crate::vmm_config::balloon::*;
 use crate::vmm_config::boot_source::{
     BootConfig, BootSource, BootSourceConfig, BootSourceConfigError,
@@ -61,16 +63,17 @@ pub enum ResourcesError {
     /// Vsock device error: {0}
     VsockDevice(#[from] VsockConfigError),
     /// Entropy device error: {0}
-    EntropyDevice(#[from] EntropyDeviceError),
+    EntropyConfig(#[from] EntropyDeviceError),
     /// Pmem device error: {0}
-    PmemDevice(#[from] PmemConfigError),
+    PmemConfig(#[from] PmemConfigError),
     /// Memory hotplug config error: {0}
     MemoryHotplugConfig(#[from] MemoryHotplugConfigError),
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(untagged)]
-enum CustomCpuTemplateOrPath {
+#[allow(missing_docs)]
+pub enum CustomCpuTemplateOrPath {
     Path(PathBuf),
     Template(CustomCpuTemplate),
 }
@@ -78,24 +81,25 @@ enum CustomCpuTemplateOrPath {
 /// Used for configuring a vmm from one single json passed to the Firecracker process.
 #[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[allow(missing_docs)]
 pub struct VmmConfig {
-    balloon: Option<BalloonDeviceConfig>,
-    drives: Vec<BlockDeviceConfig>,
-    boot_source: BootSourceConfig,
-    cpu_config: Option<CustomCpuTemplateOrPath>,
-    logger: Option<crate::logger::LoggerConfig>,
-    machine_config: Option<MachineConfig>,
-    metrics: Option<MetricsConfig>,
-    mmds_config: Option<MmdsConfig>,
+    pub balloon: Option<BalloonDeviceConfig>,
+    pub drives: Vec<BlockDeviceConfig>,
+    pub boot_source: BootSourceConfig,
+    pub cpu_config: Option<CustomCpuTemplateOrPath>,
+    pub logger: Option<LoggerConfig>,
+    pub machine_config: Option<MachineConfig>,
+    pub metrics: Option<MetricsConfig>,
+    pub mmds_config: Option<MmdsConfig>,
     #[serde(default)]
-    network_interfaces: Vec<NetworkInterfaceConfig>,
-    vsock: Option<VsockDeviceConfig>,
-    entropy: Option<EntropyDeviceConfig>,
+    pub network_interfaces: Vec<NetworkInterfaceConfig>,
+    pub vsock: Option<VsockDeviceConfig>,
+    pub entropy: Option<EntropyDeviceConfig>,
     #[serde(default, rename = "pmem")]
-    pmem_devices: Vec<PmemConfig>,
+    pub pmem_devices: Vec<PmemConfig>,
     #[serde(skip)]
-    serial_config: Option<SerialConfig>,
-    memory_hotplug: Option<MemoryHotplugConfig>,
+    pub serial_config: Option<SerialConfig>,
+    pub memory_hotplug: Option<MemoryHotplugConfig>,
 }
 
 /// A data structure that encapsulates the device configurations
@@ -116,7 +120,7 @@ pub struct VmResources {
     pub net_builder: NetBuilder,
     /// The entropy device builder.
     pub entropy: EntropyDeviceBuilder,
-    /// The pmem devices.
+    /// The pmem device configs.
     pub pmem: PmemBuilder,
     /// The memory hotplug configuration.
     pub memory_hotplug: Option<MemoryHotplugConfig>,
@@ -132,9 +136,22 @@ pub struct VmResources {
     pub pci_enabled: bool,
     /// Where serial console output should be written to
     pub serial_out_path: Option<PathBuf>,
+    /// Optional rate limiter config for serial output.
+    pub serial_rate_limiter_cfg: Option<TokenBucketConfig>,
 }
 
 impl VmResources {
+    /// Returns a `TokenBucket` from the serial rate limiter config, if configured.
+    pub fn serial_rate_limiter(&self) -> Option<crate::rate_limiter::TokenBucket> {
+        self.serial_rate_limiter_cfg.as_ref().and_then(|cfg| {
+            crate::rate_limiter::TokenBucket::new(
+                cfg.size,
+                cfg.one_time_burst.unwrap_or(0),
+                cfg.refill_time,
+            )
+        })
+    }
+
     /// Configures Vmm resources as described by the `config_json` param.
     pub fn from_json(
         config_json: &str,
@@ -215,6 +232,7 @@ impl VmResources {
 
         if let Some(serial_cfg) = vmm_config.serial_config {
             resources.serial_out_path = serial_cfg.serial_out_path;
+            resources.serial_rate_limiter_cfg = serial_cfg.rate_limiter;
         }
 
         if let Some(memory_hotplug_config) = vmm_config.memory_hotplug {
@@ -293,7 +311,9 @@ impl VmResources {
 
             for net_dev in net_devs_with_mmds {
                 let net = net_dev.lock().unwrap();
-                inner_mmds_config.network_interfaces.push(net.id().clone());
+                inner_mmds_config
+                    .network_interfaces
+                    .push(net.id().to_string());
                 // Only need to get one ip address, as they will all be equal.
                 if inner_mmds_config.ipv4_address.is_none() {
                     // Safe to unwrap the mmds_ns as the filter() explicitly checks for
@@ -434,8 +454,7 @@ impl VmResources {
         if !network_interfaces.iter().all(|id| {
             self.net_builder
                 .iter()
-                .map(|device| device.lock().expect("Poisoned lock").id().clone())
-                .any(|x| &x == id)
+                .any(|device| device.lock().expect("Poisoned lock").id() == id)
         }) {
             return Err(MmdsConfigError::InvalidNetworkInterfaceId);
         }
@@ -448,7 +467,7 @@ impl VmResources {
         // network interface ID list.
         for net_device in self.net_builder.iter() {
             let mut net_device_lock = net_device.lock().expect("Poisoned lock");
-            if network_interfaces.contains(net_device_lock.id()) {
+            if network_interfaces.contains(&net_device_lock.id) {
                 net_device_lock.configure_mmds_network_stack(ipv4_addr, mmds.clone());
             } else {
                 net_device_lock.disable_mmds_network_stack();
@@ -530,7 +549,7 @@ impl From<&VmResources> for VmmConfig {
             network_interfaces: resources.net_builder.configs(),
             vsock: resources.vsock.config(),
             entropy: resources.entropy.config(),
-            pmem_devices: resources.pmem.configs(),
+            pmem_devices: resources.pmem.configs.clone(),
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots.
             serial_config: None,
             memory_hotplug: resources.memory_hotplug.clone(),
@@ -554,14 +573,14 @@ mod tests {
     use crate::cpu_config::templates::{CpuTemplateType, StaticCpuTemplate};
     use crate::devices::virtio::block::virtio::VirtioBlockError;
     use crate::devices::virtio::block::{BlockError, CacheType};
+    use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::vsock::VSOCK_DEV_ID;
     use crate::resources::VmResources;
     use crate::utils::net::mac::MacAddr;
     use crate::vmm_config::RateLimiterConfig;
-    use crate::vmm_config::boot_source::{
-        BootConfig, BootSource, BootSourceConfig, DEFAULT_KERNEL_CMDLINE,
-    };
+    use crate::vmm_config::boot_source::{BootConfig, BootSource, BootSourceConfig};
     use crate::vmm_config::drive::{BlockBuilder, BlockDeviceConfig};
+    use crate::vmm_config::machine_config::HugePageConfig::{Hugetlbfs2M, Transparent};
     use crate::vmm_config::machine_config::{HugePageConfig, MachineConfig, MachineConfigError};
     use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig};
     use crate::vmm_config::vsock::tests::default_config;
@@ -578,6 +597,7 @@ mod tests {
                 .unwrap()
                 .to_string(),
             guest_mac: Some(MacAddr::from_str("01:23:45:67:89:0a").unwrap()),
+            mtu: None,
             rx_rate_limiter: Some(RateLimiterConfig::default()),
             tx_rate_limiter: Some(RateLimiterConfig::default()),
         }
@@ -618,13 +638,11 @@ mod tests {
     }
 
     fn default_boot_cfg() -> BootSource {
-        let kernel_cmdline =
-            linux_loader::cmdline::Cmdline::try_from(DEFAULT_KERNEL_CMDLINE, 4096).unwrap();
         let tmp_file = TempFile::new().unwrap();
         BootSource {
             config: BootSourceConfig::default(),
             builder: Some(BootConfig {
-                cmdline: kernel_cmdline,
+                cmdline: None,
                 kernel_file: File::open(tmp_file.as_path()).unwrap(),
                 initrd_file: Some(File::open(tmp_file.as_path()).unwrap()),
             }),
@@ -646,6 +664,7 @@ mod tests {
             pmem: Default::default(),
             pci_enabled: false,
             serial_out_path: None,
+            serial_rate_limiter_cfg: None,
             memory_hotplug: Default::default(),
         }
     }
@@ -1458,6 +1477,26 @@ mod tests {
             Err(MachineConfigError::InvalidMemorySize)
         );
 
+        // Odd memory size - not supported by THP/Hugetlbfs
+        aux_vm_config.mem_size_mib = Some(1025);
+        aux_vm_config.huge_pages = Some(Transparent);
+        assert_eq!(
+            vm_resources.update_machine_config(&aux_vm_config),
+            Err(MachineConfigError::InvalidMemorySize)
+        );
+        aux_vm_config.huge_pages = Some(Hugetlbfs2M);
+        assert_eq!(
+            vm_resources.update_machine_config(&aux_vm_config),
+            Err(MachineConfigError::InvalidMemorySize)
+        );
+        // Odd size supported by HugePageConfig::None
+        aux_vm_config.huge_pages = Some(HugePageConfig::None);
+        vm_resources.update_machine_config(&aux_vm_config).unwrap();
+        assert_eq!(
+            MachineConfigUpdate::from(vm_resources.machine_config.clone()),
+            aux_vm_config
+        );
+
         // Incompatible mem_size_mib with balloon size.
         vm_resources.machine_config.mem_size_mib = 128;
         vm_resources
@@ -1562,12 +1601,12 @@ mod tests {
         let tmp_ino = tmp_file.as_file().metadata().unwrap().st_ino();
 
         assert_ne!(
-            boot_builder
-                .cmdline
+            boot_builder.cmdline.as_ref().map(|c| c
                 .as_cstring()
                 .unwrap()
-                .as_bytes_with_nul(),
-            [cmdline.as_bytes(), b"\0"].concat()
+                .as_bytes_with_nul()
+                .to_vec()),
+            Some([cmdline.as_bytes(), b"\0"].concat())
         );
         assert_ne!(
             boot_builder.kernel_file.metadata().unwrap().st_ino(),
@@ -1589,6 +1628,8 @@ mod tests {
         assert_eq!(
             boot_source_builder
                 .cmdline
+                .as_ref()
+                .unwrap()
                 .as_cstring()
                 .unwrap()
                 .as_bytes_with_nul(),
@@ -1660,8 +1701,8 @@ mod tests {
             path_on_host: tmp_file.as_path().to_str().unwrap().to_string(),
             ..Default::default()
         };
-        assert_eq!(vm_resources.pmem.devices.len(), 0);
+        assert_eq!(vm_resources.pmem.configs.len(), 0);
         vm_resources.build_pmem_device(cfg).unwrap();
-        assert_eq!(vm_resources.pmem.devices.len(), 1);
+        assert_eq!(vm_resources.pmem.configs.len(), 1);
     }
 }

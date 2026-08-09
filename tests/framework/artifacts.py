@@ -4,23 +4,19 @@
 """Define classes for interacting with CI artifacts"""
 
 import re
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
 import pytest
 
 from framework.defs import ARTIFACT_DIR
-from framework.utils import check_output, get_firecracker_version_from_toml
-from framework.with_filelock import with_filelock
-from host_tools.cargo_build import get_binary
 
 
 def select_supported_kernels():
     """Select guest kernels supported by the current combination of kernel and
     instance type.
     """
-    supported_kernels = [r"vmlinux-5.10.\d+", r"vmlinux-6.1.\d+"]
+    supported_kernels = [r"vmlinux-5.10.\d+", r"vmlinux-6.1.\d+", r"vmlinux-6.18.\d+"]
 
     # Booting with MPTable is deprecated but we still want to test
     # for it. Until we drop support for it we will be building a 5.10 guest
@@ -49,107 +45,65 @@ def disks(glob) -> list:
     return sorted(ARTIFACT_DIR.glob(glob))
 
 
-def kernel_params(
-    glob="vmlinux-*", select=kernels, artifact_dir=ARTIFACT_DIR
-) -> Iterator:
-    """Return supported kernels"""
-    for kernel in select(glob, artifact_dir):
-        yield pytest.param(kernel, id=kernel.name)
+def kernel_params(glob="vmlinux-*", select=kernels, artifact_dir=ARTIFACT_DIR) -> list:
+    """Return supported kernels or a single None if no kernels are found"""
+    return [
+        pytest.param(kernel, id=kernel.name) for kernel in select(glob, artifact_dir)
+    ] or [pytest.param(None, id="no-kernel-found")]
 
 
-@dataclass(frozen=True, repr=True)
-class FirecrackerArtifact:
-    """Utility class for Firecracker binary artifacts."""
-
-    path: Path
-
-    @property
-    def name(self):
-        """Get the Firecracker name."""
-        return self.path.name
-
-    @property
-    def jailer(self):
-        """Get the jailer with the same version."""
-        return self.path.with_name(f"jailer-v{self.version}")
-
-    @property
-    def version(self):
-        """Return Firecracker's version: `X.Y.Z-prerelase`."""
-        # Get the filename, split on the first '-' and trim the leading 'v'.
-        # sample: firecracker-v1.2.0-alpha
-        return self.path.name.split("-", 1)[1][1:]
-
-    @property
-    def version_tuple(self):
-        """Return the artifact's version as a tuple `(X, Y, Z)`."""
-        return tuple(int(x) for x in self.version.split("."))
-
-    @property
-    def snapshot_version_tuple(self):
-        """Return the artifact's snapshot version as a tuple: `X.Y.0`."""
-
-        # Starting from Firecracker v1.7.0, snapshots have their own version that is
-        # independent of Firecracker versions. For these Firecracker versions, use
-        # the --snapshot-version Firecracker flag, to figure out which snapshot version
-        # it supports.
-
-        return (
-            check_output([self.path, "--snapshot-version"])
-            .stdout.strip()
-            .split("\n")[0]
-            .split(".")
-        )
-
-    @property
-    def snapshot_version(self):
-        """Return the artifact's snapshot version: `X.Y.0`.
-
-        Due to how Firecracker maps release versions to snapshot versions, we
-        have to request the minor version instead of the actual version.
-        """
-        return ".".join(str(x) for x in self.snapshot_version_tuple)
+# Catalogues of guest kernel artifacts. Each entry is a `pytest.param` so test
+# ids carry the kernel filename (e.g. "vmlinux-6.1.123") rather than "kernel0".
+ALL_GUEST_KERNELS = list(kernel_params("vmlinux-*"))
+ACPI_GUEST_KERNELS = [p for p in kernel_params("vmlinux-*") if "no-acpi" not in p.id]
+GUEST_KERNELS_5_10 = list(kernel_params("vmlinux-5.10.*"))
+GUEST_KERNELS_6_1 = list(kernel_params("vmlinux-6.1.*"))
+GUEST_KERNELS_6_1_DEBUG = list(
+    kernel_params("vmlinux-6.1.*", artifact_dir=ARTIFACT_DIR / "debug")
+)
+GUEST_KERNELS_6_18 = list(kernel_params("vmlinux-6.18.*"))
+GUEST_KERNELS_6_18_DEBUG = list(
+    kernel_params("vmlinux-6.18.*", artifact_dir=ARTIFACT_DIR / "debug")
+)
+# The single canonical kernel used when a test pins to one specific kernel
+# (e.g. tests of Firecracker functionality that don't depend on guest kernel).
+# Update here when the default version changes. Stored as a `pytest.param`
+# so the test id carries the kernel filename (e.g. "vmlinux-6.1.168").
+GUEST_KERNEL_DEFAULT = GUEST_KERNELS_6_1[0] if GUEST_KERNELS_6_1 else None
+GUEST_KERNEL_DEFAULT_DEBUG = (
+    GUEST_KERNELS_6_1_DEBUG[0] if GUEST_KERNELS_6_1_DEBUG else None
+)
 
 
-@with_filelock
-def current_release(version):
-    """Massage this working copy Firecracker binary to look like a normal
-    release, so it can run the same tests.
+def pin_guest_kernel(kernels_or_path):
+    """Convenience marker for pinning the `guest_kernel` dim.
+
+    The default `guest_kernel` fixture parametrizes over ALL_GUEST_KERNELS;
+    use this helper to restrict to a single kernel or a smaller subset.
+
+    Usage at module level:
+        pytestmark = pin_guest_kernel(ACPI_GUEST_KERNELS)
+
+    Usage at test level:
+        @pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+        def test_foo(uvm): ...
+
+    Accepts a kernel catalogue (e.g. ACPI_GUEST_KERNELS), a single
+    `pytest.param`, or a single Path.
     """
-    binaries = []
-    for binary in ["firecracker", "jailer"]:
-        bin_path1 = get_binary(binary)
-        bin_path2 = bin_path1.with_name(f"{binary}-v{version}")
-        if not bin_path2.exists():
-            bin_path2.unlink(missing_ok=True)
-            bin_path2.hardlink_to(bin_path1)
-        binaries.append(bin_path2)
-    return binaries
+    # Wrap a single Path or pytest.param into a list. A bare ParameterSet
+    # passed to `parametrize` would be treated as a sequence of args and
+    # produce broken parameterizations.
+    if not isinstance(kernels_or_path, list):
+        kernels_or_path = [kernels_or_path]
+    return pytest.mark.parametrize("guest_kernel", kernels_or_path, indirect=True)
 
 
-def working_version_as_artifact():
-    """
-    Return working copy of Firecracker as a release artifact
-    """
-    cargo_version = get_firecracker_version_from_toml()
-    return FirecrackerArtifact(current_release(str(cargo_version))[0])
+def pin_rootfs_mode(mode):
+    """Convenience marker for pinning the `rootfs_mode` dim ("ro" | "rw")."""
+    return pytest.mark.parametrize("rootfs_mode", [mode], indirect=True)
 
 
-def firecracker_artifacts():
-    """Return all supported firecracker binaries."""
-    cargo_version = get_firecracker_version_from_toml()
-    # until the next minor version (but *not* including)
-    max_version = (cargo_version.major, cargo_version.minor + 1, 0)
-    prefix = "firecracker/firecracker-*"
-    for firecracker in sorted(ARTIFACT_DIR.glob(prefix)):
-        match = re.match(r"firecracker-v(\d+)\.(\d+)\.(\d+)", firecracker.name)
-        if not match:
-            continue
-        fc = FirecrackerArtifact(firecracker)
-        version = fc.version_tuple
-        if version >= max_version:
-            continue
-        yield pytest.param(fc, id=fc.name)
-
-    fc = working_version_as_artifact()
-    yield pytest.param(fc, id=fc.name)
+def pin_pci(enabled):
+    """Convenience marker for pinning the `pci_enabled` dim to a single value."""
+    return pytest.mark.parametrize("pci_enabled", [enabled], indirect=True)

@@ -3,6 +3,7 @@
 """Performance benchmark for pmem device"""
 
 import concurrent
+import json
 import os
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 
 import framework.utils_fio as fio
 import host_tools.drive as drive_tools
+from framework.artifacts import ACPI_GUEST_KERNELS, pin_guest_kernel
 from framework.utils import track_cpu_utilization
 
 PMEM_DEVICE_SIZE_MB = 2048
@@ -17,6 +19,8 @@ PMEM_DEVICE_SIZE_SINGLE_READ_MB = 512
 WARMUP_SEC = 10
 RUNTIME_SEC = 30
 GUEST_MEM_MIB = 1024
+
+pytestmark = pin_guest_kernel(ACPI_GUEST_KERNELS)
 
 
 def run_fio(
@@ -77,7 +81,7 @@ def emit_fio_metrics(logs_dir, metrics):
 @pytest.mark.parametrize("fio_block_size", [4096], ids=["bs4096"])
 @pytest.mark.parametrize("fio_engine", [fio.Engine.LIBAIO, fio.Engine.PSYNC])
 def test_pmem_performance(
-    uvm_plain_acpi,
+    uvm,
     vcpus,
     fio_mode,
     fio_block_size,
@@ -88,7 +92,7 @@ def test_pmem_performance(
     """
     Measure performance of pmem device
     """
-    vm = uvm_plain_acpi
+    vm = uvm
     vm.memory_monitor = None
     vm.spawn()
     vm.basic_config(vcpu_count=vcpus, mem_size_mib=GUEST_MEM_MIB)
@@ -159,7 +163,7 @@ def emit_fio_single_read_metrics(logs_dir, metrics):
 @pytest.mark.parametrize("fio_block_size", [4096], ids=["bs4096"])
 def test_pmem_first_read(
     microvm_factory,
-    guest_kernel_acpi,
+    guest_kernel,
     rootfs,
     fio_block_size,
     metrics,
@@ -173,9 +177,7 @@ def test_pmem_first_read(
     """
 
     for i in range(10):
-        vm = microvm_factory.build(
-            guest_kernel_acpi, rootfs, pci=True, monitor_memory=False
-        )
+        vm = microvm_factory.build(guest_kernel, rootfs, pci=True, monitor_memory=False)
         vm.spawn()
         vm.basic_config(mem_size_mib=GUEST_MEM_MIB)
         vm.add_net_iface()
@@ -197,5 +199,80 @@ def test_pmem_first_read(
             }
         )
         run_fio_single_read(vm, i, results_dir, fio_block_size)
+        vm.kill()
 
     emit_fio_single_read_metrics(results_dir, metrics)
+
+
+def check_flush_limit(ssh_connection, count, min_time, max_time):
+    """Verify that the pmem rate limiter throttles flush ops.
+
+    Runs fio with fsync=1 and loops=count so each loop writes one 4K
+    block and issues one fsync, triggering a virtio-pmem FLUSH request.
+    """
+    fio_cmd = (
+        f"fio --name=flush-test --rw=write --bs=4096 --size=4096"
+        f" --loops={count}"
+        f" --filename=/dev/pmem0 --ioengine=sync --direct=1 --fsync=1"
+        f" --zero_buffers --output-format=json"
+    )
+
+    _, stdout, _ = ssh_connection.check_output(fio_cmd)
+    data = json.loads(stdout)
+    runtime_ms = data["jobs"][0]["write"]["runtime"]
+
+    assert runtime_ms > min_time * 1000
+    assert runtime_ms < max_time * 1000
+
+
+def test_pmem_rate_limiter(uvm):
+    """Test that the pmem rate limiter throttles flush operations."""
+    vm = uvm
+    vm.memory_monitor = None
+    vm.spawn()
+    vm.basic_config(vcpu_count=2, mem_size_mib=512)
+    vm.add_net_iface()
+
+    pmem_size_mb = 2
+    flush_bytes = pmem_size_mb << 20
+    fs = drive_tools.FilesystemFile(os.path.join(vm.fsfiles, "scratch"), pmem_size_mb)
+    vm.api.pmem.put(
+        id="scratch",
+        path_on_host=vm.create_jailed_resource(fs.path),
+        read_only=False,
+        rate_limiter={
+            "ops": {"size": 100, "refill_time": 100},
+        },
+    )
+    vm.start()
+
+    # Time gaps are wider than 1s because there is an overhead in doing actual
+    # flush
+
+    # 1000 flush ops at 100 ops/100ms = 1000 ops/s -> ~1 second.
+    check_flush_limit(vm.ssh, 1000, 0.7, 2.0)
+
+    # Patch to double the rate.
+    vm.api.pmem.patch(
+        id="scratch",
+        rate_limiter={
+            "ops": {"size": 200, "refill_time": 100},
+        },
+    )
+
+    # 2000 flush ops at 200 ops/100ms = 2000 ops/s -> ~1 second.
+    check_flush_limit(vm.ssh, 2000, 0.7, 2.0)
+
+    # Switch to bandwidth limiting.
+    # Each flush consumes file_len bytes from the bandwidth bucket.
+    # Allow 1000 flushes/s: 100 flushes per 100ms * flush_bytes per flush.
+    vm.api.pmem.patch(
+        id="scratch",
+        rate_limiter={
+            "bandwidth": {"size": 100 * flush_bytes, "refill_time": 100},
+            "ops": {"size": 0, "refill_time": 0},
+        },
+    )
+
+    # 1000 flush ops at 1000 flushes/s -> ~1 second.
+    check_flush_limit(vm.ssh, 1000, 0.7, 2.0)

@@ -29,6 +29,7 @@ class CpuModel(str, Enum):
     ARM_NEOVERSE_N1 = "ARM_NEOVERSE_N1"
     ARM_NEOVERSE_V1 = "ARM_NEOVERSE_V1"
     ARM_NEOVERSE_V2 = "ARM_NEOVERSE_V2"
+    ARM_NEOVERSE_V3 = "ARM_NEOVERSE_V3"
     INTEL_CASCADELAKE = "INTEL_CASCADELAKE"
     INTEL_ICELAKE = "INTEL_ICELAKE"
     INTEL_SAPPHIRE_RAPIDS = "INTEL_SAPPHIRE_RAPIDS"
@@ -38,6 +39,7 @@ class CpuModel(str, Enum):
 CPU_DICT = {
     CpuVendor.INTEL: {
         "Intel(R) Xeon(R) Platinum 8259CL CPU": "INTEL_CASCADELAKE",
+        "Intel(R) Xeon(R) Platinum 8275CL CPU": "INTEL_CASCADELAKE",
         "Intel(R) Xeon(R) Platinum 8375C CPU": "INTEL_ICELAKE",
         "Intel(R) Xeon(R) Platinum 8488C": "INTEL_SAPPHIRE_RAPIDS",
         "Intel(R) Xeon(R) 6975P-C": "INTEL_GRANITE_RAPIDS",
@@ -47,6 +49,7 @@ CPU_DICT = {
         "0xd0c": "ARM_NEOVERSE_N1",
         "0xd40": "ARM_NEOVERSE_V1",
         "0xd4f": "ARM_NEOVERSE_V2",
+        "0xd84": "ARM_NEOVERSE_V3",
     },
 }
 

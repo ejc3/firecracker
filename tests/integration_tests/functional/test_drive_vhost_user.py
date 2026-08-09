@@ -88,7 +88,8 @@ def _check_drives(test_microvm, assert_dict, keys_array):
 def test_vhost_user_block(uvm_vhost_user_booted_ro):
     """
     This test simply tries to boot a VM with
-    vhost-user-block as a root device.
+    vhost-user-block as a root device and then
+    tries to snapshot it.
     """
 
     vm = uvm_vhost_user_booted_ro
@@ -104,6 +105,14 @@ def test_vhost_user_block(uvm_vhost_user_booted_ro):
     }
     _check_drives(vm, assert_dict, assert_dict.keys())
     vhost_user_block_metrics.validate(vm)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"Devices without snapshot support are present: vhost-user-block\(id: rootfs\)",
+    ):
+        vm.api.snapshot_create.put(
+            mem_file_path="memfile", snapshot_path="statefile", snapshot_type="Full"
+        )
 
 
 def test_vhost_user_block_read_write(uvm_vhost_user_booted_rw):
@@ -284,7 +293,7 @@ def test_partuuid_update(uvm_vhost_user_plain_any, rootfs):
     vhost_user_block_metrics.validate(vm)
 
 
-def test_config_change(uvm_plain_any):
+def test_config_change(uvm):
     """
     Verify handling of block device resize.
     We expect that the guest will start reporting the updated size
@@ -295,7 +304,7 @@ def test_config_change(uvm_plain_any):
     new_sizes = [20, 10, 30]  # MB
     mkfs_mount_cmd = "mkfs.ext4 /dev/vdb && mkdir -p /tmp/tmp && mount /dev/vdb /tmp/tmp && umount /tmp/tmp"
 
-    vm = uvm_plain_any
+    vm = uvm
     vm.spawn(log_level="Info")
     vm.basic_config()
     vm.add_net_iface()

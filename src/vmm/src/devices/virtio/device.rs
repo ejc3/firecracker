@@ -9,13 +9,17 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
+use serde::{Deserialize, Serialize};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::ActivateError;
 use super::queue::{Queue, QueueError};
 use super::transport::VirtioInterrupt;
+use crate::MutEventSubscriber;
 use crate::devices::virtio::AsAny;
-use crate::logger::warn;
+use crate::devices::virtio::generated::virtio_ids;
+use crate::logger::{error, info, warn};
+use crate::utils::u64_to_usize;
 use crate::vstate::memory::GuestMemoryMmap;
 
 /// State of an active VirtIO device
@@ -51,13 +55,32 @@ impl DeviceState {
     }
 }
 
+/// Type of a virtio device
+/// Represent it as u8 to give it a known size.
+/// All used types fit in u8.
+#[allow(clippy::cast_possible_truncation)]
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VirtioDeviceType {
+    Net = virtio_ids::VIRTIO_ID_NET as u8,
+    Block = virtio_ids::VIRTIO_ID_BLOCK as u8,
+    Rng = virtio_ids::VIRTIO_ID_RNG as u8,
+    Balloon = virtio_ids::VIRTIO_ID_BALLOON as u8,
+    Vsock = virtio_ids::VIRTIO_ID_VSOCK as u8,
+    Mem = virtio_ids::VIRTIO_ID_MEM as u8,
+    Pmem = virtio_ids::VIRTIO_ID_PMEM as u8,
+}
+
+/// Unique identifier for a virtio device: its type and string ID.
+pub type VirtioDeviceId = (VirtioDeviceType, String);
+
 /// Trait for virtio devices to be driven by a virtio transport.
 ///
 /// The lifecycle of a virtio device is to be moved to a virtio transport, which will then query the
 /// device. The virtio devices needs to create queues, events and event fds for interrupts and
 /// expose them to the transport via get_queues/get_queue_events/get_interrupt/get_interrupt_status
 /// fns.
-pub trait VirtioDevice: AsAny + Send {
+pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
     /// Get the available features offered by device.
     fn avail_features(&self) -> u64;
 
@@ -75,14 +98,17 @@ pub trait VirtioDevice: AsAny + Send {
     }
 
     /// The virtio device type (as a constant of the struct).
-    fn const_device_type() -> u32
+    fn const_device_type() -> VirtioDeviceType
     where
         Self: Sized;
 
     /// The virtio device type.
     ///
     /// It should be the same as returned by Self::const_device_type().
-    fn device_type(&self) -> u32;
+    fn device_type(&self) -> VirtioDeviceType;
+
+    /// Returns unique device id
+    fn id(&self) -> &str;
 
     /// Returns the device queues.
     fn queues(&self) -> &[Queue];
@@ -137,8 +163,23 @@ pub trait VirtioDevice: AsAny + Send {
         self.set_acked_features(self.acked_features() | v);
     }
 
+    /// Returns the full device-specific configuration as a byte slice.
+    ///
+    /// Each device returns its live config struct bytes here.
+    fn config_as_bytes(&self) -> &[u8];
+
     /// Reads this device configuration space at `offset`.
-    fn read_config(&self, offset: u64, data: &mut [u8]);
+    fn read_config(&self, offset: u64, data: &mut [u8]) {
+        let config = self.config_as_bytes();
+        let offset = u64_to_usize(offset);
+        if let Some(config_from_offset) = config.get(offset..) {
+            let len = config_from_offset.len().min(data.len());
+            data[..len].copy_from_slice(&config_from_offset[..len]);
+            data[len..].fill(0);
+        } else {
+            data.fill(0);
+        }
+    }
 
     /// Writes to this device configuration space at `offset`.
     fn write_config(&mut self, offset: u64, data: &[u8]);
@@ -153,11 +194,26 @@ pub trait VirtioDevice: AsAny + Send {
     /// Checks if the resources of this device are activated.
     fn is_activated(&self) -> bool;
 
-    /// Optionally deactivates this device and returns ownership of the guest memory map, interrupt
-    /// event, and queue events.
-    fn reset(&mut self) -> Option<(Arc<dyn VirtioInterrupt>, Vec<EventFd>)> {
-        None
+    /// Set the device state to Inactive
+    fn deactivate(&mut self);
+
+    /// Reset the device. Returns true on success, false otherwise.
+    /// It must not be overridden.
+    fn reset(&mut self) -> bool {
+        if !self._reset() {
+            return false;
+        }
+        self.deactivate();
+        self.set_acked_features(0);
+        for queue in self.queues_mut() {
+            *queue = Queue::new(queue.max_size);
+        }
+        true
     }
+
+    /// Backend-specific reset logic. Returns true on success, false if the
+    /// backend does not support reset.
+    fn _reset(&mut self) -> bool;
 
     /// Mark pages used by queues as dirty.
     fn mark_queue_memory_dirty(&mut self, mem: &GuestMemoryMmap) -> Result<(), QueueError> {
@@ -167,13 +223,45 @@ pub trait VirtioDevice: AsAny + Send {
         Ok(())
     }
 
+    /// Notify all queues by writing to the eventfds.
+    fn notify_queue_events(&mut self) {
+        info!("[{:?}:{}] notifying queues", self.device_type(), self.id());
+        for (i, eventfd) in self.queue_events().iter().enumerate() {
+            if let Err(err) = eventfd.write(1) {
+                error!(
+                    "[{:?}:{}] error notifying queue {}: {}",
+                    self.device_type(),
+                    self.id(),
+                    i,
+                    err
+                );
+            }
+        }
+    }
+
+    /// Drain all queue notification eventfds, discarding any pending
+    /// notifications. This is used if a notification arrives while a device
+    /// is being reset and before it's activated again.
+    fn drain_queue_events(&self) {
+        for event in self.queue_events() {
+            event.read();
+        }
+    }
+
     /// Kick the device, as if it had received external events.
-    fn kick(&mut self) {}
+    fn kick(&mut self) {
+        if self.is_activated() {
+            self.notify_queue_events();
+        }
+    }
+
+    /// Prepare the device for saving its state
+    fn prepare_save(&mut self) {}
 }
 
 impl fmt::Debug for dyn VirtioDevice {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "VirtioDevice type {}", self.device_type())
+        write!(f, "VirtioDevice type {:?}", self.device_type())
     }
 }
 
@@ -181,11 +269,11 @@ impl fmt::Debug for dyn VirtioDevice {
 #[macro_export]
 macro_rules! impl_device_type {
     ($const_type:expr) => {
-        fn const_device_type() -> u32 {
+        fn const_device_type() -> VirtioDeviceType {
             $const_type
         }
 
-        fn device_type(&self) -> u32 {
+        fn device_type(&self) -> VirtioDeviceType {
             Self::const_device_type()
         }
     };
@@ -193,16 +281,28 @@ macro_rules! impl_device_type {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use event_manager::{EventOps, Events, MutEventSubscriber};
+
     use super::*;
 
     #[derive(Debug)]
     struct MockVirtioDevice {
         avail_features: u64,
         acked_features: u64,
+        config: Vec<u8>,
+    }
+
+    impl MutEventSubscriber for MockVirtioDevice {
+        fn process(&mut self, _: Events, _: &mut EventOps) {}
+        fn init(&mut self, _: &mut EventOps) {}
     }
 
     impl VirtioDevice for MockVirtioDevice {
-        impl_device_type!(0);
+        impl_device_type!(VirtioDeviceType::Net);
+
+        fn id(&self) -> &str {
+            "mock"
+        }
 
         fn avail_features(&self) -> u64 {
             self.avail_features
@@ -232,8 +332,8 @@ pub(crate) mod tests {
             todo!()
         }
 
-        fn read_config(&self, _offset: u64, _data: &mut [u8]) {
-            todo!()
+        fn config_as_bytes(&self) -> &[u8] {
+            &self.config
         }
 
         fn write_config(&mut self, _offset: u64, _data: &[u8]) {
@@ -251,6 +351,14 @@ pub(crate) mod tests {
         fn is_activated(&self) -> bool {
             todo!()
         }
+
+        fn deactivate(&mut self) {
+            todo!()
+        }
+
+        fn _reset(&mut self) -> bool {
+            todo!()
+        }
     }
 
     #[test]
@@ -258,6 +366,7 @@ pub(crate) mod tests {
         let mut device = MockVirtioDevice {
             avail_features: 0,
             acked_features: 0,
+            config: vec![],
         };
 
         let mock_feature_1 = 1u64;
@@ -279,6 +388,7 @@ pub(crate) mod tests {
         let mut device = MockVirtioDevice {
             avail_features: features,
             acked_features: 0,
+            config: vec![],
         };
 
         assert_eq!(
@@ -295,5 +405,49 @@ pub(crate) mod tests {
         }
 
         assert_eq!(device.acked_features, features);
+    }
+
+    #[test]
+    fn test_read_config_default() {
+        let device = MockVirtioDevice {
+            avail_features: 0,
+            acked_features: 0,
+            config: vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22],
+        };
+
+        // Exact read within bounds.
+        let mut buf = [0xFF; 8];
+        device.read_config(0, &mut buf);
+        assert_eq!(buf, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22]);
+
+        // Partial read at valid offset (offset+len exceeds config size).
+        let mut buf = [0xFF; 8];
+        device.read_config(4, &mut buf);
+        assert_eq!(buf, [0xEE, 0xFF, 0x11, 0x22, 0, 0, 0, 0]);
+
+        // Fully out-of-bounds (offset == config size).
+        let mut buf = [0xFF; 4];
+        device.read_config(8, &mut buf);
+        assert_eq!(buf, [0, 0, 0, 0]);
+
+        // Fully out-of-bounds (offset > config size).
+        let mut buf = [0xFF; 4];
+        device.read_config(100, &mut buf);
+        assert_eq!(buf, [0, 0, 0, 0]);
+
+        // Sub-range read within bounds.
+        let mut buf = [0xFF; 2];
+        device.read_config(2, &mut buf);
+        assert_eq!(buf, [0xCC, 0xDD]);
+
+        // Empty config: any read returns zeros.
+        let empty_device = MockVirtioDevice {
+            avail_features: 0,
+            acked_features: 0,
+            config: vec![],
+        };
+        let mut buf = [0xFF; 4];
+        empty_device.read_config(0, &mut buf);
+        assert_eq!(buf, [0, 0, 0, 0]);
     }
 }

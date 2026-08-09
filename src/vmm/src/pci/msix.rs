@@ -7,20 +7,21 @@
 use std::sync::Arc;
 
 use byteorder::{ByteOrder, LittleEndian};
-use pci::PciCapabilityId;
 use serde::{Deserialize, Serialize};
 use vm_memory::ByteValued;
+use zerocopy::FromBytes;
 
-use crate::Vm;
 use crate::logger::{debug, error, warn};
 use crate::pci::configuration::PciCapability;
+use crate::pci::{PciCapabilityId, PciSBDF};
 use crate::snapshot::Persist;
 use crate::vstate::interrupts::{InterruptError, MsixVectorConfig, MsixVectorGroup};
+use crate::vstate::vm::KvmVm;
 
 const MAX_MSIX_VECTORS_PER_DEVICE: u16 = 2048;
 const MSIX_TABLE_ENTRIES_MODULO: u64 = 16;
 const MSIX_PBA_ENTRIES_MODULO: u64 = 8;
-const BITS_PER_PBA_ENTRY: usize = 64;
+const BITS_PER_PBA_ENTRY: u16 = 64;
 const FUNCTION_MASK_BIT: u8 = 14;
 const MSIX_ENABLE_BIT: u8 = 15;
 
@@ -71,8 +72,8 @@ pub struct MsixConfig {
     pub table_entries: Vec<MsixTableEntry>,
     /// Pending bit array
     pub pba_entries: Vec<u64>,
-    /// Id of the device using this set of vectors
-    pub devid: u32,
+    /// SBDF of the device using this set of vectors
+    pub sbdf: PciSBDF,
     /// Interrupts vectors used
     pub vectors: Arc<MsixVectorGroup>,
     /// Whether vectors are masked
@@ -86,7 +87,7 @@ impl std::fmt::Debug for MsixConfig {
         f.debug_struct("MsixConfig")
             .field("table_entries", &self.table_entries)
             .field("pba_entries", &self.pba_entries)
-            .field("devid", &self.devid)
+            .field("sbdf", &self.sbdf)
             .field("masked", &self.masked)
             .field("enabled", &self.enabled)
             .finish()
@@ -95,19 +96,19 @@ impl std::fmt::Debug for MsixConfig {
 
 impl MsixConfig {
     /// Create a new MSI-X configuration
-    pub fn new(vectors: Arc<MsixVectorGroup>, devid: u32) -> Self {
+    pub fn new(vectors: Arc<MsixVectorGroup>, sbdf: PciSBDF) -> Self {
         assert!(vectors.num_vectors() <= MAX_MSIX_VECTORS_PER_DEVICE);
 
         let mut table_entries: Vec<MsixTableEntry> = Vec::new();
         table_entries.resize_with(vectors.num_vectors() as usize, Default::default);
         let mut pba_entries: Vec<u64> = Vec::new();
-        let num_pba_entries: usize = (vectors.num_vectors() as usize).div_ceil(BITS_PER_PBA_ENTRY);
+        let num_pba_entries: usize = (vectors.num_vectors()).div_ceil(BITS_PER_PBA_ENTRY) as usize;
         pba_entries.resize_with(num_pba_entries, Default::default);
 
         MsixConfig {
             table_entries,
             pba_entries,
-            devid,
+            sbdf,
             vectors,
             masked: true,
             enabled: false,
@@ -117,8 +118,8 @@ impl MsixConfig {
     /// Create an MSI-X configuration from snapshot state
     pub fn from_state(
         state: MsixConfigState,
-        vm: Arc<Vm>,
-        devid: u32,
+        vm: Arc<KvmVm>,
+        sbdf: PciSBDF,
     ) -> Result<Self, InterruptError> {
         let vectors = Arc::new(MsixVectorGroup::restore(vm, &state.vectors)?);
         if state.enabled && !state.masked {
@@ -131,7 +132,7 @@ impl MsixConfig {
                     high_addr: table_entry.msg_addr_hi,
                     low_addr: table_entry.msg_addr_lo,
                     data: table_entry.msg_data,
-                    devid,
+                    devid: sbdf,
                 };
 
                 vectors.update(idx, config, state.masked, true)?;
@@ -142,7 +143,7 @@ impl MsixConfig {
         Ok(MsixConfig {
             table_entries: state.table_entries,
             pba_entries: state.pba_entries,
-            devid,
+            sbdf,
             vectors,
             masked: state.masked,
             enabled: state.enabled,
@@ -171,13 +172,13 @@ impl MsixConfig {
         // Update interrupt routing
         if old_masked != self.masked || old_enabled != self.enabled {
             if self.enabled && !self.masked {
-                debug!("MSI-X enabled for device 0x{:x}", self.devid);
+                debug!("MSI-X enabled for device {}", self.sbdf);
                 for (idx, table_entry) in self.table_entries.iter().enumerate() {
                     let config = MsixVectorConfig {
                         high_addr: table_entry.msg_addr_hi,
                         low_addr: table_entry.msg_addr_lo,
                         data: table_entry.msg_data,
-                        devid: self.devid,
+                        devid: self.sbdf,
                     };
 
                     if let Err(e) = self.vectors.update(idx, config, table_entry.masked(), true) {
@@ -185,7 +186,7 @@ impl MsixConfig {
                     }
                 }
             } else if old_enabled || !old_masked {
-                debug!("MSI-X disabled for device 0x{:x}", self.devid);
+                debug!("MSI-X disabled for device {}", self.sbdf);
                 if let Err(e) = self.vectors.disable() {
                     error!("Failed disabling irq_fd: {:?}", e);
                 }
@@ -198,10 +199,26 @@ impl MsixConfig {
         // masked.
         if old_masked && !self.masked {
             for (index, entry) in self.table_entries.clone().iter().enumerate() {
-                if !entry.masked() && self.get_pba_bit(index.try_into().unwrap()) == 1 {
+                // Table indices are bounded by MAX_MSIX_VECTORS_PER_DEVICE (2048), fitting in u16.
+                #[allow(clippy::cast_possible_truncation)]
+                let index = index as u16;
+
+                if !entry.masked() && self.get_pba_bit(index) == 1 {
                     self.inject_msix_and_clear_pba(index);
                 }
             }
+        }
+    }
+
+    /// Write to the Message Control register
+    pub fn write_msg_ctl_register(&mut self, offset: u8, data: &[u8]) {
+        if offset == 2 && data.len() == 2 {
+            // 2-bytes write in the Message Control field
+            self.set_msg_ctl(u16::read_from_bytes(data).unwrap());
+        } else if offset == 0 && data.len() == 4 {
+            // 4 bytes write at the beginning. Ignore the first 2 bytes which are the
+            // capability id and next capability pointer
+            self.set_msg_ctl((u32::read_from_bytes(data).unwrap() >> 16) as u16);
         }
     }
 
@@ -319,7 +336,7 @@ impl MsixConfig {
                 high_addr: table_entry.msg_addr_hi,
                 low_addr: table_entry.msg_addr_lo,
                 data: table_entry.msg_data,
-                devid: self.devid,
+                devid: self.sbdf,
             };
 
             if let Err(e) = self
@@ -338,12 +355,16 @@ impl MsixConfig {
         // All of this is valid only if MSI-X has not been masked for the whole
         // device.
 
+        // Table indices are bounded by MAX_MSIX_VECTORS_PER_DEVICE (2048), fitting in u16.
+        #[allow(clippy::cast_possible_truncation)]
+        let index = index as u16;
+
         // Check if bit has been flipped
         if !self.masked
             && self.enabled
             && old_entry.masked()
             && !table_entry.masked()
-            && self.get_pba_bit(index.try_into().unwrap()) == 1
+            && self.get_pba_bit(index) == 1
         {
             self.inject_msix_and_clear_pba(index);
         }
@@ -404,15 +425,15 @@ impl MsixConfig {
             return;
         }
 
-        let index: usize = (vector as usize) / BITS_PER_PBA_ENTRY;
-        let shift: usize = (vector as usize) % BITS_PER_PBA_ENTRY;
+        let index = vector / BITS_PER_PBA_ENTRY;
+        let shift = vector % BITS_PER_PBA_ENTRY;
         let mut mask: u64 = 1u64 << shift;
 
         if reset {
             mask = !mask;
-            self.pba_entries[index] &= mask;
+            self.pba_entries[index as usize] &= mask;
         } else {
-            self.pba_entries[index] |= mask;
+            self.pba_entries[index as usize] |= mask;
         }
     }
 
@@ -424,28 +445,28 @@ impl MsixConfig {
             return 0xff;
         }
 
-        let index: usize = (vector as usize) / BITS_PER_PBA_ENTRY;
-        let shift: usize = (vector as usize) % BITS_PER_PBA_ENTRY;
+        let index = vector / BITS_PER_PBA_ENTRY;
+        let shift = vector % BITS_PER_PBA_ENTRY;
 
-        ((self.pba_entries[index] >> shift) & 0x0000_0001u64) as u8
+        ((self.pba_entries[index as usize] >> shift) & 0x0000_0001u64) as u8
     }
 
     /// Inject an MSI-X interrupt and clear the PBA bit for a vector
-    fn inject_msix_and_clear_pba(&mut self, vector: usize) {
+    fn inject_msix_and_clear_pba(&mut self, vector: u16) {
         // Inject the MSI message
-        match self.vectors.trigger(vector) {
+        match self.vectors.trigger(vector as usize) {
             Ok(_) => debug!("MSI-X injected on vector control flip"),
             Err(e) => error!("failed to inject MSI-X: {}", e),
         }
 
         // Clear the bit from PBA
-        self.set_pba_bit(vector.try_into().unwrap(), true);
+        self.set_pba_bit(vector, true);
     }
 }
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-/// MSI-X PCI capability
+/// PCIe spec revision 6.0: 7.7.2 MSI-X Capability and Table Structure
 pub struct MsixCap {
     /// Message Control Register
     ///   10-0:  MSI-X Table size
@@ -496,30 +517,81 @@ impl MsixCap {
             pba: (pba_off & 0xffff_fff8u32) | u32::from(pba_pci_bar & 0x7u8),
         }
     }
+
+    /// Is MASKED bit set
+    pub fn masked(&self) -> bool {
+        (self.msg_ctl >> FUNCTION_MASK_BIT) & 0x1 == 0x1
+    }
+
+    /// Is ENABLED bit set
+    pub fn enabled(&self) -> bool {
+        (self.msg_ctl >> MSIX_ENABLE_BIT) & 0x1 == 0x1
+    }
+
+    /// Table offset
+    pub fn table_offset(&self) -> u32 {
+        self.table & 0xffff_fff8
+    }
+
+    /// Pba offset
+    pub fn pba_offset(&self) -> u32 {
+        self.pba & 0xffff_fff8
+    }
+
+    /// Table BAR idx
+    pub fn table_bir(&self) -> u8 {
+        (self.table & 0x7) as u8
+    }
+
+    /// PBA BAR idx
+    pub fn pba_bir(&self) -> u8 {
+        (self.pba & 0x7) as u8
+    }
+
+    /// Table size
+    pub fn table_size(&self) -> u16 {
+        (self.msg_ctl & 0x7ff) + 1
+    }
+
+    /// Table BAR offset and size in bytes
+    pub fn table_bar_offset_and_size(&self) -> (u64, u64) {
+        // The table takes 16 bytes per entry.
+        let size = self.table_size() as u64 * MSIX_TABLE_ENTRIES_MODULO;
+        (self.table_offset() as u64, size)
+    }
+
+    /// PBA BAR offset and size in bytes
+    pub fn pba_bar_offset_and_size(&self) -> (u64, u64) {
+        // The pba takes 1 bit per entry and is stored in chunks of 8 bytes.
+        let chunks = self.table_size().div_ceil(BITS_PER_PBA_ENTRY);
+        let size = u64::from(chunks) * MSIX_PBA_ENTRIES_MODULO;
+        (self.pba_offset() as u64, size)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::builder::tests::default_vmm;
+    use crate::check_metric_after_block;
     use crate::logger::{IncMetric, METRICS};
-    use crate::{Vm, check_metric_after_block};
+    use crate::vstate::vm::KvmVm;
 
     fn msix_vector_group(nr_vectors: u16) -> Arc<MsixVectorGroup> {
         let vmm = default_vmm();
-        Arc::new(Vm::create_msix_group(vmm.vm.clone(), nr_vectors).unwrap())
+        Arc::new(KvmVm::create_msix_group(vmm.vm.as_kvm().unwrap().clone(), nr_vectors).unwrap())
     }
 
     #[test]
     #[should_panic]
     fn test_too_many_vectors() {
-        MsixConfig::new(msix_vector_group(2049), 0x42);
+        MsixConfig::new(msix_vector_group(2049), PciSBDF::from(0x42));
     }
 
     #[test]
     fn test_new_msix_config() {
-        let config = MsixConfig::new(msix_vector_group(2), 0x42);
-        assert_eq!(config.devid, 0x42);
+        let config = MsixConfig::new(msix_vector_group(2), PciSBDF::from(0x42));
+        assert_eq!(config.sbdf, PciSBDF::from(0x42));
         assert!(config.masked);
         assert!(!config.enabled);
         assert_eq!(config.table_entries.len(), 2);
@@ -528,7 +600,7 @@ mod tests {
 
     #[test]
     fn test_enable_msix_vectors() {
-        let mut config = MsixConfig::new(msix_vector_group(2), 0x42);
+        let mut config = MsixConfig::new(msix_vector_group(2), PciSBDF::from(0x42));
 
         assert!(!config.enabled);
         assert!(config.masked);
@@ -555,7 +627,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_table_access_read_too_big() {
-        let config = MsixConfig::new(msix_vector_group(2), 0x42);
+        let config = MsixConfig::new(msix_vector_group(2), PciSBDF::from(0x42));
         let mut buffer = [0u8; 16];
 
         config.read_table(0, &mut buffer);
@@ -563,7 +635,7 @@ mod tests {
 
     #[test]
     fn test_read_table_past_end() {
-        let config = MsixConfig::new(msix_vector_group(2), 0x42);
+        let config = MsixConfig::new(msix_vector_group(2), PciSBDF::from(0x42));
         let mut buffer = [0u8; 8];
 
         // We have 2 vectors (16 bytes each), so we should be able to read up to 32 bytes.
@@ -574,7 +646,7 @@ mod tests {
 
     #[test]
     fn test_read_table_bad_length() {
-        let config = MsixConfig::new(msix_vector_group(2), 0x42);
+        let config = MsixConfig::new(msix_vector_group(2), PciSBDF::from(0x42));
         let mut buffer = [0u8; 8];
 
         // We can either read 4 or 8 bytes
@@ -600,7 +672,7 @@ mod tests {
 
     #[test]
     fn test_access_table() {
-        let mut config = MsixConfig::new(msix_vector_group(2), 0x42);
+        let mut config = MsixConfig::new(msix_vector_group(2), PciSBDF::from(0x42));
         // enabled and not masked
         check_metric_after_block!(
             METRICS.interrupts.config_updates,
@@ -717,7 +789,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_table_access_write_too_big() {
-        let mut config = MsixConfig::new(msix_vector_group(2), 0x42);
+        let mut config = MsixConfig::new(msix_vector_group(2), PciSBDF::from(0x42));
         let buffer = [0u8; 16];
 
         config.write_table(0, &buffer);
@@ -725,7 +797,7 @@ mod tests {
 
     #[test]
     fn test_pba_read_too_big() {
-        let config = MsixConfig::new(msix_vector_group(2), 0x42);
+        let config = MsixConfig::new(msix_vector_group(2), PciSBDF::from(0x42));
         let mut buffer = [0u8; 16];
 
         config.read_pba(0, &mut buffer);
@@ -734,7 +806,7 @@ mod tests {
 
     #[test]
     fn test_pba_invalid_offset() {
-        let config = MsixConfig::new(msix_vector_group(2), 0x42);
+        let config = MsixConfig::new(msix_vector_group(2), PciSBDF::from(0x42));
         let mut buffer = [0u8; 8];
 
         // Past the end of the PBA array
@@ -752,7 +824,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_set_pba_bit_vector_too_big() {
-        let mut config = MsixConfig::new(msix_vector_group(2), 0x42);
+        let mut config = MsixConfig::new(msix_vector_group(2), PciSBDF::from(0x42));
 
         config.set_pba_bit(2048, false);
     }
@@ -760,14 +832,14 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_get_pba_bit_vector_too_big() {
-        let config = MsixConfig::new(msix_vector_group(2), 0x42);
+        let config = MsixConfig::new(msix_vector_group(2), PciSBDF::from(0x42));
 
         config.get_pba_bit(2048);
     }
 
     #[test]
     fn test_pba_bit_invalid_vector() {
-        let mut config = MsixConfig::new(msix_vector_group(2), 0x42);
+        let mut config = MsixConfig::new(msix_vector_group(2), PciSBDF::from(0x42));
 
         // We have two vectors, so setting the pending bit for the third one
         // should be ignored
@@ -780,7 +852,7 @@ mod tests {
 
     #[test]
     fn test_pba_read() {
-        let mut config = MsixConfig::new(msix_vector_group(128), 0x42);
+        let mut config = MsixConfig::new(msix_vector_group(128), PciSBDF::from(0x42));
         let mut buffer = [0u8; 8];
 
         config.set_pba_bit(1, false);
@@ -801,7 +873,7 @@ mod tests {
 
     #[test]
     fn test_pending_interrupt() {
-        let mut config = MsixConfig::new(msix_vector_group(2), 0x42);
+        let mut config = MsixConfig::new(msix_vector_group(2), PciSBDF::from(0x42));
         config.set_pba_bit(1, false);
         assert_eq!(config.get_pba_bit(1), 1);
         // Enable MSI-X vector and unmask interrupts

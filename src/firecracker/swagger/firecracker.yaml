@@ -5,7 +5,7 @@ info:
     The API is accessible through HTTP calls on specific URLs
     carrying JSON modeled data.
     The transport medium is a Unix Domain Socket.
-  version: 1.15.0-dev
+  version: 1.17.0-dev
   termsOfService: ""
   contact:
     email: "firecracker-maintainers@amazon.com"
@@ -181,7 +181,7 @@ paths:
           schema:
             $ref: "#/definitions/BalloonStartCmd"
       responses:
-        200:
+        204:
           description: Free page hinting run started.
         400:
           description: The balloon free hinting was not enabled when the device was configured.
@@ -215,7 +215,7 @@ paths:
       summary: Stops a free page hinting run only if enabled pre-boot.
       operationId: stopBalloonHinting
       responses:
-        200:
+        204:
           description: Free page hinting run stopped.
         400:
           description: The balloon free hinting was not enabled when the device was configured.
@@ -364,6 +364,35 @@ paths:
           description: Pmem device is created/updated
         400:
           description: Pmem device cannot be created/updated due to bad input
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error.
+          schema:
+            $ref: "#/definitions/Error"
+    patch:
+      summary: Updates the rate limiter of a pmem device. Post-boot only.
+      description:
+        Updates the rate limiter applied to the pmem device with the ID specified
+        by the id path parameter.
+      operationId: patchGuestPmemByID
+      parameters:
+        - name: id
+          in: path
+          description: The id of the guest pmem device
+          required: true
+          type: string
+        - name: body
+          in: body
+          description: Pmem rate limiter properties
+          required: true
+          schema:
+            $ref: "#/definitions/PartialPmem"
+      responses:
+        204:
+          description: Pmem device updated
+        400:
+          description: Pmem device cannot be updated due to bad input
           schema:
             $ref: "#/definitions/Error"
         default:
@@ -1255,6 +1284,8 @@ definitions:
         type: boolean
         description:
           Flag to map backing file in read-only mode.
+      rate_limiter:
+        $ref: "#/definitions/RateLimiter"
 
   Error:
     type: object
@@ -1411,8 +1442,13 @@ definitions:
         type: string
         enum:
           - None
+          - Transparent
           - 2M
-        description: Which huge pages configuration (if any) should be used to back guest memory.
+        default: None
+        description: >-
+          Which huge pages configuration should be used to back guest memory.
+          "None" uses regular 4K pages. "Transparent" enables THP via
+          madvise(MADV_HUGEPAGE). "2M" uses explicit hugetlbfs 2MB pages.
 
   MemoryBackend:
     type: object
@@ -1443,6 +1479,19 @@ definitions:
       metrics_path:
         type: string
         description: Path to the named pipe or file where the JSON-formatted metrics are flushed.
+      emit_id:
+        type: boolean
+        description:
+          Whether to emit the microVM instance id (the value passed to the
+          jailer "--id") as a top-level "id" field on each metrics line.
+        default: false
+      properties:
+        type: object
+        description:
+          Operator-defined key-value pairs emitted under a top-level
+          "properties" field on each metrics line.
+        additionalProperties:
+          type: string
 
   MmdsConfig:
     type: object
@@ -1503,6 +1552,14 @@ definitions:
         description: Host level path for the guest network interface
       iface_id:
         type: string
+      mtu:
+        type: integer
+        description:
+          MTU to advertise to the guest via VIRTIO_NET_F_MTU. When set, a compatible
+          guest driver will configure the interface with this MTU. When absent,
+          VIRTIO_NET_F_MTU is not advertised and the guest uses its default MTU.
+        minimum: 68
+        maximum: 65535
       rx_rate_limiter:
         $ref: "#/definitions/RateLimiter"
       tx_rate_limiter:
@@ -1536,6 +1593,19 @@ definitions:
       rx_rate_limiter:
         $ref: "#/definitions/RateLimiter"
       tx_rate_limiter:
+        $ref: "#/definitions/RateLimiter"
+
+  PartialPmem:
+    type: object
+    description:
+      Defines a partial pmem device structure, used to update the rate limiter
+      for that device, after microvm start.
+    required:
+      - id
+    properties:
+      id:
+        type: string
+      rate_limiter:
         $ref: "#/definitions/RateLimiter"
 
   RateLimiter:
@@ -1590,6 +1660,18 @@ definitions:
         type: string
         description:
           The new host device of the interface
+  VsockOverride:
+    type: object
+    description:
+      Allows for changing the backing Unix Domain Socket of a vsock device
+      during snapshot restore.
+    required:
+      - uds_path
+    properties:
+      uds_path:
+        type: string
+        description:
+          The new path for the backing Unix Domain Socket.
 
   SnapshotLoadParams:
     type: object
@@ -1631,6 +1713,21 @@ definitions:
         description: Network host device names to override
         items:
           $ref: "#/definitions/NetworkOverride"
+      vsock_override:
+        $ref: "#/definitions/VsockOverride"
+        description:
+          Overrides the vsock device's UDS path on snapshot restore. This is useful
+          for restoring a snapshot with a different socket path than the one used
+          when the snapshot was created. For example, when the original socket path
+          is no longer available or when deploying to a different environment.
+      clock_realtime:
+        type: boolean
+        description:
+          "[x86_64 only] When set to true, passes KVM_CLOCK_REALTIME to
+          KVM_SET_CLOCK on restore, advancing kvmclock by the wall-clock time
+          elapsed since the snapshot was taken. When false (default), kvmclock resumes
+          from where it was at snapshot time. This option may be extended to other clock
+          sources and CPU architectures in the future."
 
 
   TokenBucket:
@@ -1693,6 +1790,14 @@ definitions:
       serial_out_path:
         type: string
         description: Path to a file or named pipe on the host to which serial output should be written.
+      rate_limiter:
+        $ref: "#/definitions/TokenBucket"
+        description:
+          Optional token bucket for rate limiting serial console output
+          bandwidth. When present, guest writes to the serial port that
+          exceed the configured rate are silently dropped and counted in
+          the `uart.rate_limiter_dropped_bytes` metric. When absent
+          (the default), serial output is not rate-limited.
 
   MemoryHotplugConfig:
     type: object

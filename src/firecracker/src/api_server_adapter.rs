@@ -8,8 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use event_manager::{EventOps, Events, MutEventSubscriber, SubscriberOps};
-use vmm::logger::{ProcessTimeReporter, error, info, warn};
-use vmm::resources::VmResources;
+use vmm::logger::{ProcessTimeReporter, error_unrestricted, info_unrestricted, warn_unrestricted};
 use vmm::rpc_interface::{
     ApiRequest, ApiResponse, BuildMicrovmFromRequestsError, PrebootApiController,
     RuntimeApiController, VmmAction,
@@ -34,6 +33,10 @@ pub enum ApiServerError {
     FailedToBindAndRunHttpServer(ServerError),
     /// Failed to build MicroVM from Json: {0}
     BuildFromJson(crate::BuildFromJsonError),
+    /// Missing vmm seccomp filter
+    MissingSeccompFilter,
+    /// Failed to install vmm seccomp filter: {0}
+    SeccompFilter(vmm::seccomp::InstallationError),
 }
 
 #[derive(Debug)]
@@ -42,6 +45,7 @@ struct ApiServerAdapter {
     from_api: Receiver<ApiRequest>,
     to_api: Sender<ApiResponse>,
     controller: RuntimeApiController,
+    request: Option<ApiRequest>,
 }
 
 impl ApiServerAdapter {
@@ -51,7 +55,6 @@ impl ApiServerAdapter {
         api_event_fd: EventFd,
         from_api: Receiver<ApiRequest>,
         to_api: Sender<ApiResponse>,
-        vm_resources: VmResources,
         vmm: Arc<Mutex<Vmm>>,
         event_manager: &mut EventManager,
     ) -> Result<(), ApiServerError> {
@@ -59,13 +62,18 @@ impl ApiServerAdapter {
             api_event_fd,
             from_api,
             to_api,
-            controller: RuntimeApiController::new(vm_resources, vmm.clone()),
+            controller: RuntimeApiController::new(vmm.clone()),
+            request: None,
         }));
-        event_manager.add_subscriber(api_adapter);
+        event_manager.add_subscriber(api_adapter.clone());
         loop {
             event_manager
                 .run()
                 .expect("EventManager events driver fatal error");
+            api_adapter
+                .lock()
+                .expect("Poisoned lock")
+                .handle_request(event_manager);
 
             match vmm.lock().unwrap().shutdown_exit_code() {
                 Some(FcExitCode::Ok) => break,
@@ -76,13 +84,38 @@ impl ApiServerAdapter {
         Ok(())
     }
 
-    fn handle_request(&mut self, req_action: VmmAction) {
-        let response = self.controller.handle_request(req_action);
+    fn _handle_request(&mut self, req_action: VmmAction, event_manager: &mut EventManager) {
+        let response = self.controller.handle_request(req_action, event_manager);
         // Send back the result.
         self.to_api
             .send(Box::new(response))
             .map_err(|_| ())
             .expect("one-shot channel closed");
+    }
+
+    fn handle_request(&mut self, event_manager: &mut EventManager) {
+        if let Some(api_request) = self.request.take() {
+            let request_is_pause = *api_request == VmmAction::Pause;
+            self._handle_request(*api_request, event_manager);
+
+            // If the latest req is a pause request, temporarily switch to a mode where we
+            // do blocking `recv`s on the `from_api` receiver in a loop, until we get
+            // unpaused. The device emulation is implicitly paused since we do not
+            // relinquish control to the event manager because we're not returning from
+            // `process`.
+            if request_is_pause {
+                // This loop only attempts to process API requests, so things like the
+                // metric flush timerfd handling are frozen as well.
+                loop {
+                    let req = self.from_api.recv().expect("Error receiving API request.");
+                    let req_is_resume = *req == VmmAction::Resume;
+                    self._handle_request(*req, event_manager);
+                    if req_is_resume {
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 impl MutEventSubscriber for ApiServerAdapter {
@@ -95,42 +128,23 @@ impl MutEventSubscriber for ApiServerAdapter {
             let _ = self.api_event_fd.read();
             match self.from_api.try_recv() {
                 Ok(api_request) => {
-                    let request_is_pause = *api_request == VmmAction::Pause;
-                    self.handle_request(*api_request);
-
-                    // If the latest req is a pause request, temporarily switch to a mode where we
-                    // do blocking `recv`s on the `from_api` receiver in a loop, until we get
-                    // unpaused. The device emulation is implicitly paused since we do not
-                    // relinquish control to the event manager because we're not returning from
-                    // `process`.
-                    if request_is_pause {
-                        // This loop only attempts to process API requests, so things like the
-                        // metric flush timerfd handling are frozen as well.
-                        loop {
-                            let req = self.from_api.recv().expect("Error receiving API request.");
-                            let req_is_resume = *req == VmmAction::Resume;
-                            self.handle_request(*req);
-                            if req_is_resume {
-                                break;
-                            }
-                        }
-                    }
+                    self.request = Some(api_request);
                 }
                 Err(TryRecvError::Empty) => {
-                    warn!("Got a spurious notification from api thread");
+                    warn_unrestricted!("Got a spurious notification from api thread");
                 }
                 Err(TryRecvError::Disconnected) => {
                     panic!("The channel's sending half was disconnected. Cannot receive data.");
                 }
             };
         } else {
-            error!("Spurious EventManager event for handler: ApiServerAdapter");
+            error_unrestricted!("Spurious EventManager event for handler: ApiServerAdapter");
         }
     }
 
     fn init(&mut self, ops: &mut EventOps) {
         if let Err(err) = ops.add(Events::new(&self.api_event_fd, EventSet::IN)) {
-            error!("Failed to register activate event: {}", err);
+            error_unrestricted!("Failed to register activate event: {}", err);
         }
     }
 }
@@ -176,7 +190,7 @@ pub(crate) fn run_with_api(
             return Err(ApiServerError::FailedToBindAndRunHttpServer(err));
         }
     };
-    info!("Listening on API socket ({bind_path:?}).");
+    info_unrestricted!("Listening on API socket ({bind_path:?}).");
 
     let api_kill_switch_clone = api_kill_switch
         .try_clone()
@@ -233,20 +247,22 @@ pub(crate) fn run_with_api(
         .map_err(ApiServerError::BuildMicroVmError),
     };
 
-    let result = build_result.and_then(|(vm_resources, vmm)| {
+    // INVARIANT: seccomp must be applied before entering the event loop.
+    // No guest-facing operations may occur between builder return and filter installation.
+    let result = build_result.and_then(|vmm| {
+        vmm::seccomp::apply_filter(
+            seccomp_filters
+                .get("vmm")
+                .ok_or(ApiServerError::MissingSeccompFilter)?,
+        )
+        .map_err(ApiServerError::SeccompFilter)?;
+
         firecracker_metrics
             .lock()
             .expect("Poisoned lock")
             .start(super::metrics::WRITE_METRICS_PERIOD_MS);
 
-        ApiServerAdapter::run_microvm(
-            api_event_fd,
-            from_api,
-            to_api,
-            vm_resources,
-            vmm,
-            &mut event_manager,
-        )
+        ApiServerAdapter::run_microvm(api_event_fd, from_api, to_api, vmm, &mut event_manager)
     });
 
     api_kill_switch.write(1).unwrap();

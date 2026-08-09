@@ -3,16 +3,19 @@
 """Tests the metrics system."""
 
 import os
+from pathlib import Path
 
 import host_tools.drive as drive_tools
+from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel
 from host_tools.fcmetrics import FcDeviceMetrics, validate_fc_metrics
 
 
-def test_flush_metrics(uvm_plain):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_flush_metrics(uvm):
     """
     Check the `FlushMetrics` vmm action.
     """
-    microvm = uvm_plain
+    microvm = uvm
     microvm.spawn()
     microvm.basic_config()
     microvm.start()
@@ -21,12 +24,90 @@ def test_flush_metrics(uvm_plain):
     validate_fc_metrics(metrics)
 
 
-def test_net_metrics(uvm_plain):
+def _configure_metrics_via_api(microvm, **kwargs):
+    """Configure metrics through the API rather than the `--metrics-path` CLI
+    option (the two ways of initializing metrics are mutually exclusive), and
+    wire up the host-side metrics file so the line can be read back."""
+    microvm.spawn(metrics_path=None)
+    microvm.basic_config()
+
+    metrics_path = Path(microvm.path) / "metrics.ndjson"
+    metrics_path.touch()
+    microvm.metrics_file = metrics_path
+
+    microvm.api.metrics.put(
+        metrics_path=microvm.create_jailed_resource(metrics_path), **kwargs
+    )
+    microvm.start()
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_metrics_default_shape(uvm):
+    """
+    Check that no `id` or `properties` field is emitted by default.
+    """
+    microvm = uvm
+    microvm.spawn()
+    microvm.basic_config()
+    microvm.start()
+
+    metrics = microvm.flush_metrics()
+    validate_fc_metrics(metrics)
+    assert "id" not in metrics
+    assert "properties" not in metrics
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_metrics_emit_id(uvm):
+    """
+    Check that `emit_id` emits the instance id, independently of `properties`.
+    """
+    microvm = uvm
+    _configure_metrics_via_api(microvm, emit_id=True)
+
+    metrics = microvm.flush_metrics()
+    validate_fc_metrics(metrics)
+    assert metrics["id"] == microvm.id
+    assert "properties" not in metrics
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_metrics_with_properties(uvm):
+    """
+    Check that `properties` is emitted, independently of `emit_id`.
+    """
+    microvm = uvm
+    properties = {"customer_id": "1234", "bundle_id": "fn-abc"}
+    _configure_metrics_via_api(microvm, properties=properties)
+
+    metrics = microvm.flush_metrics()
+    validate_fc_metrics(metrics)
+    assert metrics["properties"] == properties
+    assert "id" not in metrics
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_metrics_emit_id_and_properties(uvm):
+    """
+    Check that `emit_id` and `properties` can be enabled together.
+    """
+    microvm = uvm
+    properties = {"customer_id": "1234", "bundle_id": "fn-abc"}
+    _configure_metrics_via_api(microvm, emit_id=True, properties=properties)
+
+    metrics = microvm.flush_metrics()
+    validate_fc_metrics(metrics)
+    assert metrics["id"] == microvm.id
+    assert metrics["properties"] == properties
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_net_metrics(uvm):
     """
     Validate that NetDeviceMetrics doesn't have a breaking change
     and "net" is aggregate of all "net_*" in the json object.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.spawn()
 
     # Set up a basic microVM.
@@ -54,12 +135,13 @@ def test_net_metrics(uvm_plain):
         assert exit_code == 0
 
 
-def test_block_metrics(uvm_plain):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_block_metrics(uvm):
     """
     Validate that BlockDeviceMetrics doesn't have a breaking change
     and "block" is aggregate of all "block_*" in the json object.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.spawn()
 
     # Add first scratch block device.

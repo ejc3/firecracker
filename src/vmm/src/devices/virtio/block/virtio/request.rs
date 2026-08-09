@@ -297,7 +297,7 @@ impl Request {
             RequestType::In | RequestType::Out => {
                 // Check that the data length is a multiple of 512 as specified in the virtio
                 // standard.
-                if req.data_len % SECTOR_SIZE != 0 {
+                if !req.data_len.is_multiple_of(SECTOR_SIZE) {
                     return Err(VirtioBlockError::InvalidDataLength);
                 }
                 let top_sector = req
@@ -308,10 +308,8 @@ impl Request {
                     return Err(VirtioBlockError::InvalidOffset);
                 }
             }
-            RequestType::GetDeviceID => {
-                if req.data_len < VIRTIO_BLK_ID_BYTES {
-                    return Err(VirtioBlockError::InvalidDataLength);
-                }
+            RequestType::GetDeviceID if req.data_len < VIRTIO_BLK_ID_BYTES => {
+                return Err(VirtioBlockError::InvalidDataLength);
             }
             _ => {}
         }
@@ -419,10 +417,12 @@ impl Request {
 mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
 
+    use vm_memory::GuestMemoryBackend;
+
     use super::*;
     use crate::devices::virtio::queue::{Queue, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
     use crate::devices::virtio::test_utils::{VirtQueue, default_mem};
-    use crate::vstate::memory::{Address, GuestAddress, GuestMemory};
+    use crate::vstate::memory::{Address, GuestAddress};
 
     const NUM_DISK_SECTORS: u64 = 1024;
 

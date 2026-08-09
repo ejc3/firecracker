@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use vmm::builder::build_and_boot_microvm;
 use vmm::devices::virtio::block::CacheType;
-use vmm::persist::{MicrovmState, MicrovmStateError, VmInfo, snapshot_state_sanity_check};
+use vmm::persist::{
+    MicrovmState, MicrovmStateError, VirtioDevicesState, VmInfo, snapshot_state_sanity_check,
+};
 use vmm::resources::VmResources;
 use vmm::rpc_interface::{
     LoadSnapshotError, PrebootApiController, RuntimeApiController, VmmAction, VmmActionError,
@@ -102,15 +104,22 @@ fn test_build_microvm() {
 }
 
 fn pause_resume_microvm(vmm: Arc<Mutex<Vmm>>) {
-    let mut api_controller = RuntimeApiController::new(VmResources::default(), vmm.clone());
+    let mut api_controller = RuntimeApiController::new(vmm.clone());
+    let mut event_manager = EventManager::new().unwrap();
 
     // There's a race between this thread and the vcpu thread, but this thread
     // should be able to pause vcpu thread before it finishes running its test-binary.
-    api_controller.handle_request(VmmAction::Pause).unwrap();
+    api_controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
     // Pausing again the microVM should not fail (microVM remains in the
     // `Paused` state).
-    api_controller.handle_request(VmmAction::Pause).unwrap();
-    api_controller.handle_request(VmmAction::Resume).unwrap();
+    api_controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+    api_controller
+        .handle_request(VmmAction::Resume, &mut event_manager)
+        .unwrap();
 
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
@@ -138,7 +147,14 @@ fn test_dirty_bitmap_success() {
     for (vmm, _) in vmms {
         // Let it churn for a while and dirty some pages...
         thread::sleep(Duration::from_millis(100));
-        let bitmap = vmm.lock().unwrap().vm.get_dirty_bitmap().unwrap();
+        let bitmap = vmm
+            .lock()
+            .unwrap()
+            .vm
+            .as_kvm()
+            .unwrap()
+            .get_dirty_bitmap()
+            .unwrap();
         let num_dirty_pages: u32 = bitmap
             .values()
             .map(|bitmap_per_region| {
@@ -210,22 +226,18 @@ fn verify_create_snapshot(
         pci_enabled,
         memory_hotplug,
     );
-    let resources = VmResources {
-        machine_config: MachineConfig {
-            mem_size_mib: 1,
-            track_dirty_pages: is_diff,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let vm_info = VmInfo::from(&resources);
-    let mut controller = RuntimeApiController::new(resources, vmm.clone());
+
+    let vm_info = VmInfo::from(&*vmm.lock().unwrap());
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    let mut event_manager = EventManager::new().unwrap();
 
     // Be sure that the microVM is running.
     thread::sleep(Duration::from_millis(200));
 
     // Pause microVM.
-    controller.handle_request(VmmAction::Pause).unwrap();
+    controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
 
     // Create snapshot.
     let snapshot_type = match is_diff {
@@ -239,7 +251,10 @@ fn verify_create_snapshot(
     };
 
     controller
-        .handle_request(VmmAction::CreateSnapshot(snapshot_params))
+        .handle_request(
+            VmmAction::CreateSnapshot(snapshot_params),
+            &mut event_manager,
+        )
         .unwrap();
 
     vmm.lock().unwrap().stop(FcExitCode::Ok);
@@ -252,29 +267,20 @@ fn verify_create_snapshot(
 
     // Verify deserialized data.
     // The default vmm has no devices and one vCPU.
-    assert_eq!(
-        restored_microvm_state
-            .device_states
-            .mmio_state
-            .block_devices
-            .len(),
-        0
-    );
-    assert_eq!(
-        restored_microvm_state
-            .device_states
-            .mmio_state
-            .net_devices
-            .len(),
-        0
-    );
-    assert!(
-        restored_microvm_state
-            .device_states
-            .mmio_state
-            .vsock_device
-            .is_none()
-    );
+    match &restored_microvm_state.device_states.virtio_state {
+        VirtioDevicesState::Mmio(state) => {
+            assert!(!pci_enabled);
+            assert_eq!(state.block_devices.len(), 0);
+            assert_eq!(state.net_devices.len(), 0);
+            assert!(state.vsock_device.is_none());
+        }
+        VirtioDevicesState::Pci(state) => {
+            assert!(pci_enabled);
+            assert_eq!(state.block_devices.len(), 0);
+            assert_eq!(state.net_devices.len(), 0);
+            assert!(state.vsock_device.is_none());
+        }
+    }
     assert_eq!(restored_microvm_state.vcpu_states.len(), 1);
 
     (snapshot_file, memory_file)
@@ -302,6 +308,8 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
             track_dirty_pages: false,
             resume_vm: true,
             network_overrides: vec![],
+            vsock_override: None,
+            clock_realtime: false,
         }))
         .unwrap();
 
@@ -386,6 +394,8 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         track_dirty_pages: false,
         resume_vm: false,
         network_overrides: vec![],
+        vsock_override: None,
+        clock_realtime: false,
     });
     let err = preboot_api_controller.handle_preboot_request(req);
     assert!(
@@ -430,6 +440,7 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
         iface_id: String::new(),
         host_dev_name: String::new(),
         guest_mac: None,
+        mtu: None,
         rx_rate_limiter: None,
         tx_rate_limiter: None,
     });

@@ -10,10 +10,11 @@ use std::mem;
 
 use kvm_bindings::{kvm_fpu, kvm_regs, kvm_sregs};
 use kvm_ioctls::VcpuFd;
+use vm_memory::GuestMemoryBackend;
 
 use super::super::{BootProtocol, EntryPoint};
 use super::gdt::{gdt_entry, kvm_segment_from_gdt};
-use crate::vstate::memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
+use crate::vstate::memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
 // Initial pagetables.
 const PML4_START: u64 = 0x9000;
@@ -361,9 +362,8 @@ mod tests {
             ..Default::default()
         };
         let actual_fpu: kvm_fpu = vcpu.get_fpu().unwrap();
-        // TODO: auto-generate kvm related structures with PartialEq on.
         assert_eq!(expected_fpu.fcw, actual_fpu.fcw);
-        // Setting the mxcsr register from kvm_fpu inside setup_fpu does not influence anything.
+        // TODO: Setting the mxcsr register from kvm_fpu inside setup_fpu does not influence anything.
         // See 'kvm_arch_vcpu_ioctl_set_fpu' from arch/x86/kvm/x86.c.
         // The mxcsr will stay 0 and the assert below fails. Decide whether or not we should
         // remove it at all.
@@ -388,6 +388,7 @@ mod tests {
         let entry_point: EntryPoint = EntryPoint {
             entry_addr: GuestAddress(expected_regs.rip),
             protocol: BootProtocol::LinuxBoot,
+            setup_header: None,
         };
 
         setup_regs(&vcpu, entry_point).unwrap();

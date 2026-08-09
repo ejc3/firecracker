@@ -90,8 +90,12 @@ pub enum JailerError {
     GetSid(io::Error),
     #[error("Invalid gid: {0}")]
     Gid(String),
+    #[error("Detected hard link at: {0}")]
+    HardLink(PathBuf),
     #[error("Invalid instance ID: {0}")]
     InvalidInstanceId(validators::ValidatorError),
+    #[error("Cannot get metadata for a file: {0}: {1}")]
+    Metadata(PathBuf, io::Error),
     #[error("{}", format!("File {:?} doesn't have a parent", .0).replace('\"', ""))]
     MissingParent(PathBuf),
     #[error("Failed to create the jail root directory before pivoting root: {0}")]
@@ -106,8 +110,8 @@ pub enum JailerError {
     NotAFile(PathBuf),
     #[error("{}", format!("{:?} is not a directory", .0).replace('\"', ""))]
     NotADirectory(PathBuf),
-    #[error("Failed to open /dev/null: {0}")]
-    OpenDevNull(io::Error),
+    #[error("Failed to open {0}: {1}")]
+    Open(PathBuf, io::Error),
     #[error("{}", format!("Failed to parse path {:?} into an OsString", .0).replace('\"', ""))]
     OsStringParsing(PathBuf, OsString),
     #[error("Failed to pivot root: {0}")]
@@ -378,7 +382,7 @@ mod tests {
 
         let mut fds = Vec::new();
         for i in 0..n {
-            let maybe_file = File::create(format!("{}/{}", &tmp_dir_path, i));
+            let maybe_file = File::create(format!("{}/{}", tmp_dir_path, i));
             fds.push(maybe_file.unwrap().into_raw_fd());
         }
 

@@ -14,6 +14,7 @@ import pytest
 import requests
 import urllib3
 
+from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel
 from framework.defs import FC_BINARY_NAME
 from framework.jailer import JailerContext
 
@@ -52,11 +53,12 @@ def check_stats(filepath, stats, uid, gid):
     assert st.st_mode ^ stats == 0
 
 
-def test_empty_jailer_id(uvm_plain):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_empty_jailer_id(uvm):
     """
     Test that the jailer ID cannot be empty.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
 
     # Set the jailer ID to None.
     test_microvm.jailer = JailerContext(
@@ -74,11 +76,12 @@ def test_empty_jailer_id(uvm_plain):
         test_microvm.spawn()
 
 
-def test_exec_file_not_exist(uvm_plain, tmp_path):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_exec_file_not_exist(uvm, tmp_path):
     """
     Test the jailer option `--exec-file`
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
 
     # Error case 1: No such file exists
     pseudo_exec_file_path = tmp_path / "pseudo_firecracker_exec_file"
@@ -107,11 +110,52 @@ def test_exec_file_not_exist(uvm_plain, tmp_path):
         test_microvm.spawn()
 
 
-def test_default_chroot_hierarchy(uvm_plain):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_exec_destination_path_is_symlink(uvm):
+    """
+    Test the jailer correctly refuses to copy binary into symlink
+    """
+    test_microvm = uvm
+
+    firecracker_root_dir = Path(test_microvm.chroot())
+    firecracker_bin_path = firecracker_root_dir / "firecracker"
+    dummy_path = Path("/srv/dummy")
+    dummy_path.unlink(missing_ok=True)
+    dummy_path.touch()
+    firecracker_bin_path.symlink_to(dummy_path)
+    with pytest.raises(
+        Exception,
+        match=f"Failed to open {firecracker_bin_path}",
+    ):
+        test_microvm.spawn()
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_exec_destination_path_is_hardlink(uvm):
+    """
+    Test the jailer correctly refuses to copy binary into hardlink
+    """
+    test_microvm = uvm
+
+    firecracker_root_dir = Path(test_microvm.chroot())
+    firecracker_bin_path = firecracker_root_dir / "firecracker"
+    dummy_path = Path("/srv/dummy")
+    dummy_path.unlink(missing_ok=True)
+    dummy_path.touch()
+    firecracker_bin_path.hardlink_to(dummy_path)
+    with pytest.raises(
+        Exception,
+        match=f"Detected hard link at: {firecracker_bin_path}",
+    ):
+        test_microvm.spawn()
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_default_chroot_hierarchy(uvm):
     """
     Test the folder hierarchy created by default by the jailer.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
 
     test_microvm.spawn()
 
@@ -154,15 +198,19 @@ def test_default_chroot_hierarchy(uvm_plain):
         test_microvm.jailer.gid,
     )
     check_stats(
-        os.path.join(test_microvm.jailer.chroot_path(), "firecracker"), FILE_STATS, 0, 0
+        os.path.join(test_microvm.jailer.chroot_path(), "firecracker"),
+        FILE_STATS,
+        test_microvm.jailer.uid,
+        test_microvm.jailer.gid,
     )
 
 
-def test_arbitrary_usocket_location(uvm_plain):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_arbitrary_usocket_location(uvm):
     """
     Test arbitrary location scenario for the api socket.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.jailer.extra_args = {"api-sock": "api.socket"}
 
     test_microvm.spawn(serial_out_path=None)
@@ -173,6 +221,63 @@ def test_arbitrary_usocket_location(uvm_plain):
         test_microvm.jailer.uid,
         test_microvm.jailer.gid,
     )
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_jailer_bind_mount_propagation(uvm):
+    """
+    Test that host bind-mounts inside the chroot propagate into the jail.
+
+    Mounts that exist before the jailer starts, covering the recursive
+    self-bind fix (MS_BIND -> MS_BIND | MS_REC).
+
+    Regression test for #1089.
+    """
+    test_microvm = uvm
+    chroot = Path(test_microvm.chroot())
+
+    kernel_jail_name = "vmlinux.bin"
+    rootfs_jail_name = "rootfs.img"
+    kernel_mount_point = chroot / kernel_jail_name
+    rootfs_mount_point = chroot / rootfs_jail_name
+    kernel_mount_point.touch()
+    rootfs_mount_point.touch()
+    try:
+        subprocess.check_call(
+            ["mount", "--bind", str(test_microvm.kernel_file), str(kernel_mount_point)]
+        )
+        subprocess.check_call(
+            ["mount", "--bind", str(test_microvm.rootfs_file), str(rootfs_mount_point)]
+        )
+        test_microvm.spawn()
+
+        # Drive the API directly: basic_config() would hardlink over our
+        # bind-mount points and mask what we are testing.
+        test_microvm.api.machine_config.put(vcpu_count=2, mem_size_mib=256)
+        test_microvm.boot_args = (
+            "reboot=k panic=1 nomodule swiotlb=noforce console=ttyS0 cryptomgr.notests"
+        )
+        if not test_microvm.pci_enabled:
+            test_microvm.boot_args += " pci=off"
+        test_microvm.api.boot.put(
+            kernel_image_path=f"/{kernel_jail_name}",
+            boot_args=test_microvm.boot_args,
+        )
+        test_microvm.api.drive.put(
+            drive_id="rootfs",
+            path_on_host=f"/{rootfs_jail_name}",
+            is_root_device=True,
+            is_read_only=True,
+        )
+        test_microvm.add_net_iface()
+        test_microvm.start()
+        test_microvm.ssh.check_output("true")
+    finally:
+        # Unmount before the framework's chroot rmtree so it never
+        # recurses into the bind-mount sources.
+        test_microvm.kill()
+        for mp in (rootfs_mount_point, kernel_mount_point):
+            subprocess.run(["umount", str(mp)], check=False)
 
 
 class Cgroups:
@@ -281,21 +386,22 @@ def get_cpus(node):
 def check_limits(pid, no_file, fsize):
     """Verify resource limits against expected values."""
     # Fetch firecracker process limits for number of open fds
-    (soft, hard) = resource.prlimit(pid, resource.RLIMIT_NOFILE)
+    soft, hard = resource.prlimit(pid, resource.RLIMIT_NOFILE)
     assert soft == no_file
     assert hard == no_file
 
     # Fetch firecracker process limits for maximum file size
-    (soft, hard) = resource.prlimit(pid, resource.RLIMIT_FSIZE)
+    soft, hard = resource.prlimit(pid, resource.RLIMIT_FSIZE)
     assert soft == fsize
     assert hard == fsize
 
 
-def test_cgroups(uvm_plain, cgroups_info):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_cgroups(uvm, cgroups_info):
     """
     Test the cgroups are correctly set by the jailer.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.jailer.cgroup_ver = cgroups_info.version
     if test_microvm.jailer.cgroup_ver == 2:
         test_microvm.jailer.cgroups = ["cpu.weight.nice=10"]
@@ -319,11 +425,12 @@ def test_cgroups(uvm_plain, cgroups_info):
         check_cgroups_v2(test_microvm)
 
 
-def test_cgroups_custom_parent(uvm_plain, cgroups_info):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_cgroups_custom_parent(uvm, cgroups_info):
     """
     Test cgroups when a custom parent cgroup is used.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.jailer.cgroup_ver = cgroups_info.version
     test_microvm.jailer.parent_cgroup = "custom_cgroup/group2"
     if test_microvm.jailer.cgroup_ver == 2:
@@ -351,11 +458,12 @@ def test_cgroups_custom_parent(uvm_plain, cgroups_info):
         check_cgroups_v2(test_microvm)
 
 
-def test_node_cgroups(uvm_plain, cgroups_info):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_node_cgroups(uvm, cgroups_info):
     """
     Test the numa node cgroups are correctly set by the jailer.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.jailer.cgroup_ver = cgroups_info.version
 
     # Retrieve CPUs from NUMA node 0.
@@ -372,11 +480,12 @@ def test_node_cgroups(uvm_plain, cgroups_info):
         check_cgroups_v2(test_microvm)
 
 
-def test_cgroups_without_numa(uvm_plain, cgroups_info):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_cgroups_without_numa(uvm, cgroups_info):
     """
     Test the cgroups are correctly set by the jailer, without numa assignment.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.jailer.cgroup_ver = cgroups_info.version
     if test_microvm.jailer.cgroup_ver == 2:
         test_microvm.jailer.cgroups = ["cpu.weight=2"]
@@ -391,24 +500,26 @@ def test_cgroups_without_numa(uvm_plain, cgroups_info):
         check_cgroups_v2(test_microvm)
 
 
-def test_v1_default_cgroups(uvm_plain, cgroups_info):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_v1_default_cgroups(uvm, cgroups_info):
     """
     Test if the jailer is using cgroup-v1 by default.
     """
     if cgroups_info.version != 1:
         pytest.skip(reason="Requires system with cgroup-v1 enabled.")
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.jailer.cgroups = ["cpu.shares=2"]
     test_microvm.spawn()
     check_cgroups_v1(test_microvm.jailer.cgroups, test_microvm.jailer.jailer_id)
 
 
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
 @pytest.mark.parametrize(
     "parent_exists,domain_controller_in_subtree",
     [(True, False), (True, True), (False, None)],
 )
 def test_cgroups_parent_cgroup_but_no_cgroup(
-    uvm_plain, cgroups_info, parent_exists, domain_controller_in_subtree
+    uvm, cgroups_info, parent_exists, domain_controller_in_subtree
 ):
     """
     Test cgroups when `--parent-cgroup` is used but no `--cgroup` are specified.
@@ -423,7 +534,7 @@ def test_cgroups_parent_cgroup_but_no_cgroup(
     """
     if cgroups_info.version != 2:
         pytest.skip("cgroupsv2 only")
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.jailer.cgroup_ver = cgroups_info.version
     # Make it somewhat unique so it doesn't conflict with other test runs
     parent_cgroup = f"custom_cgroup/{test_microvm.id[:8]}"
@@ -469,34 +580,36 @@ def test_cgroups_parent_cgroup_but_no_cgroup(
         assert not cg_parent.exists()
 
 
-def test_args_default_resource_limits(uvm_plain):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_args_default_resource_limits(uvm):
     """
     Test the default resource limits are correctly set by the jailer.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.spawn()
     # Get firecracker's PID
     pid = test_microvm.firecracker_pid
     assert pid != 0
 
     # Fetch firecracker process limits for number of open fds
-    (soft, hard) = resource.prlimit(pid, resource.RLIMIT_NOFILE)
+    soft, hard = resource.prlimit(pid, resource.RLIMIT_NOFILE)
     # Check that the default limit was set.
     assert soft == 2048
     assert hard == 2048
 
     # Fetch firecracker process limits for number of open fds
-    (soft, hard) = resource.prlimit(pid, resource.RLIMIT_FSIZE)
+    soft, hard = resource.prlimit(pid, resource.RLIMIT_FSIZE)
     # Check that no limit was set
     assert soft == -1
     assert hard == -1
 
 
-def test_args_resource_limits(uvm_plain):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_args_resource_limits(uvm):
     """
     Test the resource limits are correctly set by the jailer.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.jailer.resource_limits = RESOURCE_LIMITS
     test_microvm.spawn()
     # Get firecracker's PID
@@ -507,7 +620,8 @@ def test_args_resource_limits(uvm_plain):
     check_limits(pid, NOFILE, FSIZE)
 
 
-def test_positive_file_size_limit(uvm_plain):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_positive_file_size_limit(uvm):
     """
     Test creating vm succeeds when memory size is under `fsize` limit.
     """
@@ -515,7 +629,7 @@ def test_positive_file_size_limit(uvm_plain):
     vm_mem_size = 128
     jail_limit = (vm_mem_size + 1) << 20
 
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.jailer.resource_limits = [f"fsize={jail_limit}"]
     test_microvm.spawn()
     test_microvm.basic_config(mem_size_mib=vm_mem_size)
@@ -524,11 +638,12 @@ def test_positive_file_size_limit(uvm_plain):
     test_microvm.start()
 
 
-def test_negative_file_size_limit(uvm_plain):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_negative_file_size_limit(uvm):
     """
     Test creating snapshot file fails when size exceeds `fsize` limit.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     # limit to 1MB, to account for logs and metrics
     test_microvm.jailer.resource_limits = [f"fsize={2**20}"]
     test_microvm.spawn()
@@ -559,11 +674,12 @@ def test_negative_file_size_limit(uvm_plain):
         assert False, "Negative test failed"
 
 
-def test_negative_no_file_limit(uvm_plain):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_negative_no_file_limit(uvm):
     """
     Test microVM is killed when exceeding `no-file` limit.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.jailer.resource_limits = ["no-file=3"]
 
     # pylint: disable=W0703
@@ -577,11 +693,12 @@ def test_negative_no_file_limit(uvm_plain):
         assert False, "Negative test failed"
 
 
-def test_new_pid_ns_resource_limits(uvm_plain):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_new_pid_ns_resource_limits(uvm):
     """
     Test that Firecracker process inherits jailer resource limits.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.jailer.resource_limits = RESOURCE_LIMITS
     test_microvm.spawn()
 
@@ -592,11 +709,12 @@ def test_new_pid_ns_resource_limits(uvm_plain):
     check_limits(fc_pid, NOFILE, FSIZE)
 
 
-def test_new_pid_namespace(uvm_plain):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_new_pid_namespace(uvm):
     """
     Test that Firecracker is spawned in a new PID namespace if requested.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.spawn()
     # Check that the PID file exists.
     fc_pid = test_microvm.firecracker_pid
@@ -623,6 +741,7 @@ def test_new_pid_namespace(uvm_plain):
     assert int(nstgid_list[0]) == fc_pid
 
 
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
 @pytest.mark.parametrize(
     "daemonize",
     [True, False],
@@ -631,11 +750,11 @@ def test_new_pid_namespace(uvm_plain):
     "new_pid_ns",
     [True, False],
 )
-def test_firecracker_kill_by_pid(uvm_plain, daemonize, new_pid_ns):
+def test_firecracker_kill_by_pid(uvm, daemonize, new_pid_ns):
     """
     Test that Firecracker is spawned in a new PID namespace if requested.
     """
-    microvm = uvm_plain
+    microvm = uvm
     microvm.jailer.daemonize = daemonize
     microvm.jailer.new_pid_ns = new_pid_ns
     microvm.spawn()
@@ -651,7 +770,8 @@ def test_firecracker_kill_by_pid(uvm_plain, daemonize, new_pid_ns):
     microvm.kill()
 
 
-def test_cgroupsv2_written_only_once(uvm_plain, cgroups_info):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_cgroupsv2_written_only_once(uvm, cgroups_info):
     """
     Test that we only write to cgroup.procs once when using CgroupsV2
 
@@ -661,7 +781,6 @@ def test_cgroupsv2_written_only_once(uvm_plain, cgroups_info):
     if cgroups_info.version != 2:
         pytest.skip(reason="Requires system with cgroup-v2 enabled.")
 
-    uvm = uvm_plain
     strace_output_path = Path(uvm.path, "strace.out")
     strace_cmd = [
         "strace",

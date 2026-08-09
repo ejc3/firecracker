@@ -36,7 +36,6 @@ use std::io::Read;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 
-use log::{debug, error, info, warn};
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 
 use super::super::csm::ConnState;
@@ -47,7 +46,7 @@ use super::muxer_rxq::MuxerRxQ;
 use super::{MuxerConnection, VsockUnixBackendError, defs};
 use crate::devices::virtio::vsock::metrics::METRICS;
 use crate::devices::virtio::vsock::packet::{VsockPacketRx, VsockPacketTx};
-use crate::logger::IncMetric;
+use crate::logger::{IncMetric, debug, error, info, warn};
 
 /// A unique identifier of a `MuxerConnection` object. Connections are stored in a hash map,
 /// keyed by a `ConnMapKey` object.
@@ -107,7 +106,14 @@ pub struct VsockMuxer {
     /// ports to host-initiated connections.
     local_port_set: HashSet<u32>,
     /// The last used host-side port.
-    local_port_last: u32,
+    ///
+    /// Local ports are allocated in a round-robin fashion within the range [1 << 30, 1 << 31).
+    /// There should be no inherent technical requirement for this specific range. But the range
+    /// provides 1 billion available ports, making port collisions unlikely. In addition, the
+    /// most significant bits are fixed to 01, which may facilitate debugging and identification.
+    /// This appears to have been a design decision dating back to the initial introduction of the
+    /// vsock implementation.
+    pub(crate) local_port_last: u32,
 }
 
 impl VsockChannel for VsockMuxer {
@@ -187,10 +193,9 @@ impl VsockChannel for VsockMuxer {
     /// This absorbs unexpected packets, handles RSTs (by dropping connections), and forwards
     /// all the rest to their owning `MuxerConnection`.
     ///
-    /// Returns:
-    /// always `Ok(())` - the packet has been consumed, and its virtio TX buffers can be
-    /// returned to the guest vsock driver.
-    fn send_pkt(&mut self, pkt: &VsockPacketTx) -> Result<(), VsockError> {
+    /// The packet is always consumed, and its virtio TX buffers can be returned to the guest
+    /// vsock driver.
+    fn send_pkt(&mut self, pkt: &VsockPacketTx) {
         let conn_key = ConnMapKey {
             local_port: pkt.hdr.dst_port(),
             peer_port: pkt.hdr.src_port(),
@@ -206,7 +211,7 @@ impl VsockChannel for VsockMuxer {
         //
         if pkt.hdr.type_() != uapi::VSOCK_TYPE_STREAM {
             self.enq_rst(pkt.hdr.dst_port(), pkt.hdr.src_port());
-            return Ok(());
+            return;
         }
 
         // We don't know how to handle packets addressed to other CIDs. We only handle the host
@@ -216,7 +221,7 @@ impl VsockChannel for VsockMuxer {
                 "vsock: dropping guest packet for unknown CID: {:?}",
                 pkt.hdr
             );
-            return Ok(());
+            return;
         }
 
         if !self.conn_map.contains_key(&conn_key) {
@@ -230,7 +235,7 @@ impl VsockChannel for VsockMuxer {
                 // Send back an RST, to let the drive know we weren't expecting this packet.
                 self.enq_rst(pkt.hdr.dst_port(), pkt.hdr.src_port());
             }
-            return Ok(());
+            return;
         }
 
         // Right, we know where to send this packet, then (to `conn_key`).
@@ -238,16 +243,13 @@ impl VsockChannel for VsockMuxer {
         // there's no point in forwarding it the packet.
         if pkt.hdr.op() == uapi::VSOCK_OP_RST {
             self.remove_connection(conn_key);
-            return Ok(());
+            return;
         }
 
         // Alright, everything looks in order - forward this packet to its owning connection.
-        let mut res: Result<(), VsockError> = Ok(());
         self.apply_conn_mutation(conn_key, |conn| {
-            res = conn.send_pkt(pkt);
+            conn.send_pkt(pkt);
         });
-
-        res
     }
 
     /// Check if the muxer has any pending RX data, with which to fill a guest-provided RX
@@ -276,7 +278,7 @@ impl VsockEpollListener for VsockMuxer {
         EventSet::IN
     }
 
-    /// Notify the muxer about a pending event having occured under its nested epoll FD.
+    /// Notify the muxer about a pending event having occurred under its nested epoll FD.
     fn notify(&mut self, _: EventSet) {
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         match self.epoll.wait(0, epoll_events.as_mut_slice()) {
@@ -299,7 +301,31 @@ impl VsockEpollListener for VsockMuxer {
     }
 }
 
-impl VsockBackend for VsockMuxer {}
+impl VsockBackend for VsockMuxer {
+    fn activate(&mut self) -> Result<(), VsockError> {
+        // Listen on the host-initiated socket, for incoming connections.
+        self.add_listener(self.host_sock.as_raw_fd(), EpollListener::HostSock)
+            .map_err(VsockError::VsockUdsBackend)
+    }
+
+    fn reset(&mut self) {
+        // Remove all connections and their epoll listeners.
+        let keys: Vec<ConnMapKey> = self.conn_map.keys().copied().collect();
+        for key in keys {
+            self.remove_connection(key);
+        }
+
+        let fds: Vec<RawFd> = self.listener_map.keys().copied().collect();
+        for fd in fds {
+            self.remove_listener(fd);
+        }
+
+        self.rxq = MuxerRxQ::new();
+        self.killq = MuxerKillQ::new();
+        self.local_port_set.clear();
+        self.local_port_last = (1u32 << 30) - 1;
+    }
+}
 
 impl VsockMuxer {
     /// Muxer constructor.
@@ -310,7 +336,7 @@ impl VsockMuxer {
             .and_then(|sock| sock.set_nonblocking(true).map(|_| sock))
             .map_err(VsockUnixBackendError::UnixBind)?;
 
-        let mut muxer = Self {
+        let muxer = Self {
             cid,
             host_sock,
             host_sock_path,
@@ -323,8 +349,6 @@ impl VsockMuxer {
             local_port_set: HashSet::with_capacity(defs::MAX_CONNECTIONS),
         };
 
-        // Listen on the host initiated socket, for incoming connections.
-        muxer.add_listener(muxer.host_sock.as_raw_fd(), EpollListener::HostSock)?;
         Ok(muxer)
     }
 
@@ -849,7 +873,8 @@ mod tests {
                 )
                 .unwrap();
 
-            let muxer = VsockMuxer::new(PEER_CID, get_file(name)).unwrap();
+            let mut muxer = VsockMuxer::new(PEER_CID, get_file(name)).unwrap();
+            muxer.activate().unwrap();
             Self {
                 _vsock_test_ctx: vsock_test_ctx,
                 rx_pkt,
@@ -889,7 +914,7 @@ mod tests {
         }
 
         fn send(&mut self) {
-            self.muxer.send_pkt(&self.tx_pkt).unwrap();
+            self.muxer.send_pkt(&self.tx_pkt);
         }
 
         fn recv(&mut self) {
@@ -1135,6 +1160,8 @@ mod tests {
         let buf = test_utils::read_packet_data(&ctx.tx_pkt, 4);
         assert_eq!(&buf, &data);
 
+        // The connection stays scheduled until the stream drains, then has no more pending RX.
+        ctx.muxer.recv_pkt(&mut ctx.rx_pkt).unwrap_err();
         assert!(!ctx.muxer.has_pending_rx());
     }
 
@@ -1170,6 +1197,117 @@ mod tests {
 
         let buf = test_utils::read_packet_data(&ctx.tx_pkt, 4);
         assert_eq!(&buf, &data);
+    }
+
+    #[test]
+    fn test_starvation_drops_and_rearms_epoll_listener() {
+        // End-to-end regression test for the guest-RX-starvation busy-spin at the muxer
+        // layer. When a connection has host data pending but the guest provides no RX
+        // buffer to drain it, the muxer must drop the connection's epoll listener (so the
+        // nested epoll fd goes quiet instead of re-firing IN forever), and re-arm it once
+        // the pending packet is delivered on RX-queue refill.
+        let mut ctx = MuxerTestContext::new("starvation_data");
+        let peer_port = 1025;
+        let (mut stream, local_port) = ctx.local_connect(peer_port);
+        let key = ConnMapKey {
+            local_port,
+            peer_port,
+        };
+        let conn_fd = ctx.muxer.conn_map.get(&key).unwrap().as_raw_fd();
+
+        // Established connection is registered with an epoll listener.
+        assert!(ctx.muxer.listener_map.contains_key(&conn_fd));
+        assert_eq!(ctx.count_epoll_listeners().1, 1);
+
+        // Host writes data; drive the muxer without providing a guest RX buffer.
+        stream.write_all(&[1, 2, 3, 4]).unwrap();
+        ctx.notify_muxer();
+
+        // The connection now has an undeliverable pending RX, so its epoll listener
+        // must have been dropped - the nested epoll fd goes quiet.
+        assert!(ctx.muxer.has_pending_rx());
+        assert!(!ctx.muxer.listener_map.contains_key(&conn_fd));
+        assert_eq!(ctx.count_epoll_listeners().1, 0);
+
+        // The guest posts an RX buffer: recv delivers the packet, but the connection stays
+        // scheduled (and its listener dropped) while the stream may still hold data.
+        ctx.recv();
+        assert_eq!(ctx.rx_pkt.hdr.op(), uapi::VSOCK_OP_RW);
+        assert!(!ctx.muxer.listener_map.contains_key(&conn_fd));
+
+        // Draining the stream clears the pending RX and re-arms the epoll listener.
+        ctx.muxer.recv_pkt(&mut ctx.rx_pkt).unwrap_err();
+        assert!(ctx.muxer.listener_map.contains_key(&conn_fd));
+        assert_eq!(ctx.count_epoll_listeners().1, 1);
+    }
+
+    #[test]
+    fn test_killed_conn_drops_epoll_listener() {
+        // A killed connection must not keep an epoll listener, or the nested epoll fd
+        // re-fires forever on a peer-closed stream that no write can ever satisfy.
+        let mut ctx = MuxerTestContext::new("killed_conn_out");
+        let peer_port = 1025;
+        let (stream, local_port) = ctx.local_connect(peer_port);
+        let key = ConnMapKey {
+            local_port,
+            peer_port,
+        };
+        let conn_fd = ctx.muxer.conn_map.get(&key).unwrap().as_raw_fd();
+        assert!(ctx.muxer.listener_map.contains_key(&conn_fd));
+
+        // Fill the host socket's send buffer, so further data lands in the TX buffer.
+        let data = vec![0xffu8; ctx.tx_pkt.buf_size() as usize];
+        let mut sends = 0;
+        while !ctx
+            .muxer
+            .conn_map
+            .get(&key)
+            .unwrap()
+            .get_polled_evset()
+            .contains(EventSet::OUT)
+        {
+            ctx.init_data_tx_pkt(local_port, peer_port, data.as_slice());
+            ctx.send();
+            sends += 1;
+            assert!(sends < 1024, "TX buffer never filled up");
+        }
+
+        // The host end goes away while data is still buffered.
+        drop(stream);
+
+        // The failing flush kills the connection, which must drop its listener.
+        ctx.muxer.notify(EventSet::IN);
+        assert_eq!(
+            ctx.muxer.conn_map.get(&key).unwrap().state(),
+            ConnState::Killed
+        );
+        assert!(!ctx.muxer.listener_map.contains_key(&conn_fd));
+        assert_eq!(ctx.count_epoll_listeners().1, 0);
+    }
+
+    #[test]
+    fn test_starvation_drops_epoll_listener_on_host_eof() {
+        // Same as `test_starvation_drops_and_rearms_epoll_listener`, but the host closes
+        // its end (EOF) instead of writing data. No host-side entity can break the loop,
+        // so dropping the listener is what makes the nested epoll fd quiet.
+        let mut ctx = MuxerTestContext::new("starvation_eof");
+        let peer_port = 1025;
+        let (stream, local_port) = ctx.local_connect(peer_port);
+        let key = ConnMapKey {
+            local_port,
+            peer_port,
+        };
+        let conn_fd = ctx.muxer.conn_map.get(&key).unwrap().as_raw_fd();
+        assert!(ctx.muxer.listener_map.contains_key(&conn_fd));
+
+        // Close the host end and drive the muxer without a guest RX buffer.
+        drop(stream);
+        ctx.notify_muxer();
+
+        // The pending EOF (SHUTDOWN) is undeliverable, so the listener must be dropped.
+        assert!(ctx.muxer.has_pending_rx());
+        assert!(!ctx.muxer.listener_map.contains_key(&conn_fd));
+        assert_eq!(ctx.count_epoll_listeners().1, 0);
     }
 
     #[test]

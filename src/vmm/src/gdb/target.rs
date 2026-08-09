@@ -1,6 +1,7 @@
 // Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cfg_select;
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, RecvError};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -11,22 +12,24 @@ use gdbstub::common::{Signal, Tid};
 use gdbstub::stub::{BaseStopReason, MultiThreadStopReason};
 use gdbstub::target::ext::base::BaseOps;
 use gdbstub::target::ext::base::multithread::{
-    MultiThreadBase, MultiThreadResume, MultiThreadResumeOps, MultiThreadSingleStep,
-    MultiThreadSingleStepOps,
+    MultiThreadBase, MultiThreadResume, MultiThreadResumeOps, MultiThreadSchedulerLocking,
+    MultiThreadSchedulerLockingOps, MultiThreadSingleStep, MultiThreadSingleStepOps,
 };
 use gdbstub::target::ext::breakpoints::{
     Breakpoints, BreakpointsOps, HwBreakpoint, HwBreakpointOps, SwBreakpoint, SwBreakpointOps,
 };
 use gdbstub::target::ext::thread_extra_info::{ThreadExtraInfo, ThreadExtraInfoOps};
 use gdbstub::target::{Target, TargetError, TargetResult};
-#[cfg(target_arch = "aarch64")]
-use gdbstub_arch::aarch64::AArch64 as GdbArch;
-#[cfg(target_arch = "aarch64")]
-use gdbstub_arch::aarch64::reg::AArch64CoreRegs as CoreRegs;
-#[cfg(target_arch = "x86_64")]
-use gdbstub_arch::x86::X86_64_SSE as GdbArch;
-#[cfg(target_arch = "x86_64")]
-use gdbstub_arch::x86::reg::X86_64CoreRegs as CoreRegs;
+cfg_select! {
+    target_arch = "aarch64" => {
+        use gdbstub_arch::aarch64::AArch64 as GdbArch;
+        use gdbstub_arch::aarch64::reg::AArch64CoreRegs as CoreRegs;
+    }
+    target_arch = "x86_64" => {
+        use gdbstub_arch::x86::X86_64_SSE as GdbArch;
+        use gdbstub_arch::x86::reg::X86_64CoreRegs as CoreRegs;
+    }
+}
 use vm_memory::{Bytes, GuestAddress, GuestMemoryError};
 
 use super::arch;
@@ -43,12 +46,14 @@ use crate::{FcExitCode, VcpuEvent, VcpuResponse, Vmm};
 struct VcpuState {
     single_step: bool,
     paused: bool,
+    has_resume_action: bool,
 }
 
 impl VcpuState {
     /// Disables single stepping on the Vcpu state
     fn reset_vcpu_state(&mut self) {
         self.single_step = false;
+        self.has_resume_action = false;
     }
 }
 
@@ -135,6 +140,9 @@ pub struct FirecrackerTarget {
     /// Stores the current paused thread id, GDB can inact commands without providing us a Tid to
     /// run on and expects us to use the last paused thread.
     paused_vcpu: Option<Tid>,
+
+    /// Whether scheduler locking is enabled for the current resume cycle
+    scheduler_locking: bool,
 }
 
 /// Convert the 1 indexed Tid to the 0 indexed Vcpuid
@@ -159,7 +167,12 @@ impl FirecrackerTarget {
     /// will handle requests from GDB and perform the appropriate actions, while also updating GDB
     /// with the state of the VMM / Vcpu's as we hit debug events
     pub fn new(vmm: Arc<Mutex<Vmm>>, gdb_event: Receiver<usize>, entry_addr: GuestAddress) -> Self {
-        let mut vcpu_state = vec![VcpuState::default(); vmm.lock().unwrap().vcpus_handles.len()];
+        let vcpus_count = {
+            let vmm = vmm.lock().unwrap();
+            let kvm_vm = vmm.vm.as_kvm().expect("GDB requires KVM");
+            kvm_vm.vcpus_handles().len()
+        };
+        let mut vcpu_state = vec![VcpuState::default(); vcpus_count];
         // By default vcpu 1 will be paused at the entry point
         vcpu_state[0].paused = true;
 
@@ -173,7 +186,19 @@ impl FirecrackerTarget {
             vcpu_state,
 
             paused_vcpu: Tid::new(1),
+            scheduler_locking: false,
         }
+    }
+
+    fn with_vcpu_fd<R>(
+        &self,
+        vcpu_idx: usize,
+        f: impl FnOnce(&kvm_ioctls::VcpuFd, &Vmm) -> R,
+    ) -> R {
+        let vmm = self.vmm.lock().unwrap();
+        let kvm_vm = vmm.vm.as_kvm().expect("GDB requires KVM");
+        let handles = kvm_vm.vcpus_handles();
+        f(&handles[vcpu_idx].vcpu_fd, &vmm)
     }
 
     // Update KVM debug info for a specific vcpu index.
@@ -188,15 +213,16 @@ impl FirecrackerTarget {
             return Ok(());
         }
 
-        let vcpu_fd = &self.vmm.lock().unwrap().vcpus_handles[vcpu_idx].vcpu_fd;
-        arch::vcpu_set_debug(vcpu_fd, hw_breakpoints, state.single_step)
+        self.with_vcpu_fd(vcpu_idx, |vcpu_fd, _| {
+            arch::vcpu_set_debug(vcpu_fd, hw_breakpoints, state.single_step)
+        })
     }
 
     /// Translate guest virtual address to guest pysical address.
     fn translate_gva(&self, vcpu_idx: usize, addr: u64) -> Result<u64, GdbTargetError> {
-        let vmm = self.vmm.lock().unwrap();
-        let vcpu_fd = &vmm.vcpus_handles[vcpu_idx].vcpu_fd;
-        arch::translate_gva(vcpu_fd, addr, &vmm)
+        self.with_vcpu_fd(vcpu_idx, |vcpu_fd, vmm| {
+            arch::translate_gva(vcpu_fd, addr, vmm)
+        })
     }
 
     /// Retrieves the currently paused Vcpu id returns an error if there is no currently paused Vcpu
@@ -224,6 +250,9 @@ impl FirecrackerTarget {
         }
 
         for cpu_id in 0..self.vcpu_state.len() {
+            if self.scheduler_locking && !self.vcpu_state[cpu_id].has_resume_action {
+                continue;
+            }
             let tid = vcpuid_to_tid(cpu_id)?;
             self.resume_vcpu(tid)?;
         }
@@ -258,7 +287,10 @@ impl FirecrackerTarget {
             return Ok(());
         }
 
-        let cpu_handle = &mut self.vmm.lock()?.vcpus_handles[tid_to_vcpuid(tid)];
+        let vmm = self.vmm.lock()?;
+        let kvm_vm = vmm.vm.as_kvm().expect("GDB requires KVM");
+        let mut handles = kvm_vm.vcpus_handles();
+        let cpu_handle = &mut handles[tid_to_vcpuid(tid)];
 
         cpu_handle.send_event(VcpuEvent::Pause)?;
         let _ = cpu_handle.response_receiver().recv()?;
@@ -269,10 +301,9 @@ impl FirecrackerTarget {
 
     /// A helper function to allow the event loop to inject this breakpoint back into the Vcpu
     pub fn inject_bp_to_guest(&mut self, tid: Tid) -> Result<(), GdbTargetError> {
-        let vmm = self.vmm.lock().unwrap();
-        let vcpu_idx = tid_to_vcpuid(tid);
-        let vcpu_fd = &vmm.vcpus_handles[vcpu_idx].vcpu_fd;
-        arch::vcpu_inject_bp(vcpu_fd, &self.hw_breakpoints, false)
+        self.with_vcpu_fd(tid_to_vcpuid(tid), |vcpu_fd, _| {
+            arch::vcpu_inject_bp(vcpu_fd, &self.hw_breakpoints, false)
+        })
     }
 
     /// Resumes the Vcpu, will return early if the Vcpu is already running
@@ -285,7 +316,10 @@ impl FirecrackerTarget {
             return Ok(());
         }
 
-        let cpu_handle = &mut self.vmm.lock()?.vcpus_handles[tid_to_vcpuid(tid)];
+        let vmm = self.vmm.lock()?;
+        let kvm_vm = vmm.vm.as_kvm().expect("GDB requires KVM");
+        let mut handles = kvm_vm.vcpus_handles();
+        let cpu_handle = &mut handles[tid_to_vcpuid(tid)];
         cpu_handle.send_event(VcpuEvent::Resume)?;
 
         let response = cpu_handle.response_receiver().recv()?;
@@ -314,10 +348,10 @@ impl FirecrackerTarget {
         }
 
         let vmm = self.vmm.lock().unwrap();
-        let vcpu_fd = &vmm.vcpus_handles[vcpu_idx].vcpu_fd;
+        let kvm_vm = vmm.vm.as_kvm().expect("GDB requires KVM");
+        let handles = kvm_vm.vcpus_handles();
+        let vcpu_fd = &handles[vcpu_idx].vcpu_fd;
         let Ok(ip) = arch::get_instruction_pointer(vcpu_fd) else {
-            // If we error here we return an arbitrary Software Breakpoint, GDB will handle
-            // this gracefully
             return Ok(Some(MultiThreadStopReason::SwBreak(tid)));
         };
 
@@ -344,12 +378,12 @@ impl Target for FirecrackerTarget {
     type Arch = GdbArch;
 
     #[inline(always)]
-    fn base_ops(&mut self) -> BaseOps<Self::Arch, Self::Error> {
+    fn base_ops(&mut self) -> BaseOps<'_, Self::Arch, Self::Error> {
         BaseOps::MultiThread(self)
     }
 
     #[inline(always)]
-    fn support_breakpoints(&mut self) -> Option<BreakpointsOps<Self>> {
+    fn support_breakpoints(&mut self) -> Option<BreakpointsOps<'_, Self>> {
         Some(self)
     }
 
@@ -364,22 +398,18 @@ impl Target for FirecrackerTarget {
 impl MultiThreadBase for FirecrackerTarget {
     /// Reads the registers for the Vcpu
     fn read_registers(&mut self, regs: &mut CoreRegs, tid: Tid) -> TargetResult<(), Self> {
-        let vmm = self.vmm.lock().unwrap();
-        let vcpu_idx = tid_to_vcpuid(tid);
-        let vcpu_fd = &vmm.vcpus_handles[vcpu_idx].vcpu_fd;
-        arch::read_registers(vcpu_fd, regs)?;
-
-        Ok(())
+        self.with_vcpu_fd(tid_to_vcpuid(tid), |vcpu_fd, _| {
+            arch::read_registers(vcpu_fd, regs)?;
+            Ok(())
+        })
     }
 
     /// Writes to the registers for the Vcpu
     fn write_registers(&mut self, regs: &CoreRegs, tid: Tid) -> TargetResult<(), Self> {
-        let vmm = self.vmm.lock().unwrap();
-        let vcpu_idx = tid_to_vcpuid(tid);
-        let vcpu_fd = &vmm.vcpus_handles[vcpu_idx].vcpu_fd;
-        arch::write_registers(vcpu_fd, regs)?;
-
-        Ok(())
+        self.with_vcpu_fd(tid_to_vcpuid(tid), |vcpu_fd, _| {
+            arch::write_registers(vcpu_fd, regs)?;
+            Ok(())
+        })
     }
 
     /// Writes data to a guest virtual address for the Vcpu
@@ -392,7 +422,9 @@ impl MultiThreadBase for FirecrackerTarget {
         let data_len = data.len();
         let vmm = self.vmm.lock().unwrap();
         let vcpu_idx = tid_to_vcpuid(tid);
-        let vcpu_fd = &vmm.vcpus_handles[vcpu_idx].vcpu_fd;
+        let kvm_vm = vmm.vm.as_kvm().expect("GDB requires KVM");
+        let handles = kvm_vm.vcpus_handles();
+        let vcpu_fd = &handles[vcpu_idx].vcpu_fd;
 
         while !data.is_empty() {
             let gpa = arch::translate_gva(vcpu_fd, gva, &vmm).map_err(|e| {
@@ -406,8 +438,10 @@ impl MultiThreadBase for FirecrackerTarget {
             );
 
             vmm.vm
+                .as_kvm()
+                .expect("GDB requires KVM")
                 .guest_memory()
-                .read(&mut data[..read_len], GuestAddress(gpa as u64))
+                .read(&mut data[..read_len], GuestAddress(gpa))
                 .map_err(|e| {
                     error!("Error reading memory {e:?} gpa is {gpa}");
                 })?;
@@ -428,7 +462,9 @@ impl MultiThreadBase for FirecrackerTarget {
     ) -> TargetResult<(), Self> {
         let vmm = self.vmm.lock().unwrap();
         let vcpu_idx = tid_to_vcpuid(tid);
-        let vcpu_fd = &vmm.vcpus_handles[vcpu_idx].vcpu_fd;
+        let kvm_vm = vmm.vm.as_kvm().expect("GDB requires KVM");
+        let handles = kvm_vm.vcpus_handles();
+        let vcpu_fd = &handles[vcpu_idx].vcpu_fd;
 
         while !data.is_empty() {
             let gpa = arch::translate_gva(vcpu_fd, gva, &vmm).map_err(|e| {
@@ -442,6 +478,8 @@ impl MultiThreadBase for FirecrackerTarget {
             );
 
             vmm.vm
+                .as_kvm()
+                .expect("GDB requires KVM")
                 .guest_memory()
                 .write(&data[..write_len], GuestAddress(gpa))
                 .map_err(|e| {
@@ -471,7 +509,7 @@ impl MultiThreadBase for FirecrackerTarget {
     }
 
     #[inline(always)]
-    fn support_resume(&mut self) -> Option<MultiThreadResumeOps<Self>> {
+    fn support_resume(&mut self) -> Option<MultiThreadResumeOps<'_, Self>> {
         Some(self)
     }
 
@@ -488,7 +526,9 @@ impl MultiThreadResume for FirecrackerTarget {
         tid: Tid,
         _signal: Option<Signal>,
     ) -> Result<(), Self::Error> {
-        self.vcpu_state[tid_to_vcpuid(tid)].single_step = false;
+        let state = &mut self.vcpu_state[tid_to_vcpuid(tid)];
+        state.single_step = false;
+        state.has_resume_action = true;
 
         Ok(())
     }
@@ -501,12 +541,18 @@ impl MultiThreadResume for FirecrackerTarget {
     /// Clears the state of all Vcpus setting it back to base config
     fn clear_resume_actions(&mut self) -> Result<(), Self::Error> {
         self.reset_all_vcpu_states();
+        self.scheduler_locking = false;
 
         Ok(())
     }
 
     #[inline(always)]
     fn support_single_step(&mut self) -> Option<MultiThreadSingleStepOps<'_, Self>> {
+        Some(self)
+    }
+
+    #[inline(always)]
+    fn support_scheduler_locking(&mut self) -> Option<MultiThreadSchedulerLockingOps<'_, Self>> {
         Some(self)
     }
 }
@@ -518,20 +564,29 @@ impl MultiThreadSingleStep for FirecrackerTarget {
         tid: Tid,
         _signal: Option<Signal>,
     ) -> Result<(), Self::Error> {
-        self.vcpu_state[tid_to_vcpuid(tid)].single_step = true;
+        let state = &mut self.vcpu_state[tid_to_vcpuid(tid)];
+        state.single_step = true;
+        state.has_resume_action = true;
 
+        Ok(())
+    }
+}
+
+impl MultiThreadSchedulerLocking for FirecrackerTarget {
+    fn set_resume_action_scheduler_lock(&mut self) -> Result<(), Self::Error> {
+        self.scheduler_locking = true;
         Ok(())
     }
 }
 
 impl Breakpoints for FirecrackerTarget {
     #[inline(always)]
-    fn support_hw_breakpoint(&mut self) -> Option<HwBreakpointOps<Self>> {
+    fn support_hw_breakpoint(&mut self) -> Option<HwBreakpointOps<'_, Self>> {
         Some(self)
     }
 
     #[inline(always)]
-    fn support_sw_breakpoint(&mut self) -> Option<SwBreakpointOps<Self>> {
+    fn support_sw_breakpoint(&mut self) -> Option<SwBreakpointOps<'_, Self>> {
         Some(self)
     }
 }

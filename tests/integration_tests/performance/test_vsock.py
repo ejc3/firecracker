@@ -4,12 +4,39 @@
 
 import json
 import os
+import re
+import subprocess
 from pathlib import Path
 
 import pytest
+from tenacity import Retrying, stop_after_attempt, wait_fixed
 
+from framework.artifacts import ACPI_GUEST_KERNELS, pin_guest_kernel
 from framework.utils_iperf import IPerf3Test, emit_iperf3_metrics
-from framework.utils_vsock import VSOCK_UDS_PATH, make_host_port_path
+from framework.utils_vsock import (
+    ECHO_SERVER_PORT,
+    VSOCK_UDS_PATH,
+    boot_vsock_vm,
+    make_host_port_path,
+    start_guest_echo_server,
+)
+
+pytestmark = pin_guest_kernel(ACPI_GUEST_KERNELS)
+
+
+@pytest.fixture
+def vsock_uvm(uvm, request):
+    """Fixture to initialize a microVM with vsock device for perf tests."""
+    vcpus = request.param if hasattr(request, "param") else 1
+
+    return boot_vsock_vm(
+        uvm,
+        vcpu_count=vcpus,
+        mem_size_mib=1024,
+        log_level="Info",
+        emit_metrics=True,
+        pin_threads=True,
+    )
 
 
 class VsockIPerf3Test(IPerf3Test):
@@ -69,13 +96,30 @@ class VsockIPerf3Test(IPerf3Test):
         return super().guest_command(port_offset).with_arg("--vsock")
 
 
+def consume_vsock_ping_output(ping_output):
+    """Parse vsock_helper ping output.
+
+    Output format:
+    rtt=123 us seq=1
+    rtt=234 us seq=2
+    ...
+
+    Yields RTT values in microseconds as ints.
+    """
+    pattern = r"rtt=(\d+) us seq=\d+"
+    for line in ping_output.strip().split("\n"):
+        match = re.match(pattern, line)
+        if match:
+            yield int(match.group(1))
+
+
 @pytest.mark.timeout(120)
 @pytest.mark.nonci
 @pytest.mark.parametrize("vcpus", [1, 2], ids=["1vcpu", "2vcpu"])
 @pytest.mark.parametrize("payload_length", ["64K", "1024K"], ids=["p64K", "p1024K"])
 @pytest.mark.parametrize("mode", ["g2h", "h2g"])
 def test_vsock_throughput(
-    uvm_plain_acpi,
+    uvm,
     vcpus,
     payload_length,
     mode,
@@ -87,7 +131,7 @@ def test_vsock_throughput(
     """
 
     mem_size_mib = 1024
-    vm = uvm_plain_acpi
+    vm = uvm
     vm.spawn(log_level="Info", emit_metrics=True)
     vm.basic_config(vcpu_count=vcpus, mem_size_mib=mem_size_mib)
     vm.add_net_iface()
@@ -119,3 +163,117 @@ def test_vsock_throughput(
         )
 
     emit_iperf3_metrics(metrics, data, VsockIPerf3Test.WARMUP_SEC)
+
+
+@pytest.mark.nonci
+@pytest.mark.parametrize("vsock_uvm", [1, 2], indirect=True, ids=["1vcpu", "2vcpu"])
+def test_vsock_latency_g2h(vsock_uvm, metrics, bin_vsock_path):
+    """
+    Test VSOCK latency for guest-to-host connections.
+
+    This starts an echo server on the host and measures RTT from
+    the guest using the vsock_helper ping command.
+    """
+    rounds = 15
+    requests_per_round = 30
+
+    vm = vsock_uvm
+
+    metrics.set_dimensions(
+        {
+            "performance_test": "test_vsock_latency",
+            "mode": "g2h",
+            **vm.dimensions,
+        }
+    )
+
+    vm.ssh.scp_put(bin_vsock_path, "/tmp/vsock_helper")
+
+    server_port_path = os.path.join(
+        vm.path, make_host_port_path(VSOCK_UDS_PATH, ECHO_SERVER_PORT)
+    )
+
+    echo_server = subprocess.Popen(
+        ["socat", f"UNIX-LISTEN:{server_port_path},fork,backlog=5", "exec:'/bin/cat'"]
+    )
+
+    try:
+        for attempt in Retrying(
+            wait=wait_fixed(0.2),
+            stop=stop_after_attempt(5),
+            reraise=True,
+        ):
+            with attempt:
+                assert Path(server_port_path).exists()
+
+        vm.create_jailed_resource(server_port_path)
+
+        samples = []
+        for _ in range(rounds):
+            # Send one extra request per round for warmup and discard the first sample.
+            _, ping_output, _ = vm.ssh.check_output(
+                f"/tmp/vsock_helper ping 2 {ECHO_SERVER_PORT} {requests_per_round + 1}"
+            )
+            samples.extend(list(consume_vsock_ping_output(ping_output))[1:])
+
+        assert (
+            len(samples) == rounds * requests_per_round
+        ), f"Expected {rounds * requests_per_round} samples, got {len(samples)}"
+
+        for sample in samples:
+            metrics.put_metric("vsock_ping_latency", sample, "Microseconds")
+
+    finally:
+        echo_server.terminate()
+        rc = echo_server.wait()
+        # socat exits with 128 + 15 (SIGTERM)
+        assert rc == 143
+
+
+@pytest.mark.nonci
+@pytest.mark.parametrize("vsock_uvm", [1, 2], indirect=True, ids=["1vcpu", "2vcpu"])
+def test_vsock_latency_h2g(vsock_uvm, metrics, bin_vsock_path):
+    """
+    Test VSOCK latency for host-to-guest connections.
+
+    This starts an echo server in the guest and measures RTT from
+    the host using the vsock_helper ping-uds command.
+    """
+    rounds = 15
+    requests_per_round = 30
+
+    vm = vsock_uvm
+
+    metrics.set_dimensions(
+        {
+            "performance_test": "test_vsock_latency",
+            "mode": "h2g",
+            **vm.dimensions,
+        }
+    )
+
+    uds_path = start_guest_echo_server(vm)
+
+    samples = []
+    for _ in range(rounds):
+        # Send one extra request per round for warmup and discard the first sample.
+        result = subprocess.run(
+            [
+                bin_vsock_path,
+                "ping-uds",
+                uds_path,
+                str(ECHO_SERVER_PORT),
+                str(requests_per_round + 1),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        samples.extend(list(consume_vsock_ping_output(result.stdout))[1:])
+
+    assert (
+        len(samples) == rounds * requests_per_round
+    ), f"Expected {rounds * requests_per_round} samples, got {len(samples)}"
+
+    for sample in samples:
+        metrics.put_metric("vsock_ping_latency", sample, "Microseconds")

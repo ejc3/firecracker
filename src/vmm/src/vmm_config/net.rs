@@ -1,7 +1,6 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::convert::TryInto;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
@@ -9,7 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use super::RateLimiterConfig;
 use crate::VmmError;
+use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::net::{Net, TapError};
+use crate::logger::warn;
+use crate::rate_limiter::RateLimiter;
 use crate::utils::net::mac::MacAddr;
 
 /// This struct represents the strongly typed equivalent of the json body from net iface
@@ -23,6 +25,8 @@ pub struct NetworkInterfaceConfig {
     pub host_dev_name: String,
     /// Guest MAC address.
     pub guest_mac: Option<MacAddr>,
+    /// Maximum Transmission Unit to advertise to the guest via VIRTIO_NET_F_MTU.
+    pub mtu: Option<u16>,
     /// Rate Limiter for received packages.
     pub rx_rate_limiter: Option<RateLimiterConfig>,
     /// Rate Limiter for transmitted packages.
@@ -34,9 +38,10 @@ impl From<&Net> for NetworkInterfaceConfig {
         let rx_rl: RateLimiterConfig = net.rx_rate_limiter().into();
         let tx_rl: RateLimiterConfig = net.tx_rate_limiter().into();
         NetworkInterfaceConfig {
-            iface_id: net.id().clone(),
+            iface_id: net.id().to_string(),
             host_dev_name: net.iface_name(),
             guest_mac: net.guest_mac().copied(),
+            mtu: net.mtu(),
             rx_rate_limiter: rx_rl.into_option(),
             tx_rate_limiter: tx_rl.into_option(),
         }
@@ -63,8 +68,6 @@ pub struct NetworkInterfaceUpdateConfig {
 pub enum NetworkInterfaceError {
     /// Could not create the network device: {0}
     CreateNetworkDevice(#[from] crate::devices::virtio::net::NetError),
-    /// Cannot create the rate limiter: {0}
-    CreateRateLimiter(#[from] std::io::Error),
     /// Unable to update the net device: {0}
     DeviceUpdate(#[from] VmmError),
     /// The MAC address is already in use: {0}
@@ -108,7 +111,7 @@ impl NetBuilder {
             let mac_conflict = |net: &Arc<Mutex<Net>>| {
                 let net = net.lock().expect("Poisoned lock");
                 // Check if another net dev has same MAC.
-                Some(mac_address) == net.guest_mac() && &netif_config.iface_id != net.id()
+                Some(mac_address) == net.guest_mac() && netif_config.iface_id != net.id()
             };
             // Validate there is no Mac conflict.
             // No need to validate host_dev_name conflict. In such a case,
@@ -124,8 +127,13 @@ impl NetBuilder {
         if let Some(index) = self
             .net_devices
             .iter()
-            .position(|net| net.lock().expect("Poisoned lock").id() == &netif_config.iface_id)
+            .position(|net| net.lock().expect("Poisoned lock").id() == netif_config.iface_id)
         {
+            warn!(
+                "Replacing existing network device '{}'. The previous device configuration will \
+                 be destroyed.",
+                netif_config.iface_id
+            );
             self.net_devices.swap_remove(index);
         }
 
@@ -140,22 +148,21 @@ impl NetBuilder {
     pub fn create_net(cfg: NetworkInterfaceConfig) -> Result<Net, NetworkInterfaceError> {
         let rx_rate_limiter = cfg
             .rx_rate_limiter
-            .map(super::RateLimiterConfig::try_into)
-            .transpose()
-            .map_err(NetworkInterfaceError::CreateRateLimiter)?;
+            .map(RateLimiter::from)
+            .unwrap_or_default();
         let tx_rate_limiter = cfg
             .tx_rate_limiter
-            .map(super::RateLimiterConfig::try_into)
-            .transpose()
-            .map_err(NetworkInterfaceError::CreateRateLimiter)?;
+            .map(RateLimiter::from)
+            .unwrap_or_default();
 
         // Create and return the Net device
         crate::devices::virtio::net::Net::new(
             cfg.iface_id,
             &cfg.host_dev_name,
             cfg.guest_mac,
-            rx_rate_limiter.unwrap_or_default(),
-            tx_rate_limiter.unwrap_or_default(),
+            rx_rate_limiter,
+            tx_rate_limiter,
+            cfg.mtu,
         )
         .map_err(NetworkInterfaceError::CreateNetworkDevice)
     }
@@ -188,6 +195,7 @@ mod tests {
             iface_id: String::from(id),
             host_dev_name: String::from(name),
             guest_mac: Some(MacAddr::from_str(mac).unwrap()),
+            mtu: None,
             rx_rate_limiter: RateLimiterConfig::default().into_option(),
             tx_rate_limiter: RateLimiterConfig::default().into_option(),
         }
@@ -199,6 +207,7 @@ mod tests {
                 iface_id: self.iface_id.clone(),
                 host_dev_name: self.host_dev_name.clone(),
                 guest_mac: self.guest_mac,
+                mtu: self.mtu,
                 rx_rate_limiter: None,
                 tx_rate_limiter: None,
             }
@@ -333,6 +342,7 @@ mod tests {
             Some(MacAddr::from_str(guest_mac).unwrap()),
             RateLimiter::default(),
             RateLimiter::default(),
+            None,
         )
         .unwrap();
 

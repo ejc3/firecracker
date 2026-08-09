@@ -4,7 +4,6 @@
 use std::sync::Arc;
 
 use event_manager::{EventOps, Events, MutEventSubscriber};
-use log::info;
 use vmm_sys_util::eventfd::EventFd;
 
 use super::BlockError;
@@ -12,8 +11,7 @@ use super::persist::{BlockConstructorArgs, BlockState};
 use super::vhost_user::device::{VhostUserBlock, VhostUserBlockConfig};
 use super::virtio::device::{VirtioBlock, VirtioBlockConfig};
 use crate::devices::virtio::ActivateError;
-use crate::devices::virtio::device::VirtioDevice;
-use crate::devices::virtio::generated::virtio_ids::VIRTIO_ID_BLOCK;
+use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::queue::{InvalidAvailIdx, Queue};
 use crate::devices::virtio::transport::VirtioInterrupt;
 use crate::impl_device_type;
@@ -82,24 +80,10 @@ impl Block {
         }
     }
 
-    pub fn prepare_save(&mut self) {
-        match self {
-            Self::Virtio(b) => b.prepare_save(),
-            Self::VhostUser(b) => b.prepare_save(),
-        }
-    }
-
     pub fn process_virtio_queues(&mut self) -> Result<(), InvalidAvailIdx> {
         match self {
             Self::Virtio(b) => b.process_virtio_queues(),
             Self::VhostUser(_) => Ok(()),
-        }
-    }
-
-    pub fn id(&self) -> &str {
-        match self {
-            Self::Virtio(b) => &b.id,
-            Self::VhostUser(b) => &b.id,
         }
     }
 
@@ -133,7 +117,14 @@ impl Block {
 }
 
 impl VirtioDevice for Block {
-    impl_device_type!(VIRTIO_ID_BLOCK);
+    impl_device_type!(VirtioDeviceType::Block);
+
+    fn id(&self) -> &str {
+        match self {
+            Self::Virtio(b) => b.id(),
+            Self::VhostUser(b) => b.id(),
+        }
+    }
 
     fn avail_features(&self) -> u64 {
         match self {
@@ -184,10 +175,10 @@ impl VirtioDevice for Block {
         }
     }
 
-    fn read_config(&self, offset: u64, data: &mut [u8]) {
+    fn config_as_bytes(&self) -> &[u8] {
         match self {
-            Self::Virtio(b) => b.read_config(offset, data),
-            Self::VhostUser(b) => b.read_config(offset, data),
+            Self::Virtio(b) => b.config_as_bytes(),
+            Self::VhostUser(b) => b.config_as_bytes(),
         }
     }
 
@@ -216,15 +207,24 @@ impl VirtioDevice for Block {
         }
     }
 
-    fn kick(&mut self) {
-        // If device is activated, kick the block queue(s) to make up for any
-        // pending or in-flight epoll events we may have not captured in
-        // snapshot. No need to kick Ratelimiters
-        // because they are restored 'unblocked' so
-        // any inflight `timer_fd` events can be safely discarded.
-        if self.is_activated() {
-            info!("kick block {}.", self.id());
-            self.process_virtio_queues();
+    fn deactivate(&mut self) {
+        match self {
+            Self::Virtio(b) => b.deactivate(),
+            Self::VhostUser(b) => b.deactivate(),
+        }
+    }
+
+    fn _reset(&mut self) -> bool {
+        match self {
+            Self::Virtio(b) => b._reset(),
+            Self::VhostUser(b) => b._reset(),
+        }
+    }
+
+    fn prepare_save(&mut self) {
+        match self {
+            Self::Virtio(b) => b.prepare_save(),
+            Self::VhostUser(b) => b.prepare_save(),
         }
     }
 }

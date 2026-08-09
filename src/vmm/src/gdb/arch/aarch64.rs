@@ -64,6 +64,8 @@ const PTE_ADDRESS_MASK: u64 = !0b111u64;
 fn read_address(vmm: &Vmm, address: u64) -> Result<u64, GdbTargetError> {
     let mut buf = [0; 8];
     vmm.vm
+        .as_kvm()
+        .expect("GDB requires KVM")
         .guest_memory()
         .read(&mut buf, GuestAddress(address))?;
 
@@ -193,6 +195,7 @@ const PSTATE_ID: u64 = arm64_core_reg_id!(KVM_REG_SIZE_U64, offset_of!(user_pt_r
 ///  - Single step
 ///  - Re-insert the SW breakpoint
 ///  - Resume
+///
 /// However, with IRQ enabled the single step takes us into the IRQ handler so when we resume we
 /// immediately hit the SW breapoint we just re-inserted getting stuck in a loop.
 fn toggle_interrupts(vcpu_fd: &VcpuFd, enable: bool) -> Result<(), GdbTargetError> {

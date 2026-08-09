@@ -17,7 +17,7 @@ source "$GIT_ROOT_DIR/tools/functions"
 # Make sure we have all the needed tools
 function install_dependencies {
     apt update
-    apt install -y bc flex bison gcc make libelf-dev libssl-dev squashfs-tools busybox-static tree cpio curl patch docker.io
+    apt install -y bc flex bison gcc make libelf-dev libssl-dev squashfs-tools busybox-static tree cpio curl patch docker.io dwarves
 
     # Install Go
     version=$(curl -s https://go.dev/VERSION?m=text | head -n 1)
@@ -27,16 +27,9 @@ function install_dependencies {
     esac
     curl -LO http://go.dev/dl/${archive}
     tar -C /usr/local -xzf $archive
-    export PATH=$PATH:/usr/local/go/bin
+    export PATH=/usr/local/go/bin:$PATH
     go version
     rm $archive
-}
-
-function prepare_docker {
-    nohup /usr/bin/dockerd --host=unix:///var/run/docker.sock --host=tcp://127.0.0.1:2375 &
-
-    # Wait for Docker socket to be created
-    timeout 15 sh -c "until docker info; do echo .; sleep 1; done"
 }
 
 function compile_and_install {
@@ -56,45 +49,11 @@ function compile_and_install {
 }
 
 # Build a rootfs
-function build_rootfs {
-    local ROOTFS_NAME=$1
-    local flavour=${2}
-    local FROM_CTR=public.ecr.aws/ubuntu/ubuntu:$flavour
-    local rootfs="tmp_rootfs"
-    mkdir -pv "$rootfs"
-
-    # Launch Docker
+function build_ci_rootfs {
+    local IMAGE_NAME=$1
+    local SETUP_SCRIPT=$2
     prepare_docker
-
-    cp -rvf overlay/* $rootfs
-
-    # curl -O https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64-root.tar.xz
-    #
-    # TBD use systemd-nspawn instead of Docker
-    #   sudo tar xaf ubuntu-22.04-minimal-cloudimg-amd64-root.tar.xz -C $rootfs
-    #   sudo systemd-nspawn --resolv-conf=bind-uplink -D $rootfs
-    docker run --env rootfs=$rootfs --privileged --rm -i -v "$PWD:/work" -w /work "$FROM_CTR" bash -s <<'EOF'
-
-./chroot.sh
-
-# Copy everything we need to the bind-mounted rootfs image file
-dirs="bin etc home lib lib64 root sbin usr"
-for d in $dirs; do tar c "/$d" | tar x -C $rootfs; done
-
-# Make mountpoints
-mkdir -pv $rootfs/{dev,proc,sys,run,tmp,var/lib/systemd}
-# So apt works
-mkdir -pv $rootfs/var/lib/dpkg/
-EOF
-
-    # TBD what abt /etc/hosts?
-    echo | tee $rootfs/etc/resolv.conf
-
-    rootfs_img="$OUTPUT_DIR/$ROOTFS_NAME.squashfs"
-    mv $rootfs/root/manifest $OUTPUT_DIR/$ROOTFS_NAME.manifest
-    mksquashfs $rootfs $rootfs_img -all-root -noappend -comp zstd
-    rm -rf $rootfs
-    rm -f nohup.out
+    build_rootfs "$IMAGE_NAME" "$OUTPUT_DIR" "$PWD/rootfs/overlay" "$SETUP_SCRIPT"
 }
 
 
@@ -141,19 +100,28 @@ function clone_amazon_linux_repo {
 }
 
 # prints the git tag corresponding to the newest and best matching the provided kernel version $1
-# this means that if a microvm kernel exists, the tag returned will be of the form
+# Kernel 6.18 follows the regular AL2023 release cadence and uses tags of the form
 #
-#    microvm-kernel-$1.<patch number>.amzn2[023]
+#    kernel.*$1.<patch number>.amzn2023
+#
+# Other versions prefer a microvm kernel tag of the form
+#
+#    microvm-kernel.*$1.<patch number>.amzn2[023]
 #
 # otherwise choose the newest tag matching
 #
-#    kernel-$1.<patch number>.amzn2[023]
+#    kernel.*$1.<patch number>.amzn2[023]
 function get_tag {
     local KERNEL_VERSION=$1
 
+    if [[ "$KERNEL_VERSION" == "6.18" ]]; then
+        git --no-pager tag -l --sort=-v:refname | grep "^kernel.*$KERNEL_VERSION\..*\.amzn2023" | head -n1
+        return
+    fi
+
     # list all tags from newest to oldest
-    (git --no-pager tag -l --sort=-creatordate | grep "microvm-kernel-$1\..*\.amzn2" \
-        || git --no-pager tag -l --sort=-creatordate | grep "kernel-$1\..*\.amzn2") | head -n1
+    (git --no-pager tag -l --sort=-v:refname | grep "microvm-kernel.*$KERNEL_VERSION\..*\.amzn2" \
+        || git --no-pager tag -l --sort=-v:refname | grep "kernel.*$KERNEL_VERSION\..*\.amzn2") | head -n1
 }
 
 function build_al_kernel {
@@ -165,17 +133,31 @@ function build_al_kernel {
     # fails immediately after clone because nothing is checked out
     make distclean || true
 
-    git checkout $(get_tag $KERNEL_VERSION)
+    TAG=$(get_tag $KERNEL_VERSION)
+
+    git checkout $TAG
+    # Create a temporary branch where we can apply patches and then
+    # easily discard them
+    git checkout -B tmp-$TAG
+
+    # Apply any patchset we have for our kernels
+    for patchset in ../patches/*; do
+        [ -d "$patchset/$KERNEL_VERSION" ] || continue
+        echo "Applying patchset ${patchset}/${KERNEL_VERSION}"
+        git apply ${patchset}/${KERNEL_VERSION}/*.patch
+    done
 
     arch=$(uname -m)
     if [ "$arch" = "x86_64" ]; then
         format="elf"
-        target="vmlinux"
-        binary_path="$target"
+        target="vmlinux bzImage"
+        binary_path="vmlinux"
+        bzimage_path="arch/x86/boot/bzImage"
     elif [ "$arch" = "aarch64" ]; then
         format="pe"
         target="Image"
         binary_path="arch/arm64/boot/$target"
+        bzimage_path=""
     else
         echo "FATAL: Unsupported architecture!"
         exit 1
@@ -193,12 +175,21 @@ function build_al_kernel {
     OUTPUT_FILE=$OUTPUT_DIR/vmlinux-$normalized_version$flavour
     cp -v $binary_path $OUTPUT_FILE
     cp -v .config $OUTPUT_FILE.config
+    if [ -n "$bzimage_path" ]; then
+        cp -v $bzimage_path $OUTPUT_DIR/bzImage-$normalized_version$flavour
+    fi
+
+    # Undo any patches previously applied, so that we can build the same kernel with different
+    # configs, e.g. no-acpi
+    git reset --hard HEAD
+    git clean -f -d
+    git checkout -
 
     popd &>/dev/null
 }
 
 function prepare_and_build_rootfs {
-    BIN_DIR=overlay/usr/local/bin
+    BIN_DIR=rootfs/overlay/usr/local/bin
 
     SRCS=(init.c fillmem.c fast_page_fault_helper.c readmem.c go_sdk_cred_provider.go go_sdk_cred_provider_with_custom_endpoint.go)
     if [ $ARCH == "aarch64" ]; then
@@ -209,7 +200,8 @@ function prepare_and_build_rootfs {
         compile_and_install $BIN_DIR/$SRC
     done
 
-    build_rootfs ubuntu-24.04 noble
+    build_ci_rootfs ubuntu:24.04 "rootfs/setup-ubuntu-ci.sh"
+    build_ci_rootfs amazonlinux:2023 "rootfs/setup-al2023-ci.sh"
     build_initramfs
 
     for SRC in ${SRCS[@]}; do
@@ -239,7 +231,7 @@ function build_al_kernels {
         die "Too many arguments in '$(basename $0) kernels' command. Please use \`$0 help\` for help."
     else
         KERNEL_VERSION=$1
-        if [[ "$KERNEL_VERSION" != @(5.10|5.10-no-acpi|6.1) ]]; then
+        if [[ "$KERNEL_VERSION" != @(5.10|5.10-no-acpi|6.1|6.18) ]]; then
             die "Unsupported kernel version: '$KERNEL_VERSION'. Please use \`$0 help\` for help."
         fi
     fi
@@ -247,19 +239,19 @@ function build_al_kernels {
     clone_amazon_linux_repo
 
     CI_CONFIG="$PWD/guest_configs/ci.config"
-    PCIE_CONFIG="$PWD/guest_configs/pcie.config"
-    PMEM_CONFIG="$PWD/guest_configs/virtio-pmem.config"
-    MEM_CONFIG="$PWD/guest_configs/virtio-mem.config"
-    VMCLOCK_CONFIG="$PWD/guest_configs/vmclock.config"
+    NVME_CONFIG="$PWD/guest_configs/nvme.config"
 
     if [[ "$KERNEL_VERSION" == @(all|5.10) ]]; then
-        build_al_kernel $PWD/guest_configs/microvm-kernel-ci-$ARCH-5.10.config "$CI_CONFIG" "$PCIE_CONFIG" "$PMEM_CONFIG" "$MEM_CONFIG"
+        build_al_kernel $PWD/guest_configs/microvm-kernel-ci-$ARCH-5.10.config "$CI_CONFIG" "$NVME_CONFIG"
     fi
     if [[ $ARCH == "x86_64" && "$KERNEL_VERSION" == @(all|5.10-no-acpi) ]]; then
-        build_al_kernel $PWD/guest_configs/microvm-kernel-ci-$ARCH-5.10-no-acpi.config "$CI_CONFIG" "$PCIE_CONFIG" "$PMEM_CONFIG" "$MEM_CONFIG"
+        build_al_kernel $PWD/guest_configs/microvm-kernel-ci-$ARCH-5.10-no-acpi.config "$CI_CONFIG" "$NVME_CONFIG"
     fi
     if [[ "$KERNEL_VERSION" == @(all|6.1) ]]; then
-        build_al_kernel $PWD/guest_configs/microvm-kernel-ci-$ARCH-6.1.config "$CI_CONFIG" "$PCIE_CONFIG" "$PMEM_CONFIG" "$MEM_CONFIG" "$VMCLOCK_CONFIG"
+        build_al_kernel $PWD/guest_configs/microvm-kernel-ci-$ARCH-6.1.config "$CI_CONFIG" "$NVME_CONFIG"
+    fi
+    if [[ "$KERNEL_VERSION" == @(all|6.18) ]]; then
+        build_al_kernel $PWD/guest_configs/microvm-kernel-ci-$ARCH-6.18.config "$CI_CONFIG" "$NVME_CONFIG"
     fi
 
     # Build debug kernels
@@ -268,12 +260,16 @@ function build_al_kernels {
     OUTPUT_DIR=$OUTPUT_DIR/debug
     mkdir -pv $OUTPUT_DIR
     if [[ "$KERNEL_VERSION" == @(all|5.10) ]]; then
-        build_al_kernel "$PWD/guest_configs/microvm-kernel-ci-$ARCH-5.10.config" "$CI_CONFIG" "$PCIE_CONFIG" "$PMEM_CONFIG" "$MEM_CONFIG" "$FTRACE_CONFIG" "$DEBUG_CONFIG"
+        build_al_kernel "$PWD/guest_configs/microvm-kernel-ci-$ARCH-5.10.config" "$CI_CONFIG" "$NVME_CONFIG" "$FTRACE_CONFIG" "$DEBUG_CONFIG"
         vmlinux_split_debuginfo $OUTPUT_DIR/vmlinux-5.10.*
     fi
     if [[ "$KERNEL_VERSION" == @(all|6.1) ]]; then
-        build_al_kernel "$PWD/guest_configs/microvm-kernel-ci-$ARCH-6.1.config" "$CI_CONFIG" "$PCIE_CONFIG" "$PMEM_CONFIG" "$MEM_CONFIG" "$FTRACE_CONFIG" "$DEBUG_CONFIG" "$VMCLOCK_CONFIG"
+        build_al_kernel "$PWD/guest_configs/microvm-kernel-ci-$ARCH-6.1.config" "$CI_CONFIG" "$NVME_CONFIG" "$FTRACE_CONFIG" "$DEBUG_CONFIG"
         vmlinux_split_debuginfo $OUTPUT_DIR/vmlinux-6.1.*
+    fi
+    if [[ "$KERNEL_VERSION" == @(all|6.18) ]]; then
+        build_al_kernel "$PWD/guest_configs/microvm-kernel-ci-$ARCH-6.18.config" "$CI_CONFIG" "$NVME_CONFIG" "$FTRACE_CONFIG" "$DEBUG_CONFIG"
+        vmlinux_split_debuginfo $OUTPUT_DIR/vmlinux-6.18.*
     fi
 }
 
@@ -299,7 +295,7 @@ Available commands:
         Builds our the currently supported CI kernels.
 
         version: Optionally choose a kernel version to build. Supported
-                 versions are: 5.10, 5.10-no-acpi or 6.1.
+                 versions are: 5.10, 5.10-no-acpi, 6.1 or 6.18.
 
     help
         Displays the help message and exits.

@@ -6,6 +6,8 @@ import platform
 
 import pytest
 
+from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel
+
 
 def max_devices(uvm):
     """
@@ -18,22 +20,22 @@ def max_devices(uvm):
     match platform.machine():
         case "aarch64":
             # On aarch64, IRQs are available from 32 to 127. We always use one IRQ each for
-            # the VMGenID, RTC and serial devices, so the maximum number of devices supported
-            # at the same time is 93.
-            return 93
+            # the VMGenID, VMClock, RTC and serial devices, so the maximum number of devices
+            # supported at the same time is 92.
+            return 92
         case "x86_64":
-            # IRQs are available from 5 to 23. We always use one IRQ for VMGenID device, so
-            # the maximum number of devices supported at the same time is 18.
-            return 18
+            # IRQs are available from 5 to 23. We always use one IRQ for VMGenID and VMClock
+            # devices, so the maximum number of devices supported at the same time is 17.
+            return 17
         case _:
             raise ValueError("Unknown platform")
 
 
-def test_attach_maximum_devices(uvm_plain_any):
+def test_attach_maximum_devices(uvm):
     """
     Test attaching maximum number of devices to the microVM.
     """
-    test_microvm = uvm_plain_any
+    test_microvm = uvm
     test_microvm.memory_monitor = None
     test_microvm.spawn()
 
@@ -53,11 +55,12 @@ def test_attach_maximum_devices(uvm_plain_any):
         test_microvm.ssh_iface(i).check_output("sync")
 
 
-def test_attach_too_many_devices(uvm_plain):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_attach_too_many_devices(uvm):
     """
     Test attaching to a microVM more devices than available IRQs.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.memory_monitor = None
     test_microvm.spawn()
 
@@ -74,12 +77,9 @@ def test_attach_too_many_devices(uvm_plain):
     # Attempting to start a microVM with more than
     # `MAX_DEVICES_ATTACHED` devices should fail.
     error_str = (
-        ("Could not find an available device slot on the PCI bus.")
+        "Could not find an available device slot on the PCI bus."
         if test_microvm.pci_enabled
-        else (
-            "Failed to allocate requested resource: The requested resource"
-            " is not available."
-        )
+        else "Could not allocate GSI: The requested resource is not available."
     )
     with pytest.raises(RuntimeError, match=error_str):
         test_microvm.start()

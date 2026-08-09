@@ -1,15 +1,19 @@
 # Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Integration tests for Firecracker's huge pages support"""
+
 import signal
 import time
 
 import pytest
 
 from framework import utils
+from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel
 from framework.microvm import HugePagesConfig
 from framework.properties import global_props
 from framework.utils_ftrace import ftrace_events
+
+pytestmark = pin_guest_kernel(GUEST_KERNEL_DEFAULT)
 
 
 def check_hugetlbfs_in_use(pid: int, allocation_name: str):
@@ -54,21 +58,21 @@ def check_hugetlbfs_in_use(pid: int, allocation_name: str):
     assert kernel_page_size_kib > 4
 
 
-def test_hugetlbfs_boot(uvm_plain):
+def test_hugetlbfs_boot(uvm):
     """Tests booting a microvm with guest memory backed by 2MB hugetlbfs pages"""
 
-    uvm_plain.spawn()
-    uvm_plain.basic_config(huge_pages=HugePagesConfig.HUGETLBFS_2MB, mem_size_mib=128)
-    uvm_plain.add_net_iface()
-    uvm_plain.start()
+    uvm.spawn()
+    uvm.basic_config(huge_pages=HugePagesConfig.HUGETLBFS_2MB, mem_size_mib=128)
+    uvm.add_net_iface()
+    uvm.start()
 
     check_hugetlbfs_in_use(
-        uvm_plain.firecracker_pid,
+        uvm.firecracker_pid,
         "/anon_hugepage",
     )
 
 
-def test_hugetlbfs_snapshot(microvm_factory, uvm_plain, snapshot_type):
+def test_hugetlbfs_snapshot(microvm_factory, uvm, snapshot_type):
     """
     Test hugetlbfs snapshot restore via uffd
 
@@ -77,7 +81,7 @@ def test_hugetlbfs_snapshot(microvm_factory, uvm_plain, snapshot_type):
     """
 
     ### Create Snapshot ###
-    vm = uvm_plain
+    vm = uvm
     vm.memory_monitor = None
     vm.spawn()
     vm.basic_config(
@@ -105,7 +109,7 @@ def test_hugetlbfs_snapshot(microvm_factory, uvm_plain, snapshot_type):
 @pytest.mark.parametrize("huge_pages", HugePagesConfig)
 def test_ept_violation_count(
     microvm_factory,
-    uvm_plain,
+    uvm,
     metrics,
     huge_pages,
 ):
@@ -115,7 +119,7 @@ def test_ept_violation_count(
     """
 
     ### Create Snapshot ###
-    vm = uvm_plain
+    vm = uvm
     vm.memory_monitor = None
     vm.spawn()
     vm.basic_config(huge_pages=huge_pages, mem_size_mib=256)

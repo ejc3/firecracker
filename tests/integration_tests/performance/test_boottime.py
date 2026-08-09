@@ -8,12 +8,17 @@ import time
 
 import pytest
 
+from framework.artifacts import ACPI_GUEST_KERNELS, pin_guest_kernel, pin_rootfs_mode
+from framework.microvm import HugePagesConfig
+
 # Regex for obtaining boot time from some string.
 
 DEFAULT_BOOT_ARGS = (
     "reboot=k panic=1 nomodule 8250.nr_uarts=0"
-    " i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd swiotlb=noforce"
+    " i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd swiotlb=noforce cryptomgr.notests"
 )
+
+pytestmark = pin_guest_kernel(ACPI_GUEST_KERNELS)
 
 
 def get_boottime_device_info(vm):
@@ -96,16 +101,17 @@ def get_systemd_analyze_times(microvm):
 
 def launch_vm_with_boot_timer(
     microvm_factory,
-    guest_kernel_acpi,
-    rootfs_rw,
+    guest_kernel,
+    rootfs,
     vcpu_count,
     mem_size_mib,
     pci_enabled,
     boot_from_pmem,
+    huge_pages=HugePagesConfig.NONE,
 ):
     """Launches a microVM with guest-timer and returns the reported metrics for it"""
     vm = microvm_factory.build(
-        guest_kernel_acpi, rootfs_rw, pci=pci_enabled, monitor_memory=False
+        guest_kernel, rootfs, pci=pci_enabled, monitor_memory=False
     )
     vm.jailer.extra_args.update({"boot-timer": None})
     vm.spawn()
@@ -115,6 +121,7 @@ def launch_vm_with_boot_timer(
             mem_size_mib=mem_size_mib,
             boot_args=DEFAULT_BOOT_ARGS + " init=/usr/local/bin/init",
             enable_entropy_device=True,
+            huge_pages=huge_pages,
         )
     else:
         vm.basic_config(
@@ -123,8 +130,9 @@ def launch_vm_with_boot_timer(
             mem_size_mib=mem_size_mib,
             boot_args=DEFAULT_BOOT_ARGS + " init=/usr/local/bin/init rootflags=dax",
             enable_entropy_device=True,
+            huge_pages=huge_pages,
         )
-        vm.add_pmem("pmem", rootfs_rw, True, True)
+        vm.add_pmem("pmem", rootfs, True, True)
 
     vm.add_net_iface()
     vm.start()
@@ -135,10 +143,10 @@ def launch_vm_with_boot_timer(
     return (vm, boot_time_us, cpu_boot_time_us)
 
 
-def test_boot_timer(microvm_factory, guest_kernel_acpi, rootfs, pci_enabled):
+def test_boot_timer(microvm_factory, guest_kernel, rootfs, pci_enabled):
     """Tests that the boot timer device works"""
     launch_vm_with_boot_timer(
-        microvm_factory, guest_kernel_acpi, rootfs, 1, 128, pci_enabled, False
+        microvm_factory, guest_kernel, rootfs, 1, 128, pci_enabled, False
     )
 
 
@@ -146,16 +154,21 @@ def test_boot_timer(microvm_factory, guest_kernel_acpi, rootfs, pci_enabled):
     "vcpu_count,mem_size_mib",
     [(1, 128), (1, 1024), (2, 2048), (4, 4096)],
 )
+@pin_rootfs_mode("rw")
 @pytest.mark.parametrize("boot_from_pmem", [True, False], ids=["PmemBoot", "BlockBoot"])
+@pytest.mark.parametrize(
+    "huge_pages", [HugePagesConfig.NONE, HugePagesConfig.TRANSPARENT], indirect=True
+)
 @pytest.mark.nonci
 def test_boottime(
     microvm_factory,
-    guest_kernel_acpi,
-    rootfs_rw,
+    guest_kernel,
+    rootfs,
     vcpu_count,
     mem_size_mib,
     boot_from_pmem,
     pci_enabled,
+    huge_pages,
     metrics,
 ):
     """Test boot time with different guest configurations"""
@@ -163,12 +176,13 @@ def test_boottime(
     for i in range(10):
         vm, boot_time_us, cpu_boot_time_us = launch_vm_with_boot_timer(
             microvm_factory,
-            guest_kernel_acpi,
-            rootfs_rw,
+            guest_kernel,
+            rootfs,
             vcpu_count,
             mem_size_mib,
             pci_enabled,
             boot_from_pmem,
+            huge_pages,
         )
 
         if i == 0:
@@ -176,6 +190,7 @@ def test_boottime(
                 {
                     "performance_test": "test_boottime",
                     "boot_from_pmem": str(boot_from_pmem),
+                    "huge_pages": str(huge_pages),
                     **vm.dimensions,
                 }
             )

@@ -4,6 +4,7 @@
 use std::fs::File;
 use std::io;
 
+use linux_loader::cmdline;
 use serde::{Deserialize, Serialize};
 
 /// Default guest kernel command line:
@@ -56,12 +57,34 @@ pub struct BootSource {
 /// Holds the kernel builder (created and validates based on BootSourceConfig).
 #[derive(Debug)]
 pub struct BootConfig {
-    /// The commandline validated against correctness.
-    pub cmdline: linux_loader::cmdline::Cmdline,
+    /// The commandline, if explicitly provided by the user. `None` means the
+    /// consumer should apply its own default (e.g. [`DEFAULT_KERNEL_CMDLINE`]).
+    pub cmdline: Option<cmdline::Cmdline>,
     /// The descriptor to the kernel file.
     pub kernel_file: File,
     /// The descriptor to the initrd file, if there is one.
     pub initrd_file: Option<File>,
+}
+
+/// Build a [`Cmdline`](cmdline::Cmdline) from a string.
+pub fn build_cmdline(s: &str) -> Result<cmdline::Cmdline, cmdline::Error> {
+    cmdline::Cmdline::try_from(s, crate::arch::CMDLINE_MAX_SIZE)
+}
+
+/// Append the `root=` (and `ro`/`rw`) arguments derived from a root block
+/// device to `cmdline`. Uses `root=PARTUUID=<uuid>` when a partuuid is
+/// available, otherwise `root=/dev/vda`.
+pub fn append_root_device_cmdline(
+    cmdline: &mut cmdline::Cmdline,
+    partuuid: Option<&str>,
+    read_only: bool,
+) -> Result<(), cmdline::Error> {
+    match partuuid {
+        Some(uuid) => cmdline.insert_str(format!("root=PARTUUID={uuid}"))?,
+        None => cmdline.insert_str("root=/dev/vda")?,
+    }
+    cmdline.insert_str(if read_only { "ro" } else { "rw" })?;
+    Ok(())
 }
 
 impl BootConfig {
@@ -78,13 +101,12 @@ impl BootConfig {
             None => None,
         };
 
-        let cmdline_str = match cfg.boot_args.as_ref() {
-            None => DEFAULT_KERNEL_CMDLINE,
-            Some(str) => str.as_str(),
+        let cmdline = match cfg.boot_args.as_ref() {
+            None => None,
+            Some(s) => {
+                Some(build_cmdline(s).map_err(|err| InvalidKernelCommandLine(err.to_string()))?)
+            }
         };
-        let cmdline =
-            linux_loader::cmdline::Cmdline::try_from(cmdline_str, crate::arch::CMDLINE_MAX_SIZE)
-                .map_err(|err| InvalidKernelCommandLine(err.to_string()))?;
 
         Ok(BootConfig {
             cmdline,
@@ -114,10 +136,7 @@ pub(crate) mod tests {
 
         let boot_cfg = BootConfig::new(&boot_src_cfg).unwrap();
         assert!(boot_cfg.initrd_file.is_none());
-        assert_eq!(
-            boot_cfg.cmdline.as_cstring().unwrap().as_bytes_with_nul(),
-            [DEFAULT_KERNEL_CMDLINE.as_bytes(), b"\0"].concat()
-        );
+        assert!(boot_cfg.cmdline.is_none());
     }
 
     #[test]
@@ -128,13 +147,14 @@ pub(crate) mod tests {
             kernel_image_path: "./vmlinux.bin".to_string(),
         };
 
-        let mut snapshot_data = vec![0u8; 1000];
-        Snapshot::new(&boot_src_cfg)
-            .save(&mut snapshot_data.as_mut_slice())
-            .unwrap();
-        let restored_boot_cfg = Snapshot::load_without_crc_check(snapshot_data.as_slice())
-            .unwrap()
-            .data;
+        // Use bitcode serialization directly for the test data
+        let serialized_data = bitcode::serialize(&boot_src_cfg).unwrap();
+        let restored_boot_cfg: BootSourceConfig = bitcode::deserialize(&serialized_data).unwrap();
         assert_eq!(boot_src_cfg, restored_boot_cfg);
+
+        // Also test with Snapshot wrapper
+        let snapshot_data = bitcode::serialize(&Snapshot::new(boot_src_cfg.clone())).unwrap();
+        let restored_snapshot = Snapshot::load_without_crc_check(&snapshot_data).unwrap();
+        assert_eq!(boot_src_cfg, restored_snapshot.data);
     }
 }

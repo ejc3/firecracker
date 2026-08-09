@@ -169,7 +169,11 @@ pub trait VsockChannel {
     fn recv_pkt(&mut self, pkt: &mut VsockPacketRx) -> Result<(), VsockError>;
 
     /// Write/send a packet through the channel.
-    fn send_pkt(&mut self, pkt: &VsockPacketTx) -> Result<(), VsockError>;
+    ///
+    /// The packet is always consumed (its virtio TX buffers can be returned to the guest):
+    /// host-side back-pressure is absorbed by buffering, and unrecoverable errors terminate
+    /// the offending connection rather than halting queue processing.
+    fn send_pkt(&mut self, pkt: &VsockPacketTx);
 
     /// Checks whether there is pending incoming data inside the channel, meaning that a subsequent
     /// call to `recv_pkt()` won't fail.
@@ -179,4 +183,11 @@ pub trait VsockChannel {
 /// The vsock backend, which is basically an epoll-event-driven vsock channel.
 /// Currently, the only implementation we have is `crate::devices::virtio::unix::muxer::VsockMuxer`,
 /// which translates guest-side vsock connections to host-side Unix domain socket connections.
-pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {}
+pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {
+    /// Activate the backend, adding its listeners to the poll set.
+    fn activate(&mut self) -> Result<(), VsockError>;
+
+    /// Reset the backend, dropping all active connections and removing its listeners
+    /// from the poll set.
+    fn reset(&mut self);
+}

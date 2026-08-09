@@ -6,7 +6,6 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use aws_lc_rs::rand;
-use log::info;
 use vm_memory::GuestMemoryError;
 use vmm_sys_util::eventfd::EventFd;
 
@@ -14,9 +13,8 @@ use super::metrics::METRICS;
 use super::{RNG_NUM_QUEUES, RNG_QUEUE};
 use crate::devices::DeviceError;
 use crate::devices::virtio::ActivateError;
-use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice};
+use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
-use crate::devices::virtio::generated::virtio_ids::VIRTIO_ID_RNG;
 use crate::devices::virtio::iov_deque::IovDequeError;
 use crate::devices::virtio::iovec::IoVecBufferMut;
 use crate::devices::virtio::queue::{FIRECRACKER_MAX_QUEUE_SIZE, InvalidAvailIdx, Queue};
@@ -27,6 +25,14 @@ use crate::rate_limiter::{RateLimiter, TokenType};
 use crate::vstate::memory::GuestMemoryMmap;
 
 pub const ENTROPY_DEV_ID: &str = "rng";
+
+/// Maximum number of bytes `handle_one()` will serve per request.
+///
+/// Overlapping descriptors within a single chain can cause `buffer.len()` to
+/// exceed the amount of distinct guest memory actually backing the request.
+/// Capping the per-request allocation to 64 KiB keeps host memory usage
+/// bounded regardless of how the descriptor chain is constructed.
+const MAX_ENTROPY_BYTES: u32 = 64 * 1024;
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum EntropyError {
@@ -53,7 +59,7 @@ pub struct Entropy {
     queue_events: Vec<EventFd>,
 
     // Device specific fields
-    rate_limiter: RateLimiter,
+    pub(crate) rate_limiter: RateLimiter,
 
     buffer: IoVecBufferMut,
 }
@@ -83,10 +89,6 @@ impl Entropy {
             rate_limiter,
             buffer: IoVecBufferMut::new()?,
         })
-    }
-
-    pub fn id(&self) -> &str {
-        ENTROPY_DEV_ID
     }
 
     fn signal_used_queue(&self) -> Result<(), DeviceError> {
@@ -119,14 +121,19 @@ impl Entropy {
             return Ok(0);
         }
 
-        let mut rand_bytes = vec![0; self.buffer.len() as usize];
+        // Cap the number of bytes we actually generate so that the host-side
+        // allocation stays bounded even when buffer.len() is inflated by
+        // overlapping descriptors in the chain.
+        let len = std::cmp::min(self.buffer.len(), MAX_ENTROPY_BYTES);
+
+        let mut rand_bytes = vec![0; len as usize];
         rand::fill(&mut rand_bytes).inspect_err(|_| {
             METRICS.host_rng_fails.inc();
         })?;
 
-        // It is ok to unwrap here. We are writing `iovec.len()` bytes at offset 0.
+        // It is ok to unwrap here. We are writing `len` bytes at offset 0.
         self.buffer.write_all_volatile_at(&rand_bytes, 0).unwrap();
-        Ok(self.buffer.len())
+        Ok(len)
     }
 
     fn process_entropy_queue(&mut self) -> Result<(), InvalidAvailIdx> {
@@ -254,7 +261,11 @@ impl Entropy {
 }
 
 impl VirtioDevice for Entropy {
-    impl_device_type!(VIRTIO_ID_RNG);
+    impl_device_type!(VirtioDeviceType::Rng);
+
+    fn id(&self) -> &str {
+        ENTROPY_DEV_ID
+    }
 
     fn queues(&self) -> &[Queue] {
         &self.queues
@@ -288,7 +299,9 @@ impl VirtioDevice for Entropy {
         self.acked_features = acked_features;
     }
 
-    fn read_config(&self, _offset: u64, mut _data: &mut [u8]) {}
+    fn config_as_bytes(&self) -> &[u8] {
+        &[]
+    }
 
     fn write_config(&mut self, _offset: u64, _data: &[u8]) {}
 
@@ -296,11 +309,21 @@ impl VirtioDevice for Entropy {
         self.device_state.is_activated()
     }
 
+    fn deactivate(&mut self) {
+        self.device_state = DeviceState::Inactive;
+    }
+
+    fn _reset(&mut self) -> bool {
+        true
+    }
+
     fn activate(
         &mut self,
         mem: GuestMemoryMmap,
         interrupt: Arc<dyn VirtioInterrupt>,
     ) -> Result<(), ActivateError> {
+        assert!(!self.is_activated());
+
         for q in self.queues.iter_mut() {
             q.initialize(&mem)
                 .map_err(ActivateError::QueueMemoryError)?;
@@ -313,13 +336,6 @@ impl VirtioDevice for Entropy {
         self.device_state = DeviceState::Activated(ActiveState { mem, interrupt });
         Ok(())
     }
-
-    fn kick(&mut self) {
-        if self.is_activated() {
-            info!("kick entropy {}.", self.id());
-            self.process_virtio_queues();
-        }
-    }
 }
 
 #[cfg(test)]
@@ -328,7 +344,7 @@ mod tests {
 
     use super::*;
     use crate::check_metric_after_block;
-    use crate::devices::virtio::device::VirtioDevice;
+    use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
     use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
     use crate::devices::virtio::test_utils::test::{
         VirtioTestDevice, VirtioTestHelper, create_virtio_mem,
@@ -366,25 +382,13 @@ mod tests {
     #[test]
     fn test_device_type() {
         let entropy_dev = default_entropy();
-        assert_eq!(entropy_dev.device_type(), VIRTIO_ID_RNG);
+        assert_eq!(entropy_dev.device_type(), VirtioDeviceType::Rng);
     }
 
     #[test]
-    fn test_read_config() {
+    fn test_config_as_bytes() {
         let entropy_dev = default_entropy();
-        let mut config = vec![0; 10];
-
-        entropy_dev.read_config(0, &mut config);
-        assert_eq!(config, vec![0; 10]);
-
-        entropy_dev.read_config(1, &mut config);
-        assert_eq!(config, vec![0; 10]);
-
-        entropy_dev.read_config(2, &mut config);
-        assert_eq!(config, vec![0; 10]);
-
-        entropy_dev.read_config(1024, &mut config);
-        assert_eq!(config, vec![0; 10]);
+        assert!(entropy_dev.config_as_bytes().is_empty());
     }
 
     #[test]
@@ -518,7 +522,7 @@ mod tests {
     fn test_bandwidth_rate_limiter() {
         let mem = create_virtio_mem();
         // Rate Limiter with 4000 bytes / sec allowance and no initial burst allowance
-        let device = Entropy::new(RateLimiter::new(4000, 0, 1000, 0, 0, 0).unwrap()).unwrap();
+        let device = Entropy::new(RateLimiter::new(4000, 0, 1000, 0, 0, 0)).unwrap();
         let mut th = VirtioTestHelper::<Entropy>::new(&mem, device);
 
         th.activate_device(&mem);
@@ -566,7 +570,7 @@ mod tests {
         let mem = create_virtio_mem();
         // Rate Limiter with unlimited bandwidth and allowance for 1 operation every 100 msec,
         // (10 ops/sec), without initial burst.
-        let device = Entropy::new(RateLimiter::new(0, 0, 0, 1, 0, 100).unwrap()).unwrap();
+        let device = Entropy::new(RateLimiter::new(0, 0, 0, 1, 0, 100)).unwrap();
         let mut th = VirtioTestHelper::<Entropy>::new(&mem, device);
 
         th.activate_device(&mem);
@@ -610,5 +614,126 @@ mod tests {
         );
         // The rate limiter event should have processed the pending buffer as well
         assert_eq!(METRICS.entropy_bytes.count(), entropy_bytes + 128);
+    }
+
+    /// Verify that handle_one() caps the host allocation to MAX_ENTROPY_BYTES
+    /// when overlapping descriptors inflate buffer.len() beyond the limit.
+    #[test]
+    fn test_handle_one_caps_overlapping_descriptors() {
+        use crate::devices::virtio::queue::VIRTQ_DESC_F_NEXT;
+        use crate::devices::virtio::test_utils::VirtQueue;
+        use crate::test_utils::single_region_mem;
+        use crate::vstate::memory::GuestAddress;
+
+        // 32 descriptors × 4 KiB = 128 KiB claimed, which exceeds MAX_ENTROPY_BYTES (64 KiB).
+        const N_DESC: u16 = 32;
+        const CHUNK: u32 = 4096;
+
+        let mem = single_region_mem(0x20000);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 256);
+        let mut queue = vq.create_queue();
+
+        let target: u64 = 0x10000;
+        for i in 0..N_DESC {
+            let flags = VIRTQ_DESC_F_WRITE | if i < N_DESC - 1 { VIRTQ_DESC_F_NEXT } else { 0 };
+            vq.dtable[i as usize].set(target, CHUNK, flags, i + 1);
+        }
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+
+        let head = queue.pop().unwrap().unwrap();
+        // SAFETY: `mem` is a valid guest memory region and `head` is a descriptor chain
+        // obtained from the virtqueue backed by that memory.
+        let buf = unsafe { IoVecBufferMut::<256>::from_descriptor_chain(&mem, head).unwrap() };
+        // buffer.len() is inflated well past the cap.
+        assert_eq!(buf.len(), u32::from(N_DESC) * CHUNK); // 128 KiB
+
+        let mut dev = default_entropy();
+        dev.buffer = buf;
+        let bytes = dev.handle_one().unwrap();
+
+        assert_eq!(
+            bytes,
+            MAX_ENTROPY_BYTES,
+            "handle_one() must cap at MAX_ENTROPY_BYTES ({MAX_ENTROPY_BYTES}), \
+             got {bytes} for inflated buffer.len() = {}",
+            u32::from(N_DESC) * CHUNK
+        );
+    }
+
+    /// Verify that handle_one() caps a large inflated buffer (~4 GiB from
+    /// 255 overlapping descriptors) to MAX_ENTROPY_BYTES.
+    #[test]
+    fn test_handle_one_caps_large_inflated_buffer() {
+        use crate::devices::virtio::queue::VIRTQ_DESC_F_NEXT;
+        use crate::devices::virtio::test_utils::VirtQueue;
+        use crate::test_utils::single_region_mem;
+        use crate::vstate::memory::GuestAddress;
+
+        const N_DESC: u16 = 255;
+        const CHUNK: u32 = 16 * 1024 * 1024; // 16 MiB
+        const TOTAL: u64 = (N_DESC as u64) * (CHUNK as u64); // ~4 GiB
+
+        let mem = single_region_mem((CHUNK as usize) + 0x100000);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 256);
+        let mut queue = vq.create_queue();
+
+        let target: u64 = 0x80000;
+        for i in 0..N_DESC {
+            let flags = VIRTQ_DESC_F_WRITE | if i < N_DESC - 1 { VIRTQ_DESC_F_NEXT } else { 0 };
+            vq.dtable[i as usize].set(target, CHUNK, flags, i + 1);
+        }
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+
+        let head = queue.pop().unwrap().unwrap();
+        // SAFETY: `mem` is a valid guest memory region and `head` is a descriptor chain
+        // obtained from the virtqueue backed by that memory.
+        let buf = unsafe { IoVecBufferMut::<256>::from_descriptor_chain(&mem, head).unwrap() };
+        assert_eq!(buf.len() as u64, TOTAL);
+
+        let mut dev = default_entropy();
+        dev.buffer = buf;
+        let bytes = dev.handle_one().unwrap();
+
+        assert_eq!(
+            bytes, MAX_ENTROPY_BYTES,
+            "handle_one() must cap at MAX_ENTROPY_BYTES, not allocate {} bytes",
+            TOTAL
+        );
+    }
+
+    /// Verify that a request within MAX_ENTROPY_BYTES is served in full
+    /// (the cap does not truncate legitimate small requests).
+    #[test]
+    fn test_handle_one_serves_small_request_in_full() {
+        use crate::devices::virtio::test_utils::VirtQueue;
+        use crate::test_utils::single_region_mem;
+        use crate::vstate::memory::GuestAddress;
+
+        const SIZE: u32 = 256;
+
+        let mem = single_region_mem(0x20000);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 256);
+        let mut queue = vq.create_queue();
+
+        vq.dtable[0].set(0x10000, SIZE, VIRTQ_DESC_F_WRITE, 0);
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+
+        let head = queue.pop().unwrap().unwrap();
+        // SAFETY: `mem` is a valid guest memory region and `head` is a descriptor chain
+        // obtained from the virtqueue backed by that memory.
+        let buf = unsafe { IoVecBufferMut::<256>::from_descriptor_chain(&mem, head).unwrap() };
+        assert_eq!(buf.len(), SIZE);
+
+        let mut dev = default_entropy();
+        dev.buffer = buf;
+        let bytes = dev.handle_one().unwrap();
+
+        assert_eq!(
+            bytes, SIZE,
+            "small request ({SIZE} bytes) should be served in full, got {bytes}"
+        );
     }
 }

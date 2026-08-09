@@ -4,7 +4,12 @@
 
 """Generate Buildkite pipelines dynamically"""
 
-from common import BKPipeline, get_changed_files, run_all_tests
+from common import (
+    BKPipeline,
+    ci_artifacts_change_mode,
+    get_changed_files,
+    run_all_tests,
+)
 
 # Buildkite default job priority is 0. Setting this to 1 prioritizes PRs over
 # scheduled jobs and other batch jobs.
@@ -27,7 +32,7 @@ pipeline = BKPipeline(
 pipeline.add_step(
     {
         "command": "./tools/devtool -y checkstyle",
-        "label": "🪶 Style",
+        "label": "style",
     },
     depends_on_build=False,
 )
@@ -35,8 +40,21 @@ pipeline.add_step(
 # run sanity build of devtool if Dockerfile is changed
 if any(x.parent.name == "devctr" for x in changed_files):
     pipeline.build_group_per_arch(
-        "🐋 Dev Container Sanity Build",
+        "dev-container-sanity-build",
         "./tools/devtool -y build_devctr && DEVCTR_IMAGE_TAG=latest ./tools/devtool test --no-build -- integration_tests/functional/test_api.py",
+    )
+
+# run sanity build of the CI guest artifacts (kernels/rootfs) if any of their
+# source files changed. Rebuild only the affected half when possible, pulling
+# the unchanged half from S3 so a guest can still boot.
+artifacts_mode = ci_artifacts_change_mode(changed_files)
+if artifacts_mode is not None:
+    pipeline.build_group_per_arch(
+        "ci-artifacts-sanity-build",
+        f"./tools/devtool -y build_ci_artifacts {artifacts_mode} && "
+        f"./tools/devtool -y stage_ci_artifacts {artifacts_mode} && "
+        "./tools/devtool -y test --no-build -- integration_tests/functional/test_api.py",
+        timeout_in_minutes=75,
     )
 
 if any(
@@ -44,7 +62,7 @@ if any(
     for x in changed_files
 ):
     pipeline.build_group_per_arch(
-        "📦 Release Sanity Build",
+        "release-sanity-build",
         "./tools/devtool -y make_release",
         depends_on_build=False,
     )
@@ -56,7 +74,7 @@ if not pipeline.args.no_kani and (
     or any(x.name == "test_kani.py" for x in changed_files)
 ):
     kani_grp = pipeline.build_group(
-        "🔍 Kani",
+        "kani",
         "./tools/devtool -y test --no-build -- ../tests/integration_tests/test_kani.py -n auto",
         # Kani step default
         # Kani runs fastest on m6a.metal
@@ -66,26 +84,23 @@ if not pipeline.args.no_kani and (
         **DEFAULTS_PERF,
         depends_on_build=False,
     )
-    # modify Kani steps' label
-    for step in kani_grp["steps"]:
-        step["label"] = "🔍 Kani"
 
 if run_all_tests(changed_files):
     pipeline.build_group(
-        "📦 Build",
+        "build",
         pipeline.devtool_test(pytest_opts="integration_tests/build/"),
         depends_on_build=False,
     )
 
     pipeline.build_group(
-        "⚙ Functional and security 🔒",
+        "functional-and-security",
         pipeline.devtool_test(
             pytest_opts="-n 16 --dist worksteal integration_tests/{{functional,security}}",
         ),
     )
 
     pipeline.build_group(
-        "⏱ Performance",
+        "performance",
         pipeline.devtool_test(
             devtool_opts="--performance -c 1-10 -m 0",
             pytest_opts="../tests/integration_tests/performance/",

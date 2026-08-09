@@ -90,6 +90,10 @@ arm64_sys_reg!(ID_AA64ISAR0_EL1, 3, 0, 0, 6, 0);
 arm64_sys_reg!(ID_AA64ISAR1_EL1, 3, 0, 0, 6, 1);
 arm64_sys_reg!(ID_AA64MMFR2_EL1, 3, 0, 0, 7, 2);
 
+// Cache Level ID Register
+// https://developer.arm.com/documentation/ddi0595/2021-12/AArch64-Registers/CLIDR-EL1--Cache-Level-ID-Register
+arm64_sys_reg!(CLIDR_EL1, 3, 1, 0, 0, 1);
+
 // Counter-timer Virtual Timer CompareValue register.
 // https://developer.arm.com/documentation/ddi0595/2021-12/AArch64-Registers/CNTV-CVAL-EL0--Counter-timer-Virtual-Timer-CompareValue-register
 // https://elixir.bootlin.com/linux/v6.8/source/arch/arm64/include/asm/sysreg.h#L468
@@ -123,7 +127,7 @@ pub const KVM_REG_ARM64_SVE_VLS: u64 =
     KVM_REG_ARM64 | KVM_REG_ARM64_SVE as u64 | KVM_REG_SIZE_U512 | 0xffff;
 
 /// Program Counter
-/// The offset value (0x100 = 32 * 8) is calcuated as follows:
+/// The offset value (0x100 = 32 * 8) is calculated as follows:
 /// - `kvm_regs` includes `regs` field of type `user_pt_regs` at the beginning (i.e., at offset 0).
 /// - `pc` follows `regs[31]` and `sp` within `user_pt_regs` and they are 8 bytes each (i.e. the
 ///   offset is (31 + 1) * 8 = 256).
@@ -192,7 +196,7 @@ impl From<usize> for RegSize {
             RegSize::U512_SIZE => RegSize::U512,
             RegSize::U1024_SIZE => RegSize::U1024,
             RegSize::U2048_SIZE => RegSize::U2048,
-            _ => unreachable!("Registers bigger then 2048 bits are not supported"),
+            _ => unreachable!("Registers bigger than 2048 bits are not supported"),
         }
     }
 }
@@ -523,7 +527,6 @@ reg_data_array!([u8; 256], 256);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::Snapshot;
 
     #[test]
     fn test_reg_size() {
@@ -544,12 +547,8 @@ mod tests {
         v.push(reg1);
         v.push(reg2);
 
-        let mut buf = vec![0; 10000];
-
-        Snapshot::new(&v).save(&mut buf.as_mut_slice()).unwrap();
-        let restored: Aarch64RegisterVec = Snapshot::load_without_crc_check(buf.as_slice())
-            .unwrap()
-            .data;
+        let serialized_data = bitcode::serialize(&v).unwrap();
+        let restored: Aarch64RegisterVec = bitcode::deserialize(&serialized_data).unwrap();
 
         for (old, new) in v.iter().zip(restored.iter()) {
             assert_eq!(old, new);
@@ -572,13 +571,11 @@ mod tests {
         v.push(reg1);
         v.push(reg2);
 
-        let mut buf = vec![0; 10000];
-
-        Snapshot::new(&v).save(&mut buf.as_mut_slice()).unwrap();
+        let serialized_data = bitcode::serialize(&v).unwrap();
 
         // Total size of registers according IDs are 16 + 16 = 32,
         // but actual data size is 8 + 16 = 24.
-        Snapshot::<Aarch64RegisterVec>::load_without_crc_check(buf.as_slice()).unwrap_err();
+        bitcode::deserialize::<Aarch64RegisterVec>(&serialized_data).unwrap_err();
     }
 
     #[test]
@@ -595,12 +592,10 @@ mod tests {
 
         v.push(reg);
 
-        let mut buf = vec![0; 10000];
-
-        Snapshot::new(v).save(&mut buf.as_mut_slice()).unwrap();
+        let serialized_data = bitcode::serialize(&v).unwrap();
 
         // 4096 bit wide registers are not supported.
-        Snapshot::<Aarch64RegisterVec>::load_without_crc_check(buf.as_slice()).unwrap_err();
+        bitcode::deserialize::<Aarch64RegisterVec>(&serialized_data).unwrap_err();
     }
 
     #[test]
