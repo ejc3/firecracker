@@ -104,9 +104,10 @@ def test_counter_ioctls_have_exact_vmm_rules():
             for argument in rule.get("args", [])
         )
     ]
-    vmm_get_one_reg_rules = [
-        rule
-        for rule in fc_filter["vmm"]["filter"]
+    get_one_reg_rules = [
+        (thread, rule)
+        for thread, thread_filter in fc_filter.items()
+        for rule in thread_filter["filter"]
         if rule.get("syscall") == "ioctl"
         and any(
             argument.get("val") == KVM_GET_ONE_REG for argument in rule.get("args", [])
@@ -144,23 +145,41 @@ def test_counter_ioctls_have_exact_vmm_rules():
                 },
             )
         ]
-        assert vmm_get_one_reg_rules == [
-            {
-                "syscall": "ioctl",
-                "args": [
-                    {
-                        "index": 1,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": KVM_GET_ONE_REG,
-                        "comment": (
-                            "KVM_GET_ONE_REG, used to freeze the Arm counter while "
-                            "paused"
-                        ),
-                    }
-                ],
-            }
+        assert get_one_reg_rules == [
+            (
+                "vmm",
+                {
+                    "syscall": "ioctl",
+                    "args": [
+                        {
+                            "index": 1,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": KVM_GET_ONE_REG,
+                            "comment": (
+                                "KVM_GET_ONE_REG, used to freeze the Arm counter while "
+                                "paused"
+                            ),
+                        }
+                    ],
+                },
+            ),
+            (
+                "vcpu",
+                {
+                    "syscall": "ioctl",
+                    "args": [
+                        {
+                            "index": 1,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": KVM_GET_ONE_REG,
+                            "comment": "KVM_GET_ONE_REG",
+                        }
+                    ],
+                },
+            ),
         ]
     else:
         assert offset_rules == []
-        assert vmm_get_one_reg_rules == []
+        assert get_one_reg_rules == []
