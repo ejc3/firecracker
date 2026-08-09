@@ -944,7 +944,6 @@ pub(crate) mod tests {
                     smt: false,
                     cpu_config: crate::cpu_config::aarch64::CpuConfiguration::default(),
                 },
-                &vm.kvm().optional_capabilities(),
             )
             .expect("failed to configure vcpu");
 

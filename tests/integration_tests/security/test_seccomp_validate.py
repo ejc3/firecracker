@@ -14,6 +14,8 @@ import seccomp
 from framework import utils
 
 ARCH = platform.machine()
+KVM_GET_ONE_REG = 1_074_835_115
+KVM_ARM_SET_COUNTER_OFFSET = 1_074_835_125
 
 
 @pytest.fixture
@@ -85,3 +87,80 @@ def test_validate_filter(seccompiler, bin_test_syscall, monkeypatch, tmp_path):
                     # if we call it with unallowed args, it should exit 159
                     # 159 = 128 (abnormal termination) + 31 (SIGSYS)
                     assert outcome.returncode == 159
+
+
+def test_counter_ioctls_have_exact_vmm_rules():
+    """Allow only the exact Arm counter ioctl requests required by the VMM."""
+
+    fc_filter_path = Path(f"../resources/seccomp/{ARCH}-unknown-linux-musl.json")
+    fc_filter = json.loads(fc_filter_path.read_text(encoding="ascii"))
+    offset_rules = [
+        (thread, rule)
+        for thread, thread_filter in fc_filter.items()
+        for rule in thread_filter["filter"]
+        if rule.get("syscall") == "ioctl"
+        and any(
+            argument.get("val") == KVM_ARM_SET_COUNTER_OFFSET
+            for argument in rule.get("args", [])
+        )
+    ]
+    vmm_get_one_reg_rules = [
+        rule
+        for rule in fc_filter["vmm"]["filter"]
+        if rule.get("syscall") == "ioctl"
+        and any(
+            argument.get("val") == KVM_GET_ONE_REG for argument in rule.get("args", [])
+        )
+    ]
+    vmm_ioctl_rules = [
+        rule for rule in fc_filter["vmm"]["filter"] if rule.get("syscall") == "ioctl"
+    ]
+
+    # An unscoped or masked request rule would make the two exact additions
+    # ineffective even if they were present in the JSON.
+    assert all(
+        any(
+            argument.get("index") == 1 and argument.get("op") == "eq"
+            for argument in rule.get("args", [])
+        )
+        for rule in vmm_ioctl_rules
+    )
+
+    if ARCH == "aarch64":
+        assert offset_rules == [
+            (
+                "vmm",
+                {
+                    "syscall": "ioctl",
+                    "args": [
+                        {
+                            "index": 1,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": KVM_ARM_SET_COUNTER_OFFSET,
+                            "comment": "KVM_ARM_SET_COUNTER_OFFSET",
+                        }
+                    ],
+                },
+            )
+        ]
+        assert vmm_get_one_reg_rules == [
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": KVM_GET_ONE_REG,
+                        "comment": (
+                            "KVM_GET_ONE_REG, used to freeze the Arm counter while "
+                            "paused"
+                        ),
+                    }
+                ],
+            }
+        ]
+    else:
+        assert offset_rules == []
+        assert vmm_get_one_reg_rules == []

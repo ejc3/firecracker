@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub(crate) mod cache_info;
+pub(crate) mod counter;
 mod fdt;
 /// Module for the global interrupt controller configuration.
 pub mod gic;
@@ -15,6 +16,9 @@ pub mod regs;
 pub mod vcpu;
 /// Architecture specific VM state code
 pub mod vm;
+
+/// Errors from the VM-wide Arm generic-counter lifecycle.
+pub use counter::CounterError;
 
 use std::cmp::min;
 use std::fmt::Debug;
@@ -55,6 +59,8 @@ pub enum ConfigurationError {
     VcpuConfigure(#[from] KvmVcpuError),
     /// Failed to read host cache information: {0}
     CacheInfo(#[from] cache_info::CacheInfoError),
+    /// Failed to configure the VM-wide generic-counter domain: {0}
+    Counter(#[from] CounterError),
 }
 
 /// Returns a Vec of the valid memory addresses for aarch64.
@@ -90,7 +96,7 @@ pub fn arch_memory_regions(size: usize) -> Vec<(GuestAddress, usize)> {
 /// Configures the system for booting Linux.
 #[allow(clippy::too_many_arguments)]
 pub fn configure_system_for_boot(
-    kvm: &Kvm,
+    _kvm: &Kvm,
     vm: &KvmVm,
     device_manager: &mut DeviceManager,
     vcpus: &mut [Vcpu],
@@ -103,6 +109,12 @@ pub fn configure_system_for_boot(
     // Construct the base CpuConfiguration to apply CPU template onto.
     let cpu_config = CpuConfiguration::new(cpu_template, vcpus)?;
 
+    // All vCPUs are now initialized. Read KVM's exact physical-counter domain
+    // from vCPU0 and install the VM-wide offset before any boot register is
+    // written. This replaces the per-vCPU PTIMER SET_ONE_REG reset.
+    let boot_vcpu = vcpus.first().ok_or(CounterError::NoBootVcpu)?;
+    vm.configure_counter_for_boot(&boot_vcpu.kvm_vcpu.fd)?;
+
     // Apply CPU template to the base CpuConfiguration.
     let cpu_config = CpuConfiguration::apply_template(cpu_config, cpu_template);
 
@@ -112,15 +124,10 @@ pub fn configure_system_for_boot(
         cpu_config,
     };
 
-    let optional_capabilities = kvm.optional_capabilities();
     // Configure vCPUs with normalizing and setting the generated CPU configuration.
     for vcpu in vcpus.iter_mut() {
-        vcpu.kvm_vcpu.configure(
-            vm.guest_memory(),
-            entry_point,
-            &vcpu_config,
-            &optional_capabilities,
-        )?;
+        vcpu.kvm_vcpu
+            .configure(vm.guest_memory(), entry_point, &vcpu_config)?;
     }
 
     // Override CLIDR_EL1 ctype/LoC fields on each vCPU to match the host's

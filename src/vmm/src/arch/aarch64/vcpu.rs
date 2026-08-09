@@ -17,7 +17,6 @@ use vm_memory::GuestAddress;
 use super::get_fdt_addr;
 use super::regs::*;
 use crate::arch::EntryPoint;
-use crate::arch::aarch64::kvm::OptionalCapabilities;
 use crate::arch::aarch64::regs::{Aarch64RegisterVec, KVM_REG_ARM64_SVE_VLS};
 use crate::cpu_config::aarch64::custom_cpu_template::VcpuFeatures;
 use crate::cpu_config::templates::CpuConfiguration;
@@ -177,7 +176,6 @@ impl KvmVcpu {
         guest_mem: &GuestMemoryMmap,
         kernel_entry_point: EntryPoint,
         vcpu_config: &VcpuConfig,
-        optional_capabilities: &OptionalCapabilities,
     ) -> Result<(), KvmVcpuError> {
         for reg in vcpu_config.cpu_config.regs.iter() {
             self.fd.set_one_reg(reg.id, reg.as_slice()).map_err(|err| {
@@ -189,12 +187,8 @@ impl KvmVcpu {
             })?;
         }
 
-        self.setup_boot_regs(
-            kernel_entry_point.entry_addr.raw_value(),
-            guest_mem,
-            optional_capabilities,
-        )
-        .map_err(KvmVcpuError::ConfigureRegisters)?;
+        self.setup_boot_regs(kernel_entry_point.entry_addr.raw_value(), guest_mem)
+            .map_err(KvmVcpuError::ConfigureRegisters)?;
 
         Ok(())
     }
@@ -251,12 +245,30 @@ impl KvmVcpu {
         Ok(state)
     }
 
-    /// Use provided state to populate KVM internal state.
+    /// Test-only single-vCPU restore convenience.
+    ///
+    /// Production restore must coordinate all vCPUs through
+    /// `restore_vcpus_in_order` so the VM-wide counter offset is installed
+    /// before this method's first saved-register replay.
+    #[cfg(test)]
     pub fn restore_state(&mut self, state: &VcpuState) -> Result<(), KvmVcpuError> {
+        self.prepare_restore_state(state)?;
+        self.finalize_restore_state(state)?;
+        self.replay_restore_state(state)
+    }
+
+    /// Initialize a vCPU from snapshot metadata without replaying any register.
+    pub fn prepare_restore_state(&mut self, state: &VcpuState) -> Result<(), KvmVcpuError> {
         self.kvi = state.kvi;
 
-        self.init_vcpu()?;
+        self.init_vcpu()
+    }
 
+    /// Apply pre-finalization registers and finalize a restored vCPU.
+    ///
+    /// The VM-wide counter offset must already be installed before this method
+    /// because SVE vector lengths are part of the saved register stream.
+    pub fn finalize_restore_state(&mut self, state: &VcpuState) -> Result<(), KvmVcpuError> {
         // If KVM_REG_ARM64_SVE_VLS is present it needs to
         // be set before vcpu is finalized.
         if let Some(sve_vls_reg) = state
@@ -268,8 +280,11 @@ impl KvmVcpu {
                 .map_err(KvmVcpuError::RestoreState)?;
         }
 
-        self.finalize_vcpu()?;
+        self.finalize_vcpu()
+    }
 
+    /// Replay all post-finalization vCPU state from a snapshot.
+    pub fn replay_restore_state(&mut self, state: &VcpuState) -> Result<(), KvmVcpuError> {
         // KVM_REG_ARM64_SVE_VLS needs to be skipped after vcpu is finalized.
         // If it is present it is handled in the code above.
         for reg in state
@@ -333,13 +348,10 @@ impl KvmVcpu {
     ///
     /// * `boot_ip` - Starting instruction pointer.
     /// * `mem` - Reserved DRAM for current VM.
-    /// + `optional_capabilities` - which optional capabilities are enabled that might influence
-    ///   vcpu configuration
     pub fn setup_boot_regs(
         &self,
         boot_ip: u64,
         mem: &GuestMemoryMmap,
-        optional_capabilities: &OptionalCapabilities,
     ) -> Result<(), VcpuArchError> {
         let kreg_off = offset_of!(kvm_regs, regs);
 
@@ -371,25 +383,6 @@ impl KvmVcpu {
             self.fd
                 .set_one_reg(id, &fdt_addr.to_le_bytes())
                 .map_err(|err| VcpuArchError::SetOneReg(id, format!("{fdt_addr:#x}"), err))?;
-
-            // Reset the physical counter for the guest. This way we avoid guest reading
-            // host physical counter.
-            // Resetting KVM_REG_ARM_PTIMER_CNT for single vcpu is enough because there is only
-            // one timer struct with offsets per VM.
-            // Because the access to KVM_REG_ARM_PTIMER_CNT is only present starting 6.4 kernel,
-            // we only do the reset if KVM_CAP_COUNTER_OFFSET is present as it was added
-            // in the same patch series as the ability to set the KVM_REG_ARM_PTIMER_CNT register.
-            // Path series which introduced the needed changes:
-            // https://lore.kernel.org/all/20230330174800.2677007-1-maz@kernel.org/
-            // Note: the value observed by the guest will still be above 0, because there is a delta
-            // time between this resetting and first call to KVM_RUN.
-            if optional_capabilities.counter_offset {
-                self.fd
-                    .set_one_reg(KVM_REG_ARM_PTIMER_CNT, &[0; 8])
-                    .map_err(|err| {
-                        VcpuArchError::SetOneReg(id, format!("{KVM_REG_ARM_PTIMER_CNT:#x}"), err)
-                    })?;
-            }
         }
         Ok(())
     }
@@ -599,7 +592,6 @@ mod tests {
     #[test]
     fn test_configure_vcpu() {
         let (vm, mut vcpu) = setup_vcpu(0x10000);
-        let optional_capabilities = vm.kvm().optional_capabilities();
 
         let vcpu_config = VcpuConfig {
             vcpu_count: 1,
@@ -614,7 +606,6 @@ mod tests {
                 protocol: BootProtocol::LinuxBoot,
             },
             &vcpu_config,
-            &optional_capabilities,
         )
         .unwrap();
 
@@ -627,7 +618,6 @@ mod tests {
                 protocol: BootProtocol::LinuxBoot,
             },
             &vcpu_config,
-            &optional_capabilities,
         );
 
         // dropping vcpu would double close the gic fd, so leak it
@@ -777,11 +767,9 @@ mod tests {
 
     #[test]
     fn test_setup_regs() {
-        let (vm, vcpu) = setup_vcpu_no_init(0x10000);
+        let (_vm, vcpu) = setup_vcpu_no_init(0x10000);
         let mem = arch_mem(layout::FDT_MAX_SIZE + 0x1000);
-        let optional_capabilities = vm.kvm().optional_capabilities();
-
-        let res = vcpu.setup_boot_regs(0x0, &mem, &optional_capabilities);
+        let res = vcpu.setup_boot_regs(0x0, &mem);
         assert!(matches!(
             res.unwrap_err(),
             VcpuArchError::SetOneReg(0x6030000000100042, _, _)
@@ -789,27 +777,7 @@ mod tests {
 
         vcpu.init_vcpu().unwrap();
 
-        vcpu.setup_boot_regs(0x0, &mem, &optional_capabilities)
-            .unwrap();
-
-        // Check that the register is reset on compatible kernels.
-        // Because there is a delta in time between we reset the register and time we
-        // read it, we cannot compare with 0. Instead we compare it with meaningfully
-        // small value.
-        if optional_capabilities.counter_offset {
-            let mut reg_bytes = [0_u8; 8];
-            vcpu.fd.get_one_reg(SYS_CNTPCT_EL0, &mut reg_bytes).unwrap();
-            let counter_value = u64::from_le_bytes(reg_bytes);
-
-            // We are reading the SYS_CNTPCT_EL0 right after resetting it.
-            // If reset did happen successfully, the value should be quite small when we read it.
-            // If the reset did not happen, the value will be same as on the host and it surely
-            // will be more that `max_value`. Measurements show that usually value is close
-            // to 1000. Use bigger `max_value` just in case.
-            let max_value = 10_000;
-
-            assert!(counter_value < max_value);
-        }
+        vcpu.setup_boot_regs(0x0, &mem).unwrap();
     }
 
     #[test]
