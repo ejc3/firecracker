@@ -20,13 +20,15 @@ use std::cmp::min;
 use std::fmt::Debug;
 use std::fs::File;
 
+use kvm_bindings::{KVM_ARM_VCPU_HAS_EL2, KVM_ARM_VCPU_HAS_EL2_E2H0};
 use linux_loader::loader::pe::PE as Loader;
 use linux_loader::loader::{Cmdline, KernelLoader};
 use vm_memory::{GuestMemoryBackend, GuestMemoryError, GuestMemoryRegion};
 
 use crate::arch::{BootProtocol, EntryPoint, arch_memory_regions_with_gap};
+use crate::cpu_config::aarch64::custom_cpu_template::VcpuFeatures;
 use crate::cpu_config::aarch64::{CpuConfiguration, CpuConfigurationError};
-use crate::cpu_config::templates::CustomCpuTemplate;
+use crate::cpu_config::templates::{CustomCpuTemplate, RegisterValueFilter};
 use crate::initrd::InitrdConfig;
 use zerocopy::IntoBytes;
 
@@ -87,6 +89,24 @@ pub fn arch_memory_regions(size: usize) -> Vec<(GuestAddress, usize)> {
     regions
 }
 
+fn cpu_template_with_nv2(cpu_template: &CustomCpuTemplate, nv2_enabled: bool) -> CustomCpuTemplate {
+    let mut template = cpu_template.clone();
+
+    if nv2_enabled {
+        let has_el2 = 1 << KVM_ARM_VCPU_HAS_EL2;
+        let has_el2_e2h0 = 1 << KVM_ARM_VCPU_HAS_EL2_E2H0;
+        template.vcpu_features.push(VcpuFeatures {
+            index: 0,
+            bitmap: RegisterValueFilter {
+                filter: has_el2 | has_el2_e2h0,
+                value: has_el2,
+            },
+        });
+    }
+
+    template
+}
+
 /// Configures the system for booting Linux.
 #[allow(clippy::too_many_arguments)]
 pub fn configure_system_for_boot(
@@ -99,12 +119,21 @@ pub fn configure_system_for_boot(
     entry_point: EntryPoint,
     initrd: &Option<InitrdConfig>,
     boot_cmdline: Cmdline,
+    nv2_enabled: bool,
 ) -> Result<(), ConfigurationError> {
+    // If NV2 (nested virtualization) is enabled, add HAS_EL2 vcpu features.
+    // HAS_EL2 (bit 7) enables virtual EL2 for the guest.
+    // Use HAS_EL2 WITHOUT HAS_EL2_E2H0 to enable VHE mode (E2H=1).
+    // VHE mode is required for recursive nested virtualization.
+    // The kernel's NV2 implementation requires E2H=1 for nested KVM to work.
+    // See: arch/arm64/kvm/config.c:236 - feat_nv2_e2h() requires !FEAT_E2H0
+    let effective_template = cpu_template_with_nv2(cpu_template, nv2_enabled);
+
     // Construct the base CpuConfiguration to apply CPU template onto.
-    let cpu_config = CpuConfiguration::new(cpu_template, vcpus)?;
+    let cpu_config = CpuConfiguration::new(&effective_template, vcpus)?;
 
     // Apply CPU template to the base CpuConfiguration.
-    let cpu_config = CpuConfiguration::apply_template(cpu_config, cpu_template);
+    let cpu_config = CpuConfiguration::apply_template(cpu_config, &effective_template);
 
     let vcpu_config = VcpuConfig {
         vcpu_count: machine_config.vcpu_count,
@@ -136,6 +165,9 @@ pub fn configure_system_for_boot(
         .as_cstring()
         .expect("Cannot create cstring from cmdline string");
 
+    // Enable SMC for PSCI when nested virtualization is enabled (HAS_EL2).
+    // With nested virt, HVC traps to the guest's virtual EL2 which has no handler.
+    // SMC goes to KVM's secure monitor emulation which handles PSCI correctly.
     let fdt = fdt::create_fdt(
         vm.guest_memory(),
         vcpu_mpidr,
@@ -143,6 +175,7 @@ pub fn configure_system_for_boot(
         device_manager,
         vm.get_irqchip(),
         initrd,
+        nv2_enabled,
     )?;
 
     let fdt_address = GuestAddress(get_fdt_addr(vm.guest_memory()));
@@ -349,6 +382,25 @@ mod tests {
         MMIO64_MEM_START,
     };
     use crate::test_utils::arch_mem;
+
+    #[test]
+    fn test_cpu_template_with_nv2_selects_vhe() {
+        let original = CustomCpuTemplate::default();
+
+        assert_eq!(cpu_template_with_nv2(&original, false), original);
+
+        let enabled = cpu_template_with_nv2(&original, true);
+        assert_eq!(original, CustomCpuTemplate::default());
+        assert_eq!(enabled.vcpu_features.len(), 1);
+
+        let nv2 = &enabled.vcpu_features[0];
+        let has_el2 = 1 << KVM_ARM_VCPU_HAS_EL2;
+        let has_el2_e2h0 = 1 << KVM_ARM_VCPU_HAS_EL2_E2H0;
+        assert_eq!(nv2.index, 0);
+        assert_eq!(nv2.bitmap.filter, has_el2 | has_el2_e2h0);
+        assert_eq!(nv2.bitmap.value, has_el2);
+        assert_eq!(nv2.bitmap.value & has_el2_e2h0, 0);
+    }
 
     #[test]
     fn test_regions_lt_1024gb() {

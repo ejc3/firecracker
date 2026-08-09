@@ -138,6 +138,9 @@ pub struct VmResources {
     pub serial_out_path: Option<PathBuf>,
     /// Optional rate limiter config for serial output.
     pub serial_rate_limiter_cfg: Option<TokenBucketConfig>,
+
+    /// Whether or not to enable nested virtualization (ARM64 NV2).
+    pub nv2_enabled: bool,
 }
 
 impl VmResources {
@@ -666,6 +669,7 @@ mod tests {
             serial_out_path: None,
             serial_rate_limiter_cfg: None,
             memory_hotplug: Default::default(),
+            nv2_enabled: false,
         }
     }
 
