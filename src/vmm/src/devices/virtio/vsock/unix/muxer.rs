@@ -974,8 +974,30 @@ mod tests {
             .to_owned()
     }
 
+    /// Raises this process's open file limit to what the tests that fill the kill queue or
+    /// the RX queue need: one descriptor per connection on each side, and the queues hold
+    /// 2048 and 2049 entries. The usual soft limit is 1024.
+    fn raise_open_file_limit() {
+        const NEEDED: libc::rlim_t = 8192;
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is a valid rlimit for the call to fill.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        if limit.rlim_cur < NEEDED {
+            limit.rlim_cur = NEEDED.min(limit.rlim_max);
+            // SAFETY: `limit` holds a soft limit no higher than the hard one.
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        }
+    }
+
     impl MuxerTestContext {
         fn new(name: &str) -> Self {
+            raise_open_file_limit();
             let vsock_test_ctx = VsockTestContext::new();
             let mut handler_ctx = vsock_test_ctx.create_event_handler_context();
             let mut rx_pkt = VsockPacketRx::new().unwrap();
@@ -1629,12 +1651,11 @@ mod tests {
         let local_port = 1026;
         let peer_port_first = 1025;
         let mut listener = ctx.create_local_listener(local_port);
-        let mut streams: Vec<UnixStream> = Vec::new();
 
         for peer_port in peer_port_first..peer_port_first + defs::MUXER_RXQ_SIZE {
             ctx.init_tx_pkt(local_port, peer_port, uapi::VSOCK_OP_REQUEST);
             ctx.send();
-            streams.push(listener.accept());
+            drop(listener.accept());
         }
 
         // The muxer RX queue should now be full (with connection reponses), but still
