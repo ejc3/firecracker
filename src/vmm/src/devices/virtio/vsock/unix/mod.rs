@@ -17,13 +17,16 @@ use crate::devices::virtio::vsock::csm::VsockConnectionBackend;
 
 mod defs {
     /// Maximum number of established connections that we can handle.
-    pub const MAX_CONNECTIONS: usize = 1023;
-
-    /// Size of the muxer RX packet queue.
-    pub const MUXER_RXQ_SIZE: u32 = 256;
+    pub const MAX_CONNECTIONS: usize = 16384;
 
     /// Size of the muxer connection kill queue.
-    pub const MUXER_KILLQ_SIZE: u32 = 128;
+    pub const MUXER_KILLQ_SIZE: u32 = 2048;
+
+    /// Size of the muxer RX packet queue.
+    ///
+    /// A full kill-queue sweep enqueues one RST per killed connection and then
+    /// enqueues the response that triggered the sweep.
+    pub const MUXER_RXQ_SIZE: u32 = MUXER_KILLQ_SIZE + 1;
 }
 
 /// Vsock backend related errors.

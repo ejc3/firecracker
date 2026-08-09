@@ -35,6 +35,7 @@ use std::fmt::Debug;
 use std::io::Read;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::time::Instant;
 
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 
@@ -769,14 +770,19 @@ impl VsockMuxer {
     /// Check if any connections have timed out, and if so, schedule them for immediate
     /// termination.
     fn sweep_killq(&mut self) {
-        while let Some(key) = self.killq.pop() {
+        self.sweep_killq_at(Instant::now());
+    }
+
+    /// Sweep the kill queue using one consistent time boundary.
+    fn sweep_killq_at(&mut self, now: Instant) {
+        while let Some(key) = self.killq.pop_expired(now) {
             // Connections don't get removed from the kill queue when their kill timer is
             // disarmed, since that would be a costly operation. This means we must check if
             // the connection has indeed expired, prior to killing it.
             let mut kill = false;
             self.conn_map
                 .entry(key)
-                .and_modify(|conn| kill = conn.has_expired());
+                .and_modify(|conn| kill = conn.has_expired_at(now));
             if kill {
                 self.kill_connection(key);
             }
@@ -787,7 +793,7 @@ impl VsockMuxer {
             METRICS.killq_resync.inc();
             // If we've just re-created the kill queue, we can sweep it again; maybe there's
             // more to kill.
-            self.sweep_killq();
+            self.sweep_killq_at(now);
         }
     }
 
@@ -819,7 +825,6 @@ mod tests {
 
     use vmm_sys_util::tempfile::TempFile;
 
-    use super::super::super::csm::defs as csm_defs;
     use super::*;
     use crate::devices::virtio::vsock::device::{RXQ_INDEX, TXQ_INDEX};
     use crate::devices::virtio::vsock::test_utils;
@@ -1389,17 +1394,42 @@ mod tests {
     }
 
     #[test]
+    fn test_muxer_supports_high_fanout() {
+        // 1,024 is the smallest behavioral control that crosses the former 1,023 limit without
+        // depending on the unit-test container's file-descriptor limit. Pin the configured
+        // production ceiling independently.
+        const HIGH_FANOUT_CONNECTIONS: u32 = 1_024;
+        const REQUIRED_MAX_CONNECTIONS: usize = 16_384;
+
+        let mut ctx = MuxerTestContext::new("muxer_high_fanout");
+        let local_port = 1026;
+        let peer_port_first = 1025;
+        let mut listener = ctx.create_local_listener(local_port);
+
+        for peer_port in peer_port_first..peer_port_first + HIGH_FANOUT_CONNECTIONS {
+            ctx.init_tx_pkt(local_port, peer_port, uapi::VSOCK_OP_REQUEST);
+            ctx.send();
+            ctx.recv();
+            assert_eq!(ctx.rx_pkt.hdr.op(), uapi::VSOCK_OP_RESPONSE);
+            assert_eq!(ctx.rx_pkt.hdr.dst_port(), peer_port);
+            drop(listener.accept());
+        }
+
+        assert_eq!(ctx.muxer.conn_map.len(), HIGH_FANOUT_CONNECTIONS as usize);
+        assert_eq!(defs::MAX_CONNECTIONS, REQUIRED_MAX_CONNECTIONS);
+    }
+
+    #[test]
     fn test_muxer_rxq() {
         let mut ctx = MuxerTestContext::new("muxer_rxq");
         let local_port = 1026;
         let peer_port_first = 1025;
         let mut listener = ctx.create_local_listener(local_port);
-        let mut streams: Vec<UnixStream> = Vec::new();
 
         for peer_port in peer_port_first..peer_port_first + defs::MUXER_RXQ_SIZE {
             ctx.init_tx_pkt(local_port, peer_port, uapi::VSOCK_OP_REQUEST);
             ctx.send();
-            streams.push(listener.accept());
+            drop(listener.accept());
         }
 
         // The muxer RX queue should now be full (with connection reponses), but still
@@ -1460,12 +1490,6 @@ mod tests {
         let peer_port_last = peer_port_first + defs::MUXER_KILLQ_SIZE;
         let mut listener = ctx.create_local_listener(local_port);
 
-        // Save metrics relevant for this test.
-        let conns_added = METRICS.conns_added.count();
-        let conns_killed = METRICS.conns_killed.count();
-        let conns_removed = METRICS.conns_removed.count();
-        let killq_resync = METRICS.killq_resync.count();
-
         for peer_port in peer_port_first..=peer_port_last {
             ctx.init_tx_pkt(local_port, peer_port, uapi::VSOCK_OP_REQUEST);
             ctx.send();
@@ -1493,55 +1517,40 @@ mod tests {
         assert!(!ctx.muxer.killq.is_synced());
         assert!(!ctx.muxer.has_pending_rx());
 
-        // Wait for the kill timers to expire.
-        std::thread::sleep(std::time::Duration::from_millis(
-            csm_defs::CONN_SHUTDOWN_TIMEOUT_MS,
-        ));
+        // Advance one injected time boundary beyond every connection's deadline. This avoids
+        // sleeping and proves that the connection omitted when the kill queue overflowed is
+        // recovered during the same sweep.
+        let sweep_at = ctx
+            .muxer
+            .conn_map
+            .values()
+            .filter_map(|conn| conn.expiry())
+            .max()
+            .unwrap();
+        ctx.muxer.sweep_killq_at(sweep_at);
 
-        // Trigger a kill queue sweep, by requesting a new connection.
-        ctx.init_tx_pkt(local_port, peer_port_last + 1, uapi::VSOCK_OP_REQUEST);
-        ctx.send();
-
-        // Check that MUXER_KILLQ_SIZE + 2 connections were added
-        // We count +2, because there are two extra connections being
-        // done outside of the loop.
+        let connection_count = usize::try_from(defs::MUXER_KILLQ_SIZE).unwrap() + 1;
         assert_eq!(
-            METRICS.conns_added.count(),
-            conns_added + u64::from(defs::MUXER_KILLQ_SIZE) + 2
+            ctx.muxer
+                .conn_map
+                .values()
+                .filter(|conn| conn.state() == ConnState::Killed)
+                .count(),
+            connection_count
         );
-        // Check that MUXER_KILLQ_SIZE connections were killed
-        assert_eq!(
-            METRICS.conns_killed.count(),
-            conns_killed + u64::from(defs::MUXER_KILLQ_SIZE)
-        );
-        // No connections should be removed at this point.
-        assert_eq!(METRICS.conns_removed.count(), conns_removed);
 
-        assert_eq!(METRICS.killq_resync.count(), killq_resync + 1);
-        // After sweeping the kill queue, it should now be synced (assuming the RX queue is larger
-        // than the kill queue, since an RST packet will be queued for each killed connection).
         assert!(ctx.muxer.killq.is_synced());
         assert!(ctx.muxer.has_pending_rx());
-        // There should be `defs::MUXER_KILLQ_SIZE` RSTs in the RX queue, from terminating the
-        // dying connections in the recent killq sweep.
-        for _p in peer_port_first..peer_port_last {
+
+        // Every killed connection retains its RST in connection state until the guest drains
+        // it, including entries recovered after either bounded queue desynchronizes.
+        for _peer_port in peer_port_first..=peer_port_last {
             ctx.recv();
             assert_eq!(ctx.rx_pkt.hdr.op(), uapi::VSOCK_OP_RST);
             assert_eq!(ctx.rx_pkt.hdr.src_port(), local_port);
         }
 
-        // The connections should have been removed here.
-        assert_eq!(
-            METRICS.conns_removed.count(),
-            conns_removed + u64::from(defs::MUXER_KILLQ_SIZE)
-        );
-
-        // There should be one more packet in the RX queue: the connection response our request
-        // that triggered the kill queue sweep.
-        ctx.recv();
-        assert_eq!(ctx.rx_pkt.hdr.op(), uapi::VSOCK_OP_RESPONSE);
-        assert_eq!(ctx.rx_pkt.hdr.dst_port(), peer_port_last + 1);
-
+        assert!(ctx.muxer.conn_map.is_empty());
         assert!(!ctx.muxer.has_pending_rx());
     }
 

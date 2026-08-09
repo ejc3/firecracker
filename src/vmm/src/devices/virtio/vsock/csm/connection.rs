@@ -567,10 +567,12 @@ where
     /// Check if this connection needs to be scheduled for forceful termination, due to its
     /// kill timer having expired.
     pub fn has_expired(&self) -> bool {
-        match self.expiry {
-            None => false,
-            Some(t) => t <= Instant::now(),
-        }
+        self.has_expired_at(Instant::now())
+    }
+
+    /// Check whether the kill timer has expired at `now`.
+    pub fn has_expired_at(&self, now: Instant) -> bool {
+        self.expiry.is_some_and(|t| t <= now)
     }
 
     /// Get the kill timer value, if one is set.
@@ -582,6 +584,7 @@ where
     /// connection is asked to yield a packet, via `recv_pkt()`).
     pub fn kill(&mut self) {
         self.state = ConnState::Killed;
+        self.expiry = None;
         self.pending_rx.insert(PendingRx::Rst);
         // We're sending an RST, so anything still buffered for the host is forfeit.
         self.tx_buf.clear();
