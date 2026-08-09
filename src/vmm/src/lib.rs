@@ -220,6 +220,9 @@ pub enum VmmError {
     #[cfg(target_arch = "aarch64")]
     /// Invalid command line error.
     Cmdline,
+    #[cfg(target_arch = "aarch64")]
+    /// Failed to set guest counter offset: {0}
+    SetCounterOffset(crate::vstate::vm::ArchVmError),
     /// Device manager error: {0}
     DeviceManager(#[from] device_manager::DeviceManagerCreateError),
     /// MMIO Device manager error: {0}
@@ -329,6 +332,14 @@ pub struct Vmm {
     vcpus_exit_evt: EventFd,
     // Device manager
     device_manager: DeviceManager,
+    /// VM-wide guest counter offset owned by this VMM. `None` means the host
+    /// kernel does not support KVM_ARM_SET_COUNTER_OFFSET and the guest keeps
+    /// the legacy time-jump behavior across pause/resume.
+    #[cfg(target_arch = "aarch64")]
+    pub counter_offset: Option<u64>,
+    /// Host counter captured once the vCPUs have paused.
+    #[cfg(target_arch = "aarch64")]
+    paused_at_counter: Option<u64>,
 }
 
 impl Vmm {
@@ -502,6 +513,20 @@ impl Vmm {
 
     /// Sends a resume command to the vCPUs.
     pub fn resume_vm(&mut self) -> Result<(), VmmError> {
+        // Advance the offset before the vCPUs run so the guest clock resumes
+        // where it paused instead of jumping forward by the pause duration.
+        #[cfg(target_arch = "aarch64")]
+        if let (Some(paused_at), Some(offset)) =
+            (self.paused_at_counter.take(), self.counter_offset)
+        {
+            let delta = crate::vstate::vm::Vm::host_counter().wrapping_sub(paused_at);
+            let new_offset = offset.wrapping_add(delta);
+            self.vm
+                .set_counter_offset(new_offset)
+                .map_err(VmmError::SetCounterOffset)?;
+            self.counter_offset = Some(new_offset);
+        }
+
         self.device_manager.kick_virtio_devices();
 
         // Send the events.
@@ -540,6 +565,12 @@ impl Vmm {
             .any(|response| !matches!(response, Ok(VcpuResponse::Paused)))
         {
             return Err(VmmError::VcpuMessage);
+        }
+
+        // Capture the counter only after every vCPU has acknowledged the pause.
+        #[cfg(target_arch = "aarch64")]
+        if self.paused_at_counter.is_none() {
+            self.paused_at_counter = Some(crate::vstate::vm::Vm::host_counter());
         }
 
         self.instance_info.state = VmState::Paused;

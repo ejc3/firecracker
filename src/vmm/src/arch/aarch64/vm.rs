@@ -29,6 +29,8 @@ pub enum ArchVmError {
     SaveGic(crate::arch::aarch64::gic::GicError),
     /// Failed to restore the VM's GIC state: {0}
     RestoreGic(crate::arch::aarch64::gic::GicError),
+    /// Failed to set the VM counter offset (KVM_ARM_SET_COUNTER_OFFSET), errno: {0}
+    SetCounterOffset(i32),
 }
 
 impl ArchVm {
@@ -67,6 +69,56 @@ impl ArchVm {
     /// Gets a reference to the irqchip of the VM.
     pub fn get_irqchip(&self) -> &crate::arch::aarch64::gic::GICDevice {
         self.irqchip_handle.as_ref().expect("IRQ chip not set")
+    }
+
+    /// Set the VM-wide guest counter offset via `KVM_ARM_SET_COUNTER_OFFSET`.
+    ///
+    /// Applies `offset` to both the virtual and physical counter views, so the
+    /// guest's CNTPCT/CNTVCT read `host_counter - offset`. Setting this before
+    /// replaying saved counter registers prevents KVM from creating per-timer
+    /// offsets that a later CNTVOFF_EL2 restore would overwrite.
+    ///
+    /// This must only be called while no vCPU is running because KVM takes all
+    /// vCPU locks while changing the offset.
+    pub fn set_counter_offset(&self, offset: u64) -> Result<(), ArchVmError> {
+        #[repr(C)]
+        struct KvmArmCounterOffset {
+            counter_offset: u64,
+            reserved: u64,
+        }
+
+        // _IOW(KVMIO = 0xAE, 0xb5, struct kvm_arm_counter_offset (16 bytes))
+        const KVM_ARM_SET_COUNTER_OFFSET: libc::c_ulong = 0x4010_aeb5;
+        let arg = KvmArmCounterOffset {
+            counter_offset: offset,
+            reserved: 0,
+        };
+
+        // SAFETY: self.fd() is a valid KVM VM fd and `arg` lives across the call.
+        let ret = unsafe {
+            libc::ioctl(
+                std::os::fd::AsRawFd::as_raw_fd(self.fd()),
+                KVM_ARM_SET_COUNTER_OFFSET,
+                &arg,
+            )
+        };
+        if ret < 0 {
+            return Err(ArchVmError::SetCounterOffset(
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Read the host's view of the generic timer counter (CNTVCT_EL0).
+    pub fn host_counter() -> u64 {
+        let counter: u64;
+        // SAFETY: reading the virtual counter from userspace is permitted on aarch64.
+        unsafe {
+            core::arch::asm!("isb", "mrs {counter}, cntvct_el0", counter = out(reg) counter);
+        }
+        counter
     }
 
     /// Saves and returns the Kvm Vm state.

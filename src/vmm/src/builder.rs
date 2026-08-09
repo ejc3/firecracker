@@ -309,6 +309,24 @@ pub fn build_microvm_for_boot(
         boot_cmdline,
     )?;
 
+    // Own the guest counter domain from boot so pause/resume can freeze the
+    // guest clock by advancing this offset by each pause duration.
+    #[cfg(target_arch = "aarch64")]
+    let counter_offset = {
+        let offset = Vm::host_counter();
+        match vm.set_counter_offset(offset) {
+            Ok(()) => Some(offset),
+            // KVM_ARM_SET_COUNTER_OFFSET was introduced in Linux 6.4. Keep
+            // legacy time-jump semantics when running on an older host.
+            Err(err) => {
+                log::warn!(
+                    "KVM_ARM_SET_COUNTER_OFFSET unavailable ({err}); guest clock will not freeze across pause/resume"
+                );
+                None
+            }
+        }
+    };
+
     let vmm = Vmm {
         instance_info: instance_info.clone(),
         machine_config: vm_resources.machine_config.clone(),
@@ -320,6 +338,10 @@ pub fn build_microvm_for_boot(
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
         device_manager,
+        #[cfg(target_arch = "aarch64")]
+        counter_offset,
+        #[cfg(target_arch = "aarch64")]
+        paused_at_counter: None,
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -471,6 +493,42 @@ pub fn build_microvm_from_snapshot(
         }
     }
 
+    // Set the VM-wide counter domain before replaying vCPU registers. Without
+    // this, KVM's CNTVCT/CNTPCT SET_ONE_REG handlers adjust per-timer offsets,
+    // then the later CNTVOFF_EL2 replay overwrites that adjustment for HAS_EL2
+    // guests. Their armed timer CVALs are left in the past and restored vCPUs
+    // can spend minutes in a timer-interrupt storm.
+    #[cfg(target_arch = "aarch64")]
+    let counter_offset = {
+        const CNTPCT_EL0_ID: u64 = 0x6030_0000_0013_df01;
+        let saved_cntpct = microvm_state.vcpu_states[0]
+            .regs
+            .iter()
+            .find(|reg| reg.id == CNTPCT_EL0_ID)
+            .map(|reg| reg.value::<u64, 8>());
+
+        match saved_cntpct {
+            Some(saved) => {
+                let offset = Vm::host_counter().wrapping_sub(saved);
+                match vm.set_counter_offset(offset) {
+                    Ok(()) => Some(offset),
+                    Err(err) => {
+                        log::warn!(
+                            "KVM_ARM_SET_COUNTER_OFFSET unavailable ({err}); restored guest timers keep legacy time-jump semantics"
+                        );
+                        None
+                    }
+                }
+            }
+            None => {
+                log::warn!(
+                    "snapshot has no saved CNTPCT_EL0; restored guest timers keep legacy time-jump semantics"
+                );
+                None
+            }
+        }
+    };
+
     // Restore vcpus kvm state.
     for (vcpu, state) in vcpus.iter_mut().zip(microvm_state.vcpu_states.iter()) {
         vcpu.kvm_vcpu
@@ -522,6 +580,10 @@ pub fn build_microvm_from_snapshot(
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
         device_manager,
+        #[cfg(target_arch = "aarch64")]
+        counter_offset,
+        #[cfg(target_arch = "aarch64")]
+        paused_at_counter: None,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -843,6 +905,10 @@ pub(crate) mod tests {
             vcpus_handles: Vec::new(),
             vcpus_exit_evt,
             device_manager: default_device_manager(),
+            #[cfg(target_arch = "aarch64")]
+            counter_offset: None,
+            #[cfg(target_arch = "aarch64")]
+            paused_at_counter: None,
         }
     }
 
