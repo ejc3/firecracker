@@ -20,3 +20,14 @@ def test_firecracker_swagger():
     """
     swagger_spec = Path("../src/firecracker/swagger/firecracker.yaml")
     validate_swagger(swagger_spec)
+
+
+def test_memory_backend_enum_matches_runtime():
+    """Ensure every runtime snapshot-memory backend is exposed by OpenAPI."""
+    swagger_spec = Path("../src/firecracker/swagger/firecracker.yaml")
+    spec_dict, _ = read_from_filename(swagger_spec)
+
+    backend_types = spec_dict["definitions"]["MemoryBackend"]["properties"][
+        "backend_type"
+    ]["enum"]
+    assert backend_types == ["File", "Uffd", "UffdMinor"]

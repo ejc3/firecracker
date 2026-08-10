@@ -439,6 +439,10 @@ snapshot. Accepted values are:
   for the guest memory range. Please refer to
   [this](handling-page-faults-on-snapshot-resume.md) for more details on
   handling page faults in the user space.
+- `UffdMinor` - map guest memory privately over a backing file supplied by the
+  user space handler, register the range for userfaultfd minor faults, and let
+  the handler resolve those faults with `UFFDIO_CONTINUE`. Clean pages share the
+  backing page cache; guest writes use copy-on-write memory.
 
 The meaning of `backend_path` depends on the `backend_type` chosen:
 
@@ -447,14 +451,18 @@ The meaning of `backend_path` depends on the `backend_type` chosen:
 - when using `Uffd`, `backend_path` refers to the path of the unix domain socket
   used for communication between Firecracker and the user space process that
   handles page faults.
+- when using `UffdMinor`, `backend_path` refers to the unix domain socket used
+  for the versioned backing-file and userfaultfd exchange with the handler.
 
 The `huge_pages` field selects the host page configuration for the restored
 microVM. It accepts `Snapshot`, `None`, `Transparent`, and `2M`. `Snapshot`
 reuses the value stored in the snapshot and is the default when the field is
 omitted; `None` uses the host's default memory-mapping behavior. Explicit `2M`
-hugetlbfs pages require the `Uffd` backend, so combining `2M` with `File`
-returns an error. With `Uffd`, the effectiveness of transparent huge pages may
-be limited.
+hugetlbfs pages require the `Uffd` or `UffdMinor` backend, so combining `2M`
+with `File` returns an error. For `UffdMinor`, the handler's backing file must
+match the page configuration the restore resolves to: a hugetlbfs file for `2M`
+and a shmem file, such as a memfd, otherwise. With either UFFD backend, the
+effectiveness of transparent huge pages may be limited.
 
 When relying on the OS to handle page faults, the command below is also
 accepted. Note that `mem_file_path` field is currently under the deprecation
