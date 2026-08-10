@@ -208,6 +208,38 @@ mod tests {
             "snapshot_path": "foo",
             "mem_backend": {
                 "backend_path": "bar",
+                "backend_type": "UffdMinor"
+            },
+            "resume_vm": true
+        }"#;
+        let expected_config = LoadSnapshotParams {
+            snapshot_path: PathBuf::from("foo"),
+            mem_backend: MemBackendConfig {
+                backend_path: PathBuf::from("bar"),
+                backend_type: MemBackendType::UffdMinor,
+            },
+            track_dirty_pages: false,
+            resume_vm: true,
+            network_overrides: vec![],
+            vsock_override: None,
+            clock_realtime: false,
+        };
+        let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+        assert!(
+            parsed_request
+                .parsing_info()
+                .take_deprecation_message()
+                .is_none()
+        );
+        assert_eq!(
+            vmm_action_from_request(parsed_request),
+            VmmAction::LoadSnapshot(expected_config)
+        );
+
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_backend": {
+                "backend_path": "bar",
                 "backend_type": "File"
             },
             "track_dirty_pages": true

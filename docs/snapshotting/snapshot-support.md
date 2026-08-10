@@ -423,6 +423,10 @@ snapshot. Accepted values are:
   for the guest memory range. Please refer to
   [this](handling-page-faults-on-snapshot-resume.md) for more details on
   handling page faults in the user space.
+- `UffdMinor` - map guest memory privately over a backing file supplied by the
+  user space handler, register the range for userfaultfd minor faults, and let
+  the handler resolve those faults with `UFFDIO_CONTINUE`. Clean pages share the
+  backing page cache; guest writes use copy-on-write memory.
 
 The meaning of `backend_path` depends on the `backend_type` chosen:
 
@@ -431,6 +435,8 @@ The meaning of `backend_path` depends on the `backend_type` chosen:
 - when using `Uffd`, `backend_path` refers to the path of the unix domain socket
   used for communication between Firecracker and the user space process that
   handles page faults.
+- when using `UffdMinor`, `backend_path` refers to the unix domain socket used
+  for the versioned backing-file and userfaultfd exchange with the handler.
 
 When relying on the OS to handle page faults, the command below is also
 accepted. Note that `mem_file_path` field is currently under the deprecation
