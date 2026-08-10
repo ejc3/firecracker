@@ -438,6 +438,22 @@ The meaning of `backend_path` depends on the `backend_type` chosen:
 - when using `UffdMinor`, `backend_path` refers to the unix domain socket used
   for the versioned backing-file and userfaultfd exchange with the handler.
 
+`UffdMinor` uses one versioned exchange on that connected stream:
+
+1. The handler sends the exact V1 greeting `FCVM_UFFD_MINOR_BACKING`, carrying
+   exactly one backing-file descriptor with the greeting bytes.
+1. Firecracker requires the complete greeting and descriptor within five
+   seconds, maps the backing file privately, and registers the mappings with
+   `UFFDIO_REGISTER_MODE_MINOR`.
+1. On the same stream, Firecracker sends the JSON array of guest-memory mappings
+   together with exactly one userfaultfd descriptor. This outbound reply also
+   has a five-second write timeout.
+
+The stream has no message boundaries, so either descriptor-bearing send may be
+short. In that case, the sender transfers the descriptor only once with the
+first non-empty prefix and writes the remaining bytes without another
+descriptor. A handler must accumulate fragments before parsing the JSON.
+
 When relying on the OS to handle page faults, the command below is also
 accepted. Note that `mem_file_path` field is currently under the deprecation
 policy. `mem_file_path` and `mem_backend` are mutually exclusive, therefore

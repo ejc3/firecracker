@@ -11,6 +11,7 @@ mod uffd_utils;
 
 use std::cell::Cell;
 use std::error::Error;
+use std::ffi::CStr;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -21,6 +22,7 @@ use userfaultfd::{Event, FaultKind};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 const UFFD_MINOR_BACKING_HELLO_V1: &[u8] = b"FCVM_UFFD_MINOR_BACKING";
+const UFFD_MINOR_BACKING_MEMFD_NAME: &CStr = c"firecracker_uffd_minor_test";
 
 trait MinorBackingSocket {
     fn send_with_fd_once(
@@ -59,7 +61,7 @@ fn create_minor_backing(snapshot_path: &str) -> Result<File, Box<dyn Error>> {
     // transfers ownership of a new descriptor to this process.
     let backing_fd = unsafe {
         libc::memfd_create(
-            c"firecracker_uffd_minor_test".as_ptr(),
+            UFFD_MINOR_BACKING_MEMFD_NAME.as_ptr(),
             libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC,
         )
     };

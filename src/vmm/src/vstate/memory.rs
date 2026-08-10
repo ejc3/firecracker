@@ -913,10 +913,11 @@ fn snapshot_file_mmap_flags(reserve: bool) -> libc::c_int {
 /// Creates a GuestMemoryMmap given a `file` containing the data and a `state` containing
 /// mapping information.
 ///
-/// `reserve` omits `MAP_NORESERVE`. This is required for the UFFD-minor hugetlbfs backend:
-/// reserving all private CoW backing makes pool exhaustion fail at restore mmap with `ENOMEM`
-/// rather than delivering `SIGBUS` to a running guest. File and shmem-backed restores pass
-/// `false`, retaining their existing overcommit behavior.
+/// When `reserve` is `true`, the mapping uses `MAP_PRIVATE` without `MAP_NORESERVE`; when it is
+/// `false`, the mapping uses `MAP_PRIVATE | MAP_NORESERVE`. Reserving all private CoW backing is
+/// required for the UFFD-minor hugetlbfs backend: pool exhaustion then fails at restore mmap with
+/// `ENOMEM` rather than delivering `SIGBUS` to a running guest. File and shmem-backed restores
+/// pass `false`, retaining their existing overcommit behavior.
 pub fn snapshot_file(
     file: File,
     regions: impl Iterator<Item = (GuestAddress, usize)>,
