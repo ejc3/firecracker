@@ -24,7 +24,7 @@ use std::cmp::min;
 use std::fmt::Debug;
 use std::fs::File;
 
-use kvm_bindings::{KVM_ARM_VCPU_HAS_EL2, KVM_ARM_VCPU_HAS_EL2_E2H0};
+use kvm_bindings::{KVM_ARM_VCPU_HAS_EL2, KVM_ARM_VCPU_HAS_EL2_E2H0, KVM_ARM_VCPU_POWER_OFF};
 use linux_loader::loader::pe::PE as Loader;
 use linux_loader::loader::{Cmdline, KernelLoader};
 use vm_memory::{GuestMemoryBackend, GuestMemoryError, GuestMemoryRegion};
@@ -63,6 +63,19 @@ pub enum ConfigurationError {
     CacheInfo(#[from] cache_info::CacheInfoError),
     /// Failed to configure the VM-wide generic-counter domain: {0}
     Counter(#[from] CounterError),
+    /// KVM_ARM_VCPU_HAS_EL2_E2H0 is unsupported; Arm nested virtualization requires VHE.
+    UnsupportedE2h0,
+    /// Effective Arm vCPU feature words disagree across vCPUs.
+    InconsistentVcpuFeatures,
+}
+
+/// Exception level and host-extension mode used to boot an Arm guest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArmBootMode {
+    /// Boot the guest kernel at EL1.
+    El1,
+    /// Boot the guest kernel at EL2 with VHE (HCR_EL2.E2H = 1).
+    El2Vhe,
 }
 
 /// Returns a Vec of the valid memory addresses for aarch64.
@@ -113,6 +126,79 @@ fn cpu_template_with_nv2(cpu_template: &CustomCpuTemplate, nv2_enabled: bool) ->
     template
 }
 
+fn effective_vcpu_feature_word(initial_feature_word: u32, cpu_template: &CustomCpuTemplate) -> u32 {
+    cpu_template
+        .vcpu_features
+        .iter()
+        .filter(|feature| feature.index == 0)
+        .fold(initial_feature_word, |word, feature| {
+            feature.bitmap.apply(word)
+        })
+}
+
+fn arm_boot_mode(feature_word: u32) -> Result<ArmBootMode, ConfigurationError> {
+    let has_el2 = 1 << KVM_ARM_VCPU_HAS_EL2;
+    let has_el2_e2h0 = 1 << KVM_ARM_VCPU_HAS_EL2_E2H0;
+
+    if feature_word & has_el2_e2h0 != 0 {
+        return Err(ConfigurationError::UnsupportedE2h0);
+    }
+
+    Ok(if feature_word & has_el2 != 0 {
+        ArmBootMode::El2Vhe
+    } else {
+        ArmBootMode::El1
+    })
+}
+
+pub(crate) fn validate_restored_vcpu_feature_words(
+    feature_words: &[u32],
+) -> Result<(), ConfigurationError> {
+    // Saving strips POWER_OFF from every vCPU KVI, so restored feature words
+    // must agree exactly.
+    validate_vcpu_feature_words(feature_words, 0).map(|_| ())
+}
+
+fn validate_vcpu_feature_words(
+    feature_words: &[u32],
+    allowed_difference_mask: u32,
+) -> Result<ArmBootMode, ConfigurationError> {
+    let (boot_feature_word, secondary_feature_words) = feature_words
+        .split_first()
+        .ok_or(CounterError::NoBootVcpu)?;
+    let boot_mode = arm_boot_mode(*boot_feature_word)?;
+    let canonical_boot_word = boot_feature_word & !allowed_difference_mask;
+
+    for feature_word in secondary_feature_words {
+        arm_boot_mode(*feature_word)?;
+        if feature_word & !allowed_difference_mask != canonical_boot_word {
+            return Err(ConfigurationError::InconsistentVcpuFeatures);
+        }
+    }
+
+    Ok(boot_mode)
+}
+
+fn resolve_arm_boot_mode(
+    cpu_template: &CustomCpuTemplate,
+    nv2_enabled: bool,
+    initial_feature_words: &[u32],
+) -> Result<(CustomCpuTemplate, ArmBootMode), ConfigurationError> {
+    let effective_template = cpu_template_with_nv2(cpu_template, nv2_enabled);
+    let effective_feature_words = initial_feature_words
+        .iter()
+        .map(|word| effective_vcpu_feature_word(*word, &effective_template))
+        .collect::<Vec<_>>();
+
+    // Secondary vCPUs intentionally carry POWER_OFF during boot. Every other
+    // effective initialization feature must agree before any vCPU is passed to
+    // KVM_ARM_VCPU_INIT, and every word must independently select supported VHE.
+    let boot_mode =
+        validate_vcpu_feature_words(&effective_feature_words, 1 << KVM_ARM_VCPU_POWER_OFF)?;
+
+    Ok((effective_template, boot_mode))
+}
+
 /// Configures the system for booting Linux.
 #[allow(clippy::too_many_arguments)]
 pub fn configure_system_for_boot(
@@ -133,7 +219,12 @@ pub fn configure_system_for_boot(
     // VHE mode is required for recursive nested virtualization.
     // The kernel's NV2 implementation requires E2H=1 for nested KVM to work.
     // See: arch/arm64/kvm/config.c:236 - feat_nv2_e2h() requires !FEAT_E2H0
-    let effective_template = cpu_template_with_nv2(cpu_template, nv2_enabled);
+    let initial_feature_words = vcpus
+        .iter()
+        .map(|vcpu| vcpu.kvm_vcpu.boot_feature_word())
+        .collect::<Vec<_>>();
+    let (effective_template, boot_mode) =
+        resolve_arm_boot_mode(cpu_template, nv2_enabled, &initial_feature_words)?;
 
     // Construct the base CpuConfiguration to apply CPU template onto.
     let cpu_config = CpuConfiguration::new(&effective_template, vcpus)?;
@@ -182,7 +273,7 @@ pub fn configure_system_for_boot(
         device_manager,
         vm.get_irqchip(),
         initrd,
-        nv2_enabled,
+        boot_mode,
     )?;
 
     let fdt_address = GuestAddress(get_fdt_addr(vm.guest_memory()));
@@ -407,6 +498,144 @@ mod tests {
         assert_eq!(nv2.bitmap.filter, has_el2 | has_el2_e2h0);
         assert_eq!(nv2.bitmap.value, has_el2);
         assert_eq!(nv2.bitmap.value & has_el2_e2h0, 0);
+    }
+
+    fn feature_modifier(filter: u32, value: u32) -> VcpuFeatures {
+        VcpuFeatures {
+            index: 0,
+            bitmap: RegisterValueFilter { filter, value },
+        }
+    }
+
+    #[test]
+    fn test_effective_has_el2_drives_boot_mode() {
+        let has_el2 = 1 << KVM_ARM_VCPU_HAS_EL2;
+        let cpu_template = CustomCpuTemplate {
+            vcpu_features: vec![feature_modifier(has_el2, has_el2)],
+            ..Default::default()
+        };
+
+        let (_, boot_mode) = resolve_arm_boot_mode(&cpu_template, false, &[0]).unwrap();
+
+        assert_eq!(boot_mode, ArmBootMode::El2Vhe);
+    }
+
+    #[test]
+    fn test_e2h0_boot_mode_is_rejected() {
+        let has_el2 = 1 << KVM_ARM_VCPU_HAS_EL2;
+        let has_el2_e2h0 = 1 << KVM_ARM_VCPU_HAS_EL2_E2H0;
+        let cpu_template = CustomCpuTemplate {
+            vcpu_features: vec![feature_modifier(
+                has_el2 | has_el2_e2h0,
+                has_el2 | has_el2_e2h0,
+            )],
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            resolve_arm_boot_mode(&cpu_template, false, &[0]),
+            Err(ConfigurationError::UnsupportedE2h0)
+        ));
+    }
+
+    #[test]
+    fn test_primary_initial_e2h0_is_rejected() {
+        let has_el2_e2h0 = 1 << KVM_ARM_VCPU_HAS_EL2_E2H0;
+
+        assert!(matches!(
+            resolve_arm_boot_mode(&CustomCpuTemplate::default(), false, &[has_el2_e2h0],),
+            Err(ConfigurationError::UnsupportedE2h0)
+        ));
+    }
+
+    #[test]
+    fn test_template_can_clear_initial_has_el2() {
+        let has_el2 = 1 << KVM_ARM_VCPU_HAS_EL2;
+        let cpu_template = CustomCpuTemplate {
+            vcpu_features: vec![feature_modifier(has_el2, 0)],
+            ..Default::default()
+        };
+
+        let (_, boot_mode) = resolve_arm_boot_mode(&cpu_template, false, &[has_el2]).unwrap();
+
+        assert_eq!(boot_mode, ArmBootMode::El1);
+    }
+
+    #[test]
+    fn test_cli_nv2_modifier_is_last_and_selects_vhe() {
+        let has_el2 = 1 << KVM_ARM_VCPU_HAS_EL2;
+        let has_el2_e2h0 = 1 << KVM_ARM_VCPU_HAS_EL2_E2H0;
+        let cpu_template = CustomCpuTemplate {
+            vcpu_features: vec![feature_modifier(
+                has_el2 | has_el2_e2h0,
+                has_el2 | has_el2_e2h0,
+            )],
+            ..Default::default()
+        };
+
+        let (effective_template, boot_mode) =
+            resolve_arm_boot_mode(&cpu_template, true, &[0]).unwrap();
+        let effective_word = effective_vcpu_feature_word(0, &effective_template);
+
+        assert_eq!(boot_mode, ArmBootMode::El2Vhe);
+        assert_ne!(effective_word & has_el2, 0);
+        assert_eq!(effective_word & has_el2_e2h0, 0);
+    }
+
+    #[test]
+    fn test_secondary_e2h0_is_rejected_before_vcpu_init() {
+        let has_el2_e2h0 = 1 << KVM_ARM_VCPU_HAS_EL2_E2H0;
+        let power_off = 1 << KVM_ARM_VCPU_POWER_OFF;
+
+        assert!(matches!(
+            resolve_arm_boot_mode(
+                &CustomCpuTemplate::default(),
+                false,
+                &[0, power_off | has_el2_e2h0],
+            ),
+            Err(ConfigurationError::UnsupportedE2h0)
+        ));
+    }
+
+    #[test]
+    fn test_divergent_vcpu_features_are_rejected_before_vcpu_init() {
+        let has_el2 = 1 << KVM_ARM_VCPU_HAS_EL2;
+        let power_off = 1 << KVM_ARM_VCPU_POWER_OFF;
+
+        assert!(matches!(
+            resolve_arm_boot_mode(&CustomCpuTemplate::default(), false, &[has_el2, power_off],),
+            Err(ConfigurationError::InconsistentVcpuFeatures)
+        ));
+    }
+
+    #[test]
+    fn test_secondary_power_off_is_an_allowed_feature_difference() {
+        let power_off = 1 << KVM_ARM_VCPU_POWER_OFF;
+
+        let (_, boot_mode) =
+            resolve_arm_boot_mode(&CustomCpuTemplate::default(), false, &[0, power_off]).unwrap();
+
+        assert_eq!(boot_mode, ArmBootMode::El1);
+    }
+
+    #[test]
+    fn test_restore_rejects_secondary_e2h0_before_any_vcpu_init() {
+        let has_el2_e2h0 = 1 << KVM_ARM_VCPU_HAS_EL2_E2H0;
+
+        assert!(matches!(
+            validate_restored_vcpu_feature_words(&[0, has_el2_e2h0]),
+            Err(ConfigurationError::UnsupportedE2h0)
+        ));
+    }
+
+    #[test]
+    fn test_restore_rejects_divergent_features_before_any_vcpu_init() {
+        let has_el2 = 1 << KVM_ARM_VCPU_HAS_EL2;
+
+        assert!(matches!(
+            validate_restored_vcpu_feature_words(&[has_el2, 0]),
+            Err(ConfigurationError::InconsistentVcpuFeatures)
+        ));
     }
 
     #[test]

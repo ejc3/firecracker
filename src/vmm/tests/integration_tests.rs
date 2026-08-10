@@ -34,6 +34,21 @@ use vmm::vmm_config::vsock::VsockDeviceConfig;
 use vmm::{DumpCpuConfigError, EventManager, FcExitCode, Vmm};
 use vmm_sys_util::tempfile::TempFile;
 
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn test_public_arm_vcpu_api_remains_source_compatible() {
+    let _config = vmm::VcpuConfig {
+        vcpu_count: 1,
+        smt: false,
+        cpu_config: vmm::cpu_config::templates::CpuConfiguration::default(),
+    };
+    let _setup_boot_regs: fn(
+        &vmm::arch::KvmVcpu,
+        u64,
+        &vmm::vstate::memory::GuestMemoryMmap,
+    ) -> Result<(), vmm::arch::aarch64::vcpu::VcpuArchError> = vmm::arch::KvmVcpu::setup_boot_regs;
+}
+
 #[allow(unused_mut, unused_variables)]
 fn check_booted_microvm(vmm: Arc<Mutex<Vmm>>, mut evmgr: EventManager) {
     // On x86_64, the vmm should exit once its workload completes and signals the exit event.

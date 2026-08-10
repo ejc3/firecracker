@@ -14,6 +14,7 @@ use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 use serde::{Deserialize, Serialize};
 use vm_memory::GuestAddress;
 
+use super::ArmBootMode;
 use super::get_fdt_addr;
 use super::regs::*;
 use crate::arch::EntryPoint;
@@ -44,6 +45,8 @@ pub enum VcpuArchError {
     Fam(vmm_sys_util::fam::Error),
     /// Failed to set/get device attributes for vCPU: {0}
     DeviceAttribute(kvm_ioctls::Error),
+    /// KVM_ARM_VCPU_HAS_EL2_E2H0 is unsupported; Arm nested virtualization requires VHE.
+    UnsupportedE2h0,
 }
 
 /// Extract the Manufacturer ID from the host.
@@ -99,10 +102,20 @@ pub enum KvmVcpuError {
     SaveState(VcpuArchError),
     /// Found unsupported KVM_ARM_VCPU_PMU_V3 bit set in vcpu features.
     UnsupportedPmuV3,
+    /// Found unsupported KVM_ARM_VCPU_HAS_EL2_E2H0 bit set in vcpu features.
+    UnsupportedE2h0,
 }
 
 /// Error type for [`KvmVcpu::configure`].
 pub type KvmVcpuConfigureError = KvmVcpuError;
+
+fn validate_vcpu_init_feature_word(feature_word: u32) -> Result<(), KvmVcpuError> {
+    if feature_word & (1 << KVM_ARM_VCPU_HAS_EL2_E2H0) != 0 {
+        Err(KvmVcpuError::UnsupportedE2h0)
+    } else {
+        Ok(())
+    }
+}
 
 /// A wrapper around creating and using a kvm aarch64 vcpu.
 #[derive(Debug)]
@@ -208,6 +221,11 @@ impl KvmVcpu {
         self.finalize_vcpu()?;
 
         Ok(())
+    }
+
+    /// Return the feature word used for Arm vCPU initialization.
+    pub(crate) fn boot_feature_word(&self) -> u32 {
+        self.kvi.features[0]
     }
 
     /// Creates default kvi struct based on vcpu index.
@@ -316,6 +334,8 @@ impl KvmVcpu {
 
     /// Initializes internal vcpufd.
     fn init_vcpu(&self) -> Result<(), KvmVcpuError> {
+        validate_vcpu_init_feature_word(self.kvi.features[0])?;
+
         // Setting KVM_ARM_VCPU_PMU_V3 without initialising the PMU causes KVM
         // to crash on KVM_RUN with EINVAL.
         //
@@ -353,6 +373,17 @@ impl KvmVcpu {
         boot_ip: u64,
         mem: &GuestMemoryMmap,
     ) -> Result<(), VcpuArchError> {
+        let has_el2 = 1 << KVM_ARM_VCPU_HAS_EL2;
+        let has_el2_e2h0 = 1 << KVM_ARM_VCPU_HAS_EL2_E2H0;
+        let feature_word = self.kvi.features[0];
+        if feature_word & has_el2_e2h0 != 0 {
+            return Err(VcpuArchError::UnsupportedE2h0);
+        }
+        let boot_mode = if feature_word & has_el2 != 0 {
+            ArmBootMode::El2Vhe
+        } else {
+            ArmBootMode::El1
+        };
         let kreg_off = offset_of!(kvm_regs, regs);
 
         // Get the register index of the PSTATE (Processor State) register.
@@ -360,15 +391,13 @@ impl KvmVcpu {
         // kernel's is_hyp_mode_available() returns true.
         let pstate = offset_of!(user_pt_regs, pstate) + kreg_off;
         let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, pstate);
-        let has_el2 = (self.kvi.features[0] & (1 << KVM_ARM_VCPU_HAS_EL2)) != 0;
         // HAS_EL2 without HAS_EL2_E2H0 selects VHE. Boot at EL2h so the guest kernel sees
         // HYP mode and can initialize its nested KVM implementation.
         // The guest kernel's is_hyp_mode_available() checks CurrentEL on boot - it must
         // see EL2 or it will assume no hypervisor mode is available.
-        let pstate_value = if has_el2 {
-            PSTATE_FAULT_BITS_64_EL2
-        } else {
-            PSTATE_FAULT_BITS_64
+        let pstate_value = match boot_mode {
+            ArmBootMode::El1 => PSTATE_FAULT_BITS_64,
+            ArmBootMode::El2Vhe => PSTATE_FAULT_BITS_64_EL2,
         };
         self.fd
             .set_one_reg(id, &pstate_value.to_le_bytes())
@@ -376,7 +405,7 @@ impl KvmVcpu {
 
         // When HAS_EL2 is enabled, initialize EL2 system registers for VHE mode.
         // For VHE (E2H=1), the guest kernel runs at EL2 and can use kvm-arm.mode=nested.
-        if has_el2 {
+        if boot_mode == ArmBootMode::El2Vhe {
             // Set HCR_EL2 with E2H=1 for VHE mode.
             // HCR_EL2.E2H (bit 34) enables VHE, allowing the guest kernel to run at EL2.
             // This is required for kvm-arm.mode=nested to work in the guest.
@@ -726,6 +755,16 @@ mod tests {
 
         let res = vcpu.init(&vcpu_features);
         assert!(matches!(res.unwrap_err(), KvmVcpuError::UnsupportedPmuV3));
+    }
+
+    #[test]
+    fn test_direct_init_rejects_e2h0_before_ioctl() {
+        let has_el2_e2h0 = 1 << KVM_ARM_VCPU_HAS_EL2_E2H0;
+
+        assert!(matches!(
+            validate_vcpu_init_feature_word(has_el2_e2h0),
+            Err(KvmVcpuError::UnsupportedE2h0)
+        ));
     }
 
     #[test]

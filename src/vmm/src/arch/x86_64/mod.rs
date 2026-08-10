@@ -107,6 +107,16 @@ pub enum ConfigurationError {
     VcpuConfigure(#[from] KvmVcpuConfigureError),
     /// Error configuring ACPI: {0}
     Acpi(#[from] crate::acpi::AcpiError),
+    /// Nested virtualization through Arm NV2 is unsupported on x86_64.
+    NestedVirtualizationUnsupported,
+}
+
+fn reject_nv2_on_x86(nv2_enabled: bool) -> Result<(), ConfigurationError> {
+    if nv2_enabled {
+        Err(ConfigurationError::NestedVirtualizationUnsupported)
+    } else {
+        Ok(())
+    }
 }
 
 /// Returns a Vec of the valid memory addresses.
@@ -190,8 +200,10 @@ pub fn configure_system_for_boot(
     entry_point: EntryPoint,
     initrd: &Option<InitrdConfig>,
     boot_cmdline: Cmdline,
-    _nv2_enabled: bool,
+    nv2_enabled: bool,
 ) -> Result<(), ConfigurationError> {
+    reject_nv2_on_x86(nv2_enabled)?;
+
     // Construct the base CpuConfiguration to apply CPU template onto.
     let cpu_config = CpuConfiguration::new(kvm.supported_cpuid.clone(), cpu_template, &vcpus[0])?;
     // Apply CPU template to the base CpuConfiguration.
@@ -597,6 +609,15 @@ mod tests {
     use crate::test_utils::{arch_mem, single_region_mem};
     use crate::utils::mib_to_bytes;
     use crate::vstate::resources::ResourceAllocator;
+
+    #[test]
+    fn test_nv2_is_rejected_on_x86() {
+        reject_nv2_on_x86(false).unwrap();
+        assert!(matches!(
+            reject_nv2_on_x86(true),
+            Err(ConfigurationError::NestedVirtualizationUnsupported)
+        ));
+    }
 
     #[test]
     fn regions_lt_4gb() {

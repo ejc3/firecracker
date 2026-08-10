@@ -12,6 +12,7 @@ use aws_lc_rs::rand;
 use vm_fdt::{Error as VmFdtError, FdtWriter, FdtWriterNode};
 use vm_memory::{GuestMemoryBackend, GuestMemoryError, GuestMemoryRegion};
 
+use super::ArmBootMode;
 use super::cache_info::{CacheEntry, read_cache_config};
 use super::gic::GICDevice;
 use crate::arch::{
@@ -72,7 +73,7 @@ pub fn create_fdt(
     device_manager: &DeviceManager,
     gic_device: &GICDevice,
     initrd: &Option<InitrdConfig>,
-    nested_virt: bool,
+    boot_mode: ArmBootMode,
 ) -> Result<Vec<u8>, FdtError> {
     // Allocate stuff necessary for storing the blob.
     let mut fdt_writer = FdtWriter::new()?;
@@ -97,7 +98,7 @@ pub fn create_fdt(
     create_gic_node(&mut fdt_writer, gic_device)?;
     create_timer_node(&mut fdt_writer)?;
     create_clock_node(&mut fdt_writer)?;
-    create_psci_node(&mut fdt_writer, nested_virt)?;
+    create_psci_node(&mut fdt_writer, boot_mode)?;
     create_devices_node(&mut fdt_writer, device_manager)?;
     create_vmgenid_node(&mut fdt_writer, device_manager.acpi_devices.vmgenid())?;
     create_vmclock_node(&mut fdt_writer, device_manager.acpi_devices.vmclock())?;
@@ -386,11 +387,14 @@ fn create_timer_node(fdt: &mut FdtWriter) -> Result<(), FdtError> {
     Ok(())
 }
 
-fn psci_method(use_smc: bool) -> &'static str {
-    if use_smc { "smc" } else { "hvc" }
+fn psci_method(boot_mode: ArmBootMode) -> &'static str {
+    match boot_mode {
+        ArmBootMode::El1 => "hvc",
+        ArmBootMode::El2Vhe => "smc",
+    }
 }
 
-fn create_psci_node(fdt: &mut FdtWriter, use_smc: bool) -> Result<(), FdtError> {
+fn create_psci_node(fdt: &mut FdtWriter, boot_mode: ArmBootMode) -> Result<(), FdtError> {
     let compatible = "arm,psci-0.2";
 
     let psci = fdt.begin_node("psci")?;
@@ -400,7 +404,7 @@ fn create_psci_node(fdt: &mut FdtWriter, use_smc: bool) -> Result<(), FdtError> 
     // HVC would trap to the guest's virtual EL2 which has no handler.
     // SMC goes to the host's EL3 emulation (KVM's secure monitor) which handles PSCI.
     // When nested virt is disabled, either method works, but we use HVC for compatibility.
-    fdt.property_string("method", psci_method(use_smc))?;
+    fdt.property_string("method", psci_method(boot_mode))?;
     fdt.end_node(psci)?;
 
     Ok(())
@@ -575,9 +579,9 @@ mod tests {
     use crate::{EventManager, Kvm};
 
     #[test]
-    fn test_psci_method_tracks_nested_virtualization() {
-        assert_eq!(psci_method(false), "hvc");
-        assert_eq!(psci_method(true), "smc");
+    fn test_psci_method_tracks_boot_mode() {
+        assert_eq!(psci_method(ArmBootMode::El1), "hvc");
+        assert_eq!(psci_method(ArmBootMode::El2Vhe), "smc");
     }
 
     #[test]
@@ -618,7 +622,7 @@ mod tests {
             &device_manager,
             &gic,
             &initrd,
-            false, // nested_virt - false to match saved DTB
+            ArmBootMode::El1,
         )
         .unwrap();
         let generated_fdt = device_tree::DeviceTree::load(&dtb_bytes).unwrap();
@@ -663,7 +667,7 @@ mod tests {
             &device_manager,
             &gic,
             &initrd,
-            true,
+            ArmBootMode::El2Vhe,
         )
         .unwrap();
         let nested_fdt = device_tree::DeviceTree::load(&nested_dtb_bytes).unwrap();

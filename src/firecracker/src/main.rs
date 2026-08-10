@@ -118,6 +118,18 @@ fn main() -> ExitCode {
     }
 }
 
+fn add_nv2_argument<'a>(arg_parser: ArgParser<'a>, supported: bool) -> ArgParser<'a> {
+    if supported {
+        arg_parser.arg(
+            Argument::new("enable-nv2")
+                .takes_value(false)
+                .help("Enables nested virtualization (ARM64 NV2)."),
+        )
+    } else {
+        arg_parser
+    }
+}
+
 fn main_exec() -> Result<(), MainError> {
     // Initialize the logger.
     LOGGER.init().map_err(MainError::SetLogger)?;
@@ -154,7 +166,7 @@ fn main_exec() -> Result<(), MainError> {
 
     let http_max_payload_size_str = HTTP_MAX_PAYLOAD_SIZE.to_string();
 
-    let mut arg_parser =
+    let mut arg_parser = add_nv2_argument(
         ArgParser::new()
             .arg(
                 Argument::new("api-sock")
@@ -278,12 +290,9 @@ fn main_exec() -> Result<(), MainError> {
                 Argument::new("enable-pci")
                     .takes_value(false)
                     .help("Enables PCIe support."),
-            )
-            .arg(
-                Argument::new("enable-nv2")
-                    .takes_value(false)
-                    .help("Enables nested virtualization (ARM64 NV2)."),
-            );
+            ),
+        cfg!(target_arch = "aarch64"),
+    );
 
     arg_parser.parse_from_cmdline()?;
     let arguments = arg_parser.arguments();
@@ -693,4 +702,29 @@ fn run_without_api(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use utils::arg_parser::UtilsArgParserError;
+
+    #[test]
+    fn test_enable_nv2_argument_is_arch_gated() {
+        let args = vec!["firecracker".to_string(), "--enable-nv2".to_string()];
+
+        let supported = add_nv2_argument(ArgParser::new(), true);
+        let mut supported_arguments = supported.arguments().clone();
+        supported_arguments.parse(&args).unwrap();
+        assert!(supported_arguments.flag_present("enable-nv2"));
+
+        let unsupported = add_nv2_argument(ArgParser::new(), false);
+        let mut unsupported_arguments = unsupported.arguments().clone();
+        assert_eq!(
+            unsupported_arguments.parse(&args),
+            Err(UtilsArgParserError::UnexpectedArgument(
+                "enable-nv2".to_string()
+            ))
+        );
+    }
 }

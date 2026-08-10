@@ -22,6 +22,8 @@ use crate::Vcpu;
 use crate::arch::aarch64::counter::{
     CounterError, canonical_saved_counter, restore_vcpus_in_order,
 };
+#[cfg(target_arch = "aarch64")]
+use crate::arch::aarch64::validate_restored_vcpu_feature_words;
 use crate::arch::{ConfigurationError, configure_system_for_boot, load_kernel};
 #[cfg(target_arch = "aarch64")]
 use crate::construct_kvm_mpidrs;
@@ -63,6 +65,8 @@ use crate::vstate::memory::GuestRegionMmap;
 #[cfg(target_arch = "aarch64")]
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
+#[cfg(target_arch = "aarch64")]
+use crate::vstate::vcpu::VcpuState;
 use crate::vstate::vm::{KvmVm, Vm, VmError};
 use crate::{EventManager, Vmm, VmmError};
 
@@ -424,6 +428,21 @@ pub enum BuildMicrovmFromSnapshotError {
     UnsupportedClockRealtime,
 }
 
+#[cfg(target_arch = "aarch64")]
+fn with_validated_restored_vcpu_features<T>(
+    vcpu_states: &[VcpuState],
+    restore: impl FnOnce() -> T,
+) -> Result<T, BuildMicrovmFromSnapshotError> {
+    let feature_words = vcpu_states
+        .iter()
+        .map(|state| state.kvi.features[0])
+        .collect::<Vec<_>>();
+    validate_restored_vcpu_feature_words(&feature_words)
+        .map_err(StartMicrovmError::ConfigureSystem)
+        .map_err(BuildMicrovmFromSnapshotError::CreateMicrovmAndVcpus)?;
+    Ok(restore())
+}
+
 /// Builds and starts a microVM based on the provided MicrovmState.
 ///
 /// An `Arc` reference of the built `Vmm` is also plugged in the `EventManager`, while another
@@ -468,6 +487,7 @@ pub fn build_microvm_from_snapshot(
             }
         }
     }
+
     // Restore vCPU KVM state. On Arm the VM-wide counter offset must be
     // installed after every vCPU is initialized but before even the SVE
     // pre-finalization register is replayed.
@@ -479,33 +499,35 @@ pub fn build_microvm_from_snapshot(
     }
 
     #[cfg(target_arch = "aarch64")]
-    restore_vcpus_in_order(
-        &mut vcpus,
-        |index, vcpu| {
-            vcpu.kvm_vcpu
-                .prepare_restore_state(&microvm_state.vcpu_states[index])
-                .map_err(VcpuError::VcpuResponse)
-                .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)
-        },
-        |vcpus| {
-            let saved_counter = canonical_saved_counter(&microvm_state.vcpu_states)?;
-            let boot_vcpu = vcpus.first().ok_or(CounterError::NoBootVcpu)?;
-            vm.configure_counter_for_restore(&boot_vcpu.kvm_vcpu.fd, saved_counter)?;
-            Ok(())
-        },
-        |index, vcpu| {
-            vcpu.kvm_vcpu
-                .finalize_restore_state(&microvm_state.vcpu_states[index])
-                .map_err(VcpuError::VcpuResponse)
-                .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)
-        },
-        |index, vcpu| {
-            vcpu.kvm_vcpu
-                .replay_restore_state(&microvm_state.vcpu_states[index])
-                .map_err(VcpuError::VcpuResponse)
-                .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)
-        },
-    )?;
+    with_validated_restored_vcpu_features(&microvm_state.vcpu_states, || {
+        restore_vcpus_in_order(
+            &mut vcpus,
+            |index, vcpu| {
+                vcpu.kvm_vcpu
+                    .prepare_restore_state(&microvm_state.vcpu_states[index])
+                    .map_err(VcpuError::VcpuResponse)
+                    .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)
+            },
+            |vcpus| {
+                let saved_counter = canonical_saved_counter(&microvm_state.vcpu_states)?;
+                let boot_vcpu = vcpus.first().ok_or(CounterError::NoBootVcpu)?;
+                vm.configure_counter_for_restore(&boot_vcpu.kvm_vcpu.fd, saved_counter)?;
+                Ok(())
+            },
+            |index, vcpu| {
+                vcpu.kvm_vcpu
+                    .finalize_restore_state(&microvm_state.vcpu_states[index])
+                    .map_err(VcpuError::VcpuResponse)
+                    .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)
+            },
+            |index, vcpu| {
+                vcpu.kvm_vcpu
+                    .replay_restore_state(&microvm_state.vcpu_states[index])
+                    .map_err(VcpuError::VcpuResponse)
+                    .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)
+            },
+        )
+    })??;
 
     #[cfg(target_arch = "x86_64")]
     for (vcpu, state) in vcpus.iter_mut().zip(microvm_state.vcpu_states.iter()) {
@@ -813,6 +835,11 @@ fn attach_balloon_device(
 #[cfg(test)]
 pub(crate) mod tests {
 
+    #[cfg(target_arch = "aarch64")]
+    use std::cell::Cell;
+
+    #[cfg(target_arch = "aarch64")]
+    use kvm_bindings::KVM_ARM_VCPU_HAS_EL2_E2H0;
     use linux_loader::cmdline::Cmdline;
     use vmm_sys_util::tempfile::TempFile;
 
@@ -836,6 +863,29 @@ pub(crate) mod tests {
     use crate::vmm_config::vsock::{VsockBuilder, VsockDeviceConfig};
     use crate::vstate::vm::Vm;
     use crate::vstate::vm::tests::setup_vm_with_memory;
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_invalid_restored_kvi_blocks_vcpu_prepare() {
+        let mut vcpu_states = vec![VcpuState::default(), VcpuState::default()];
+        vcpu_states[1].kvi.features[0] = 1 << KVM_ARM_VCPU_HAS_EL2_E2H0;
+        let prepare_called = Cell::new(false);
+
+        let result = with_validated_restored_vcpu_features(&vcpu_states, || {
+            prepare_called.set(true);
+        });
+
+        assert!(
+            matches!(
+                result,
+                Err(BuildMicrovmFromSnapshotError::CreateMicrovmAndVcpus(
+                    StartMicrovmError::ConfigureSystem(ConfigurationError::UnsupportedE2h0)
+                ))
+            ) && !prepare_called.get(),
+            "invalid saved KVI must fail before prepare: result={result:?}, prepare_called={}",
+            prepare_called.get()
+        );
+    }
 
     #[derive(Debug)]
     pub(crate) struct CustomBlockConfig {

@@ -315,10 +315,22 @@ impl fmt::Debug for PrebootApiController<'_> {
 pub enum LoadSnapshotError {
     /// Loading a microVM snapshot not allowed after configuring boot-specific resources.
     LoadSnapshotNotAllowed,
+    /// Loading a snapshot with --enable-nv2 is unsupported; vCPU features come from the snapshot.
+    Nv2NotAllowedOnRestore,
     /// Failed to restore from snapshot: {0}
     RestoreFromSnapshot(#[from] RestoreFromSnapshotError),
     /// Failed to resume microVM: {0}
     ResumeMicrovm(#[from] VmmError),
+}
+
+fn validate_snapshot_load(boot_path: bool, nv2_enabled: bool) -> Result<(), LoadSnapshotError> {
+    if boot_path {
+        Err(LoadSnapshotError::LoadSnapshotNotAllowed)
+    } else if nv2_enabled {
+        Err(LoadSnapshotError::Nv2NotAllowedOnRestore)
+    } else {
+        Ok(())
+    }
 }
 
 /// Shorthand type for a request containing a boxed VmmAction.
@@ -648,8 +660,7 @@ impl<'a> PrebootApiController<'a> {
     ) -> Result<VmmData, LoadSnapshotError> {
         let load_start_us = get_time_us(ClockType::Monotonic);
 
-        if self.boot_path {
-            let err = LoadSnapshotError::LoadSnapshotNotAllowed;
+        if let Err(err) = validate_snapshot_load(self.boot_path, self.vm_resources.nv2_enabled) {
             info!("{}", err);
             return Err(err);
         }
@@ -1343,5 +1354,18 @@ mod tests {
         check_unsupported(runtime_request(VmmAction::SetMemoryHotplugDevice(
             MemoryHotplugConfig::default(),
         )));
+    }
+
+    #[test]
+    fn test_snapshot_restore_rejects_enable_nv2() {
+        validate_snapshot_load(false, false).unwrap();
+        assert!(matches!(
+            validate_snapshot_load(false, true),
+            Err(LoadSnapshotError::Nv2NotAllowedOnRestore)
+        ));
+        assert!(matches!(
+            validate_snapshot_load(true, true),
+            Err(LoadSnapshotError::LoadSnapshotNotAllowed)
+        ));
     }
 }
