@@ -616,7 +616,6 @@ dependencies = [
  "event-manager",
  "libc",
  "log-instrument",
- "memfd",
  "micro_http",
  "seccompiler",
  "semver",
