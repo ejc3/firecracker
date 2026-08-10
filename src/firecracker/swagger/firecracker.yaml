@@ -1461,13 +1461,15 @@ definitions:
         enum:
           - File
           - Uffd
+          - UffdMinor
       backend_path:
         type: string
         description: Based on 'backend_type' it is either
           1) Path to the file that contains the guest memory to be loaded
           2) Path to the UDS where a process is listening for a UFFD initialization
           control payload and open file descriptor that it can use to serve this
-          process's guest memory page faults
+          process's guest memory page faults. For UffdMinor, the handler first
+          supplies the private backing-file descriptor over this UDS.
 
   Metrics:
     type: object
