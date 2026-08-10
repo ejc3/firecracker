@@ -13,16 +13,14 @@ use std::cell::Cell;
 use std::error::Error;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 
-use memfd::{FileSeal, MemfdOptions};
 use uffd_utils::{Runtime, UffdHandler};
 use userfaultfd::{Event, FaultKind};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 const UFFD_MINOR_BACKING_HELLO_V1: &[u8] = b"FCVM_UFFD_MINOR_BACKING";
-const UFFD_MINOR_MEMFD_NAME: &str = "firecracker_uffd_minor_test";
 
 trait MinorBackingSocket {
     fn send_with_fd_once(
@@ -57,12 +55,22 @@ fn create_minor_backing(snapshot_path: &str) -> Result<File, Box<dyn Error>> {
         );
     }
 
-    let backing = MemfdOptions::default()
-        .allow_sealing(true)
-        .create(UFFD_MINOR_MEMFD_NAME)?;
-    backing.as_file().set_len(snapshot_len)?;
+    // SAFETY: the name is a valid NUL-terminated C string and successful `memfd_create`
+    // transfers ownership of a new descriptor to this process.
+    let backing_fd = unsafe {
+        libc::memfd_create(
+            c"firecracker_uffd_minor_test".as_ptr(),
+            libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC,
+        )
+    };
+    if backing_fd < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: `backing_fd` was just returned by `memfd_create` and has no other owner.
+    let backing = unsafe { File::from_raw_fd(backing_fd) };
+    backing.set_len(snapshot_len)?;
 
-    let mut destination = backing.as_file().try_clone()?;
+    let mut destination = backing.try_clone()?;
     let copied = io::copy(
         &mut Read::by_ref(&mut snapshot).take(snapshot_len),
         &mut destination,
@@ -86,15 +94,14 @@ fn create_minor_backing(snapshot_path: &str) -> Result<File, Box<dyn Error>> {
     destination.flush()?;
     drop(destination);
 
-    let seals = [
-        FileSeal::SealShrink,
-        FileSeal::SealGrow,
-        FileSeal::SealWrite,
-        FileSeal::SealSeal,
-    ];
-    backing.add_seals(&seals)?;
+    let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL;
+    // SAFETY: `backing` owns a valid memfd created with `MFD_ALLOW_SEALING`, and the third
+    // argument is the integer bit mask required by `F_ADD_SEALS`.
+    if unsafe { libc::fcntl(backing.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
 
-    Ok(backing.into_file())
+    Ok(backing)
 }
 
 fn send_minor_backing<S: MinorBackingSocket>(stream: &mut S, backing: &File) -> io::Result<()> {
@@ -165,6 +172,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::FileExt;
+
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
@@ -198,6 +207,45 @@ mod tests {
             self.payload.extend_from_slice(payload);
             Ok(())
         }
+    }
+
+    #[test]
+    fn test_minor_backing_copies_and_seals_snapshot() {
+        const SNAPSHOT: &[u8] = b"snapshot memory contents";
+        let snapshot = TempFile::new().unwrap();
+        std::fs::write(snapshot.as_path(), SNAPSHOT).unwrap();
+
+        let backing = create_minor_backing(snapshot.as_path().to_str().unwrap()).unwrap();
+
+        assert_eq!(backing.metadata().unwrap().len(), SNAPSHOT.len() as u64);
+        let mut actual = vec![0; SNAPSHOT.len()];
+        backing.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(actual, SNAPSHOT);
+
+        // SAFETY: `backing` owns a valid descriptor and F_GET_SEALS takes no third argument.
+        let seals = unsafe { libc::fcntl(backing.as_raw_fd(), libc::F_GET_SEALS) };
+        assert_eq!(
+            seals,
+            libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL
+        );
+        assert_eq!(
+            backing.write_at(b"X", 0).unwrap_err().raw_os_error(),
+            Some(libc::EPERM)
+        );
+        assert_eq!(
+            backing
+                .set_len(SNAPSHOT.len() as u64 + 1)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
+        assert_eq!(
+            backing
+                .set_len(SNAPSHOT.len() as u64 - 1)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
     }
 
     #[test]
