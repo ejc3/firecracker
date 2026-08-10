@@ -12,8 +12,9 @@ import requests
 
 from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel
 from framework.utils import Timeout, check_output
+from framework.utils_uffd import UFFD_MINOR_BACKING_MEMFD_NAME
 
-MINOR_BACKING_NAME = "memfd:firecracker_uffd_minor_test"
+MINOR_BACKING_NAME = f"memfd:{UFFD_MINOR_BACKING_MEMFD_NAME}"
 MINOR_MARKER = "/dev/shm/uffd-minor-marker"
 MINOR_MARKER_SIZE = 8 * 1024 * 1024
 

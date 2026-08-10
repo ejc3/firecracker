@@ -13,6 +13,9 @@ from framework.utils import chroot
 from host_tools import cargo_build
 
 SOCKET_PATH = "/firecracker-uffd.sock"
+# Keep this test-fixture contract synchronized with UFFD_MINOR_BACKING_MEMFD_NAME in
+# src/firecracker/examples/uffd/minor_handler.rs.
+UFFD_MINOR_BACKING_MEMFD_NAME = "firecracker_uffd_minor_test"
 
 
 class UffdHandler:
@@ -92,7 +95,7 @@ class UffdHandler:
     def backing_memfd_path(self):
         """Return the procfs path of the minor handler's sealed backing memfd."""
         assert self.is_running()
-        expected_target = "/memfd:firecracker_uffd_minor_test (deleted)"
+        expected_target = f"/memfd:{UFFD_MINOR_BACKING_MEMFD_NAME} (deleted)"
         matches = []
         for descriptor in Path(f"/proc/{self.proc.pid}/fd").iterdir():
             try:
