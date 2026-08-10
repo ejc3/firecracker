@@ -7,7 +7,7 @@ use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::mem::forget;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -51,6 +51,30 @@ use crate::{EventManager, Vmm, vstate};
 // handshake must use a new magic rather than accepting ambiguous payloads on this stream.
 const UFFD_MINOR_BACKING_HELLO_V1: &[u8] = b"FCVM_UFFD_MINOR_BACKING";
 const UFFD_MINOR_BACKING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+trait UffdHandshakeSocket {
+    fn send_with_fd_once(
+        &mut self,
+        payload: &[u8],
+        fd: RawFd,
+    ) -> Result<usize, vmm_sys_util::errno::Error>;
+
+    fn write_remaining(&mut self, payload: &[u8]) -> io::Result<()>;
+}
+
+impl UffdHandshakeSocket for UnixStream {
+    fn send_with_fd_once(
+        &mut self,
+        payload: &[u8],
+        fd: RawFd,
+    ) -> Result<usize, vmm_sys_util::errno::Error> {
+        self.send_with_fd(payload, fd)
+    }
+
+    fn write_remaining(&mut self, payload: &[u8]) -> io::Result<()> {
+        self.write_all(payload)
+    }
+}
 
 /// Holds information related to the VM that is not part of VmState.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -556,6 +580,8 @@ pub enum GuestMemoryFromUffdError {
     Connect(#[from] std::io::Error),
     /// Failed to sends file descriptor: {0}
     Send(#[from] vmm_sys_util::errno::Error),
+    /// Failed to send the complete UFFD mappings payload: {0}
+    SendPayload(std::io::Error),
     /// The UFFD handler did not send a guest memory backing file descriptor.
     NoBackingFile,
     /// The UFFD handler sent an invalid minor-backing protocol greeting.
@@ -801,8 +827,34 @@ fn create_backend_mappings(
     backend_mappings
 }
 
+fn send_uffd_payload(
+    socket: &mut impl UffdHandshakeSocket,
+    payload: &[u8],
+    fd: RawFd,
+) -> Result<(), GuestMemoryFromUffdError> {
+    let written = socket.send_with_fd_once(payload, fd)?;
+    if written == 0 {
+        return Err(GuestMemoryFromUffdError::SendPayload(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "descriptor-bearing UFFD mappings send wrote zero bytes",
+        )));
+    }
+    if written > payload.len() {
+        return Err(GuestMemoryFromUffdError::SendPayload(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "descriptor-bearing UFFD mappings send reported too many bytes",
+        )));
+    }
+    if written < payload.len() {
+        socket
+            .write_remaining(&payload[written..])
+            .map_err(GuestMemoryFromUffdError::SendPayload)?;
+    }
+    Ok(())
+}
+
 fn send_uffd_handshake(
-    socket: UnixStream,
+    mut socket: UnixStream,
     backend_mappings: &[GuestRegionUffdMapping],
     uffd: &impl AsRawFd,
 ) -> Result<(), GuestMemoryFromUffdError> {
@@ -810,7 +862,8 @@ fn send_uffd_handshake(
     // (i.e GuestRegionUffdMapping entries).
     let backend_mappings = serde_json::to_string(backend_mappings).unwrap();
 
-    socket.send_with_fd(
+    send_uffd_payload(
+        &mut socket,
         backend_mappings.as_bytes(),
         // In the happy case we can close the fd since the other process has it open and is
         // using it to serve us pages.
@@ -871,6 +924,7 @@ mod tests {
         CustomBlockConfig, default_kernel_cmdline, default_vmm, insert_balloon_device,
         insert_block_devices, insert_net_device, insert_vsock_device,
     };
+
     #[cfg(target_arch = "aarch64")]
     use crate::construct_kvm_mpidrs;
     use crate::devices::virtio::block::CacheType;
@@ -879,6 +933,36 @@ mod tests {
     use crate::vmm_config::net::NetworkInterfaceConfig;
     use crate::vmm_config::vsock::tests::default_config;
     use crate::vstate::memory::{GuestMemoryRegionState, GuestRegionType};
+
+    struct PartialHandshakeSocket {
+        first_write_len: usize,
+        payload: Vec<u8>,
+        sent_fds: Vec<RawFd>,
+        remaining_writes: usize,
+        remaining_error: Option<io::ErrorKind>,
+    }
+
+    impl UffdHandshakeSocket for PartialHandshakeSocket {
+        fn send_with_fd_once(
+            &mut self,
+            payload: &[u8],
+            fd: RawFd,
+        ) -> Result<usize, vmm_sys_util::errno::Error> {
+            let recorded = self.first_write_len.min(payload.len());
+            self.payload.extend_from_slice(&payload[..recorded]);
+            self.sent_fds.push(fd);
+            Ok(self.first_write_len)
+        }
+
+        fn write_remaining(&mut self, payload: &[u8]) -> io::Result<()> {
+            self.remaining_writes += 1;
+            if let Some(error_kind) = self.remaining_error {
+                return Err(io::Error::from(error_kind));
+            }
+            self.payload.extend_from_slice(payload);
+            Ok(())
+        }
+    }
 
     fn default_vmm_with_devices() -> Vmm {
         let mut event_manager = EventManager::new().expect("Cannot create EventManager");
@@ -1044,6 +1128,93 @@ mod tests {
             serde_json::from_slice(&message_buf).unwrap();
 
         assert_eq!(uffd_regions, deserialized);
+    }
+
+    #[test]
+    fn test_uffd_handshake_completes_partial_send() {
+        let expected = b"complete mappings payload";
+        let sent_fd = 42;
+        let mut socket = PartialHandshakeSocket {
+            first_write_len: 5,
+            payload: Vec::new(),
+            sent_fds: Vec::new(),
+            remaining_writes: 0,
+            remaining_error: None,
+        };
+
+        send_uffd_payload(&mut socket, expected, sent_fd).unwrap();
+
+        assert_eq!(socket.payload, expected);
+        assert_eq!(socket.sent_fds, [sent_fd]);
+        assert_eq!(socket.remaining_writes, 1);
+    }
+
+    #[test]
+    fn test_uffd_handshake_full_send_has_no_plain_tail() {
+        let expected = b"complete mappings payload";
+        let sent_fd = 42;
+        let mut socket = PartialHandshakeSocket {
+            first_write_len: expected.len(),
+            payload: Vec::new(),
+            sent_fds: Vec::new(),
+            remaining_writes: 0,
+            remaining_error: None,
+        };
+
+        send_uffd_payload(&mut socket, expected, sent_fd).unwrap();
+
+        assert_eq!(socket.payload, expected);
+        assert_eq!(socket.sent_fds, [sent_fd]);
+        assert_eq!(socket.remaining_writes, 0);
+    }
+
+    #[test]
+    fn test_uffd_handshake_rejects_invalid_send_lengths() {
+        let expected = b"complete mappings payload";
+        for (first_write_len, error_kind) in [
+            (0, io::ErrorKind::WriteZero),
+            (expected.len() + 1, io::ErrorKind::InvalidData),
+        ] {
+            let mut socket = PartialHandshakeSocket {
+                first_write_len,
+                payload: Vec::new(),
+                sent_fds: Vec::new(),
+                remaining_writes: 0,
+                remaining_error: None,
+            };
+
+            let error = send_uffd_payload(&mut socket, expected, 42).unwrap_err();
+
+            assert!(matches!(
+                error,
+                GuestMemoryFromUffdError::SendPayload(error) if error.kind() == error_kind
+            ));
+            assert_eq!(socket.sent_fds, [42]);
+            assert_eq!(socket.remaining_writes, 0);
+        }
+    }
+
+    #[test]
+    fn test_uffd_handshake_propagates_plain_tail_error() {
+        let expected = b"complete mappings payload";
+        let mut socket = PartialHandshakeSocket {
+            first_write_len: 5,
+            payload: Vec::new(),
+            sent_fds: Vec::new(),
+            remaining_writes: 0,
+            remaining_error: Some(io::ErrorKind::BrokenPipe),
+        };
+
+        let error = send_uffd_payload(&mut socket, expected, 42).unwrap_err();
+
+        assert!(matches!(
+            error,
+            GuestMemoryFromUffdError::SendPayload(error)
+                if error.kind() == io::ErrorKind::BrokenPipe
+        ));
+        assert_eq!(socket.payload, &expected[..5]);
+        assert_eq!(socket.sent_fds, [42]);
+        assert_eq!(socket.remaining_writes, 1);
     }
 
     #[test]
