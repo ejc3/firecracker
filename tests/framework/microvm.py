@@ -1111,6 +1111,7 @@ class Microvm:
         *,
         huge_pages: Optional[HugePagesConfig] = None,
         uffd_handler_name: str = None,
+        uffd_backend_type: str = "Uffd",
     ):
         """Restore a snapshot"""
 
@@ -1140,8 +1141,9 @@ class Microvm:
 
         mem_backend = {"backend_type": "File", "backend_path": str(jailed_mem)}
         if self.uffd_handler is not None:
+            assert uffd_backend_type in ("Uffd", "UffdMinor")
             mem_backend = {
-                "backend_type": "Uffd",
+                "backend_type": uffd_backend_type,
                 "backend_path": str(self.uffd_handler.socket_path),
             }
 
@@ -1344,7 +1346,11 @@ class MicroVMFactory:
         return vm
 
     def build_from_snapshot(
-        self, snapshot: Snapshot, uffd_handler_name=None, clock_realtime=False
+        self,
+        snapshot: Snapshot,
+        uffd_handler_name=None,
+        clock_realtime=False,
+        uffd_backend_type="Uffd",
     ):
         """Build a microvm from a snapshot"""
         vm = self.build()
@@ -1354,6 +1360,7 @@ class MicroVMFactory:
             resume=True,
             uffd_handler_name=uffd_handler_name,
             clock_realtime=clock_realtime,
+            uffd_backend_type=uffd_backend_type,
         )
         return vm
 

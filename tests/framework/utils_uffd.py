@@ -5,8 +5,9 @@
 import os
 import stat
 import subprocess
-import time
 from pathlib import Path
+
+from tenacity import Retrying, stop_after_delay, wait_fixed
 
 from framework.utils import chroot
 from host_tools import cargo_build
@@ -46,15 +47,25 @@ class UffdHandler:
                     args, stdout=logfile, stderr=subprocess.STDOUT
                 )
 
-            # Give it time start and fail, if it really has too (bad things happen).
-            time.sleep(1)
-            if not self.is_running():
-                print(chroot_log_file.read_text(encoding="utf-8"))
-                assert False, "Could not start PF handler!"
+            try:
+                for attempt in Retrying(
+                    wait=wait_fixed(0.01), stop=stop_after_delay(5), reraise=True
+                ):
+                    with attempt:
+                        assert self.is_running(), chroot_log_file.read_text(
+                            encoding="utf-8"
+                        )
+                        assert Path(self.socket_path).is_socket()
 
-            # The page fault handler will create the socket path with root rights.
-            # Change rights to the jailer's.
-            os.chown(self.socket_path, uid, gid)
+                # The page fault handler creates the socket with root ownership.
+                os.chown(self.socket_path, uid, gid)
+            except BaseException:
+                if self.is_running():
+                    self._proc.kill()
+                if self._proc is not None:
+                    self._proc.wait(timeout=5)
+                    self._proc = None
+                raise
 
     @property
     def proc(self):
@@ -76,6 +87,25 @@ class UffdHandler:
         if self.log_file is None:
             return ""
         return self.log_file.read_text(encoding="utf-8")
+
+    @property
+    def backing_memfd_path(self):
+        """Return the procfs path of the minor handler's sealed backing memfd."""
+        assert self.is_running()
+        expected_target = "/memfd:firecracker_uffd_minor_test (deleted)"
+        matches = []
+        for descriptor in Path(f"/proc/{self.proc.pid}/fd").iterdir():
+            try:
+                if descriptor.readlink().as_posix() == expected_target:
+                    matches.append(descriptor)
+            except FileNotFoundError:
+                # The process can close unrelated descriptors while procfs is scanned.
+                continue
+        assert len(matches) == 1, (
+            f"expected one {expected_target} descriptor for handler {self.proc.pid}, "
+            f"found {matches}"
+        )
+        return matches[0]
 
     def kill(self):
         """Kills the uffd handler process"""
