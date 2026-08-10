@@ -21,7 +21,7 @@ use crate::arch::EntryPoint;
 use crate::arch::aarch64::regs::{Aarch64RegisterVec, KVM_REG_ARM64_SVE_VLS};
 use crate::cpu_config::aarch64::custom_cpu_template::VcpuFeatures;
 use crate::cpu_config::templates::CpuConfiguration;
-use crate::logger::{IncMetric, METRICS, error};
+use crate::logger::{IncMetric, METRICS, error, warn};
 use crate::vcpu::{VcpuConfig, VcpuError};
 use crate::vstate::bus::Bus;
 use crate::vstate::memory::{Address, GuestMemoryMmap};
@@ -45,8 +45,6 @@ pub enum VcpuArchError {
     Fam(vmm_sys_util::fam::Error),
     /// Failed to set/get device attributes for vCPU: {0}
     DeviceAttribute(kvm_ioctls::Error),
-    /// KVM_ARM_VCPU_HAS_EL2_E2H0 is unsupported; Arm nested virtualization requires VHE.
-    UnsupportedE2h0,
 }
 
 /// Extract the Manufacturer ID from the host.
@@ -102,19 +100,16 @@ pub enum KvmVcpuError {
     SaveState(VcpuArchError),
     /// Found unsupported KVM_ARM_VCPU_PMU_V3 bit set in vcpu features.
     UnsupportedPmuV3,
-    /// Found unsupported KVM_ARM_VCPU_HAS_EL2_E2H0 bit set in vcpu features.
-    UnsupportedE2h0,
 }
 
 /// Error type for [`KvmVcpu::configure`].
 pub type KvmVcpuConfigureError = KvmVcpuError;
 
 fn validate_vcpu_init_feature_word(feature_word: u32) -> Result<(), KvmVcpuError> {
-    if feature_word & (1 << KVM_ARM_VCPU_HAS_EL2_E2H0) != 0 {
-        Err(KvmVcpuError::UnsupportedE2h0)
-    } else {
-        Ok(())
-    }
+    super::validate_arm_vcpu_init_feature_word(feature_word).map_err(|error| {
+        warn!("Invalid Arm vCPU initialization features: {error}");
+        KvmVcpuError::Init(kvm_ioctls::Error::new(libc::EINVAL))
+    })
 }
 
 /// A wrapper around creating and using a kvm aarch64 vcpu.
@@ -376,9 +371,11 @@ impl KvmVcpu {
         let has_el2 = 1 << KVM_ARM_VCPU_HAS_EL2;
         let has_el2_e2h0 = 1 << KVM_ARM_VCPU_HAS_EL2_E2H0;
         let feature_word = self.kvi.features[0];
-        if feature_word & has_el2_e2h0 != 0 {
-            return Err(VcpuArchError::UnsupportedE2h0);
-        }
+        debug_assert_eq!(
+            feature_word & has_el2_e2h0,
+            0,
+            "KVM_ARM_VCPU_HAS_EL2_E2H0 must be rejected before boot register setup"
+        );
         let boot_mode = if feature_word & has_el2 != 0 {
             ArmBootMode::El2Vhe
         } else {
@@ -763,7 +760,7 @@ mod tests {
 
         assert!(matches!(
             validate_vcpu_init_feature_word(has_el2_e2h0),
-            Err(KvmVcpuError::UnsupportedE2h0)
+            Err(KvmVcpuError::Init(error)) if error.errno() == libc::EINVAL
         ));
     }
 

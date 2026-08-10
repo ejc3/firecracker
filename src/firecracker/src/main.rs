@@ -56,6 +56,12 @@ const FIRECRACKER_VERSION: &str = if cfg!(feature = "fuzzing") {
 };
 const MMDS_CONTENT_ARG: &str = "metadata";
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ProcessConfig {
+    #[cfg(target_arch = "aarch64")]
+    nv2_enabled: bool,
+}
+
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 enum MainError {
     /// Failed to set the logger: {0}
@@ -410,7 +416,12 @@ fn main_exec() -> Result<(), MainError> {
 
     let boot_timer_enabled = arguments.flag_present("boot-timer");
     let pci_enabled = arguments.flag_present("enable-pci");
-    let nv2_enabled = arguments.flag_present("enable-nv2");
+    #[cfg(target_arch = "aarch64")]
+    let process_config = ProcessConfig {
+        nv2_enabled: arguments.flag_present("enable-nv2"),
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let process_config = ProcessConfig::default();
     let api_enabled = !arguments.flag_present("no-api");
     let api_payload_limit = arg_parser
         .arguments()
@@ -465,7 +476,7 @@ fn main_exec() -> Result<(), MainError> {
             process_time_reporter,
             boot_timer_enabled,
             pci_enabled,
-            nv2_enabled,
+            process_config,
             api_payload_limit,
             mmds_size_limit,
             metadata_json.as_deref(),
@@ -482,7 +493,7 @@ fn main_exec() -> Result<(), MainError> {
             instance_info,
             boot_timer_enabled,
             pci_enabled,
-            nv2_enabled,
+            process_config,
             mmds_size_limit,
             metadata_json.as_deref(),
         )
@@ -608,7 +619,7 @@ fn build_microvm_from_json(
     instance_info: InstanceInfo,
     boot_timer_enabled: bool,
     pci_enabled: bool,
-    nv2_enabled: bool,
+    _process_config: ProcessConfig,
     mmds_size_limit: usize,
     metadata_json: Option<&str>,
 ) -> Result<Arc<Mutex<vmm::Vmm>>, BuildFromJsonError> {
@@ -617,7 +628,16 @@ fn build_microvm_from_json(
             .map_err(BuildFromJsonError::ParseFromJson)?;
     vm_resources.boot_timer = boot_timer_enabled;
     vm_resources.pci_enabled = pci_enabled;
-    vm_resources.nv2_enabled = nv2_enabled;
+    #[cfg(target_arch = "aarch64")]
+    let vmm = vmm::builder::build_and_boot_microvm_with_nv2(
+        &instance_info,
+        &vm_resources,
+        event_manager,
+        seccomp_filters,
+        _process_config.nv2_enabled,
+    )
+    .map_err(BuildFromJsonError::StartMicroVM)?;
+    #[cfg(not(target_arch = "aarch64"))]
     let vmm = vmm::builder::build_and_boot_microvm(
         &instance_info,
         &vm_resources,
@@ -650,7 +670,7 @@ fn run_without_api(
     instance_info: InstanceInfo,
     bool_timer_enabled: bool,
     pci_enabled: bool,
-    nv2_enabled: bool,
+    process_config: ProcessConfig,
     mmds_size_limit: usize,
     metadata_json: Option<&str>,
 ) -> Result<(), RunWithoutApiError> {
@@ -669,7 +689,7 @@ fn run_without_api(
         instance_info,
         bool_timer_enabled,
         pci_enabled,
-        nv2_enabled,
+        process_config,
         mmds_size_limit,
         metadata_json,
     )

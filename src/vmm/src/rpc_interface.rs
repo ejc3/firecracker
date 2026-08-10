@@ -7,7 +7,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde_json::Value;
 use utils::time::{ClockType, get_time_us};
 
+#[cfg(not(target_arch = "aarch64"))]
 use super::builder::build_and_boot_microvm;
+#[cfg(target_arch = "aarch64")]
+use super::builder::build_and_boot_microvm_with_nv2;
 use super::persist::{create_snapshot, restore_from_snapshot};
 use super::resources::VmResources;
 use super::{Vmm, VmmError};
@@ -279,6 +282,25 @@ fn mmds_put_data(
         })
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ProcessConfig {
+    #[cfg(target_arch = "aarch64")]
+    nv2_enabled: bool,
+}
+
+impl ProcessConfig {
+    fn nv2_enabled(self) -> bool {
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.nv2_enabled
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            false
+        }
+    }
+}
+
 /// Enables pre-boot setup and instantiation of a Firecracker VMM.
 pub struct PrebootApiController<'a> {
     seccomp_filters: &'a BpfThreadMap,
@@ -290,6 +312,8 @@ pub struct PrebootApiController<'a> {
     // Configuring boot specific resources will set this to true.
     // Loading from snapshot will not be allowed once this is true.
     boot_path: bool,
+    // Process-only policy that must not become part of VmResources or snapshot state.
+    process_config: ProcessConfig,
     // Some PrebootApiRequest errors are irrecoverable and Firecracker
     // should cleanly teardown if they occur.
     fatal_error: Option<BuildMicrovmFromRequestsError>,
@@ -305,6 +329,7 @@ impl fmt::Debug for PrebootApiController<'_> {
             .field("event_manager", &"?")
             .field("built_vmm", &self.built_vmm)
             .field("boot_path", &self.boot_path)
+            .field("process_config", &self.process_config)
             .field("fatal_error", &self.fatal_error)
             .finish()
     }
@@ -313,10 +338,8 @@ impl fmt::Debug for PrebootApiController<'_> {
 /// Error type for [`PrebootApiController::load_snapshot`]
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum LoadSnapshotError {
-    /// Loading a microVM snapshot not allowed after configuring boot-specific resources.
+    /// Loading a microVM snapshot is not allowed with the current process configuration.
     LoadSnapshotNotAllowed,
-    /// Loading a snapshot with --enable-nv2 is unsupported; vCPU features come from the snapshot.
-    Nv2NotAllowedOnRestore,
     /// Failed to restore from snapshot: {0}
     RestoreFromSnapshot(#[from] RestoreFromSnapshotError),
     /// Failed to resume microVM: {0}
@@ -324,10 +347,8 @@ pub enum LoadSnapshotError {
 }
 
 fn validate_snapshot_load(boot_path: bool, nv2_enabled: bool) -> Result<(), LoadSnapshotError> {
-    if boot_path {
+    if boot_path || nv2_enabled {
         Err(LoadSnapshotError::LoadSnapshotNotAllowed)
-    } else if nv2_enabled {
-        Err(LoadSnapshotError::Nv2NotAllowedOnRestore)
     } else {
         Ok(())
     }
@@ -359,6 +380,22 @@ impl<'a> PrebootApiController<'a> {
         vm_resources: &'a mut VmResources,
         event_manager: &'a mut EventManager,
     ) -> Self {
+        Self::new_with_process_config(
+            seccomp_filters,
+            instance_info,
+            vm_resources,
+            event_manager,
+            ProcessConfig::default(),
+        )
+    }
+
+    fn new_with_process_config(
+        seccomp_filters: &'a BpfThreadMap,
+        instance_info: InstanceInfo,
+        vm_resources: &'a mut VmResources,
+        event_manager: &'a mut EventManager,
+        process_config: ProcessConfig,
+    ) -> Self {
         Self {
             seccomp_filters,
             instance_info,
@@ -366,6 +403,7 @@ impl<'a> PrebootApiController<'a> {
             event_manager,
             built_vmm: None,
             boot_path: false,
+            process_config,
             fatal_error: None,
         }
     }
@@ -383,7 +421,66 @@ impl<'a> PrebootApiController<'a> {
         api_event_fd: &vmm_sys_util::eventfd::EventFd,
         boot_timer_enabled: bool,
         pci_enabled: bool,
+        mmds_size_limit: usize,
+        metadata_json: Option<&str>,
+    ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromRequestsError> {
+        Self::build_microvm_from_requests_with_process_config(
+            seccomp_filters,
+            event_manager,
+            instance_info,
+            from_api,
+            to_api,
+            api_event_fd,
+            boot_timer_enabled,
+            pci_enabled,
+            ProcessConfig::default(),
+            mmds_size_limit,
+            metadata_json,
+        )
+    }
+
+    /// Builds and starts an Arm microVM from API requests with process-level NV2 policy.
+    #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_microvm_from_requests_with_nv2(
+        seccomp_filters: &BpfThreadMap,
+        event_manager: &mut EventManager,
+        instance_info: InstanceInfo,
+        from_api: &std::sync::mpsc::Receiver<ApiRequest>,
+        to_api: &std::sync::mpsc::Sender<ApiResponse>,
+        api_event_fd: &vmm_sys_util::eventfd::EventFd,
+        boot_timer_enabled: bool,
+        pci_enabled: bool,
         nv2_enabled: bool,
+        mmds_size_limit: usize,
+        metadata_json: Option<&str>,
+    ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromRequestsError> {
+        Self::build_microvm_from_requests_with_process_config(
+            seccomp_filters,
+            event_manager,
+            instance_info,
+            from_api,
+            to_api,
+            api_event_fd,
+            boot_timer_enabled,
+            pci_enabled,
+            ProcessConfig { nv2_enabled },
+            mmds_size_limit,
+            metadata_json,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_microvm_from_requests_with_process_config(
+        seccomp_filters: &BpfThreadMap,
+        event_manager: &mut EventManager,
+        instance_info: InstanceInfo,
+        from_api: &std::sync::mpsc::Receiver<ApiRequest>,
+        to_api: &std::sync::mpsc::Sender<ApiResponse>,
+        api_event_fd: &vmm_sys_util::eventfd::EventFd,
+        boot_timer_enabled: bool,
+        pci_enabled: bool,
+        process_config: ProcessConfig,
         mmds_size_limit: usize,
         metadata_json: Option<&str>,
     ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromRequestsError> {
@@ -391,7 +488,6 @@ impl<'a> PrebootApiController<'a> {
             boot_timer: boot_timer_enabled,
             mmds_size_limit,
             pci_enabled,
-            nv2_enabled,
             ..Default::default()
         };
 
@@ -404,11 +500,12 @@ impl<'a> PrebootApiController<'a> {
             info!("Successfully added metadata to mmds from file");
         }
 
-        let mut preboot_controller = PrebootApiController::new(
+        let mut preboot_controller = PrebootApiController::new_with_process_config(
             seccomp_filters,
             instance_info,
             &mut vm_resources,
             event_manager,
+            process_config,
         );
 
         // Configure and start microVM through successive API calls.
@@ -639,17 +736,28 @@ impl<'a> PrebootApiController<'a> {
     // On success, this command will end the pre-boot stage and this controller
     // will be replaced by a runtime controller.
     fn start_microvm(&mut self) -> Result<VmmData, VmmActionError> {
-        build_and_boot_microvm(
+        #[cfg(target_arch = "aarch64")]
+        let build_result = build_and_boot_microvm_with_nv2(
             &self.instance_info,
             self.vm_resources,
             self.event_manager,
             self.seccomp_filters,
-        )
-        .map(|vmm| {
-            self.built_vmm = Some(vmm);
-            VmmData::Empty
-        })
-        .map_err(VmmActionError::StartMicrovm)
+            self.process_config.nv2_enabled(),
+        );
+        #[cfg(not(target_arch = "aarch64"))]
+        let build_result = build_and_boot_microvm(
+            &self.instance_info,
+            self.vm_resources,
+            self.event_manager,
+            self.seccomp_filters,
+        );
+
+        build_result
+            .map(|vmm| {
+                self.built_vmm = Some(vmm);
+                VmmData::Empty
+            })
+            .map_err(VmmActionError::StartMicrovm)
     }
 
     // On success, this command will end the pre-boot stage and this controller
@@ -660,7 +768,14 @@ impl<'a> PrebootApiController<'a> {
     ) -> Result<VmmData, LoadSnapshotError> {
         let load_start_us = get_time_us(ClockType::Monotonic);
 
-        if let Err(err) = validate_snapshot_load(self.boot_path, self.vm_resources.nv2_enabled) {
+        let nv2_enabled = self.process_config.nv2_enabled();
+        if nv2_enabled && !self.boot_path {
+            info!(
+                "Loading a snapshot with --enable-nv2 is unsupported; vCPU features come from \
+                 the snapshot."
+            );
+        }
+        if let Err(err) = validate_snapshot_load(self.boot_path, nv2_enabled) {
             info!("{}", err);
             return Err(err);
         }
@@ -1361,7 +1476,7 @@ mod tests {
         validate_snapshot_load(false, false).unwrap();
         assert!(matches!(
             validate_snapshot_load(false, true),
-            Err(LoadSnapshotError::Nv2NotAllowedOnRestore)
+            Err(LoadSnapshotError::LoadSnapshotNotAllowed)
         ));
         assert!(matches!(
             validate_snapshot_load(true, true),

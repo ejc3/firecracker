@@ -143,6 +143,12 @@ impl std::convert::From<linux_loader::cmdline::Error> for StartMicrovmError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ProcessBootConfig {
+    #[cfg(target_arch = "aarch64")]
+    nv2_enabled: bool,
+}
+
 /// Builds and starts a microVM based on the current Firecracker VmResources configuration.
 ///
 /// The built microVM and all the created vCPUs start off in the paused state.
@@ -153,6 +159,22 @@ pub fn build_microvm_for_boot(
     vm_resources: &super::resources::VmResources,
     event_manager: &mut EventManager,
     seccomp_filters: &BpfThreadMap,
+) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    build_microvm_for_boot_with_process_config(
+        instance_info,
+        vm_resources,
+        event_manager,
+        seccomp_filters,
+        ProcessBootConfig::default(),
+    )
+}
+
+fn build_microvm_for_boot_with_process_config(
+    instance_info: &InstanceInfo,
+    vm_resources: &super::resources::VmResources,
+    event_manager: &mut EventManager,
+    seccomp_filters: &BpfThreadMap,
+    _process_config: ProcessBootConfig,
 ) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     // Timestamp for measuring microVM boot duration.
     let request_ts = TimestampUs::default();
@@ -179,6 +201,10 @@ pub fn build_microvm_for_boot(
         .machine_config
         .cpu_template
         .get_cpu_template()?;
+    #[cfg(target_arch = "aarch64")]
+    // Process policy is intentionally applied last so an API-provided template cannot override it.
+    let cpu_template =
+        crate::arch::aarch64::cpu_template_with_nv2(&cpu_template, _process_config.nv2_enabled);
 
     let kvm = Kvm::new(cpu_template.kvm_capabilities.clone())?;
     // Set up KVM VM and register memory regions.
@@ -323,7 +349,6 @@ pub fn build_microvm_for_boot(
         entry_point,
         &initrd,
         boot_cmdline,
-        vm_resources.nv2_enabled,
     )?;
 
     let vmm = Vmm {
@@ -382,8 +407,49 @@ pub fn build_and_boot_microvm(
     event_manager: &mut EventManager,
     seccomp_filters: &BpfThreadMap,
 ) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    build_and_boot_microvm_with_process_config(
+        instance_info,
+        vm_resources,
+        event_manager,
+        seccomp_filters,
+        ProcessBootConfig::default(),
+    )
+}
+
+/// Builds and boots an Arm microVM with the process-level NV2 policy applied after its CPU
+/// template.
+#[cfg(target_arch = "aarch64")]
+pub fn build_and_boot_microvm_with_nv2(
+    instance_info: &InstanceInfo,
+    vm_resources: &super::resources::VmResources,
+    event_manager: &mut EventManager,
+    seccomp_filters: &BpfThreadMap,
+    nv2_enabled: bool,
+) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    build_and_boot_microvm_with_process_config(
+        instance_info,
+        vm_resources,
+        event_manager,
+        seccomp_filters,
+        ProcessBootConfig { nv2_enabled },
+    )
+}
+
+fn build_and_boot_microvm_with_process_config(
+    instance_info: &InstanceInfo,
+    vm_resources: &super::resources::VmResources,
+    event_manager: &mut EventManager,
+    seccomp_filters: &BpfThreadMap,
+    process_config: ProcessBootConfig,
+) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     debug!("event_start: build microvm for boot");
-    let vmm = build_microvm_for_boot(instance_info, vm_resources, event_manager, seccomp_filters)?;
+    let vmm = build_microvm_for_boot_with_process_config(
+        instance_info,
+        vm_resources,
+        event_manager,
+        seccomp_filters,
+        process_config,
+    )?;
     debug!("event_end: build microvm for boot");
     // The vcpus start off in the `Paused` state, let them run.
     debug!("event_start: boot microvm");
@@ -879,8 +945,10 @@ pub(crate) mod tests {
             matches!(
                 result,
                 Err(BuildMicrovmFromSnapshotError::CreateMicrovmAndVcpus(
-                    StartMicrovmError::ConfigureSystem(ConfigurationError::UnsupportedE2h0)
-                ))
+                    StartMicrovmError::ConfigureSystem(ConfigurationError::VcpuConfigure(
+                        crate::arch::KvmVcpuError::Init(error)
+                    ))
+                )) if error.errno() == libc::EINVAL
             ) && !prepare_called.get(),
             "invalid saved KVI must fail before prepare: result={result:?}, prepare_called={}",
             prepare_called.get()
