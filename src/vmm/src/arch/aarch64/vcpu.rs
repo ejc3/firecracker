@@ -14,9 +14,9 @@ use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 use serde::{Deserialize, Serialize};
 use vm_memory::GuestAddress;
 
-use super::ArmBootMode;
 use super::get_fdt_addr;
 use super::regs::*;
+use super::{ArmBootMode, boot_mode_from_validated_feature_word};
 use crate::arch::EntryPoint;
 use crate::arch::aarch64::regs::{Aarch64RegisterVec, KVM_REG_ARM64_SVE_VLS};
 use crate::cpu_config::aarch64::custom_cpu_template::VcpuFeatures;
@@ -110,6 +110,19 @@ fn validate_vcpu_init_feature_word(feature_word: u32) -> Result<(), KvmVcpuError
         warn!("Invalid Arm vCPU initialization features: {error}");
         KvmVcpuError::Init(kvm_ioctls::Error::new(libc::EINVAL))
     })
+}
+
+fn el2_boot_hcr_value() -> u64 {
+    const HCR_E2H: u64 = 1 << 34;
+    const HCR_TGE: u64 = 1 << 27;
+
+    HCR_E2H | HCR_TGE
+}
+
+fn vmpidr_el2_value(_vcpu_index: u8, kvm_mpidr: u64) -> u64 {
+    // Keep the index at this seam so the regression test can prove that a non-linear KVM
+    // affinity mapping is never replaced with a value synthesized from the index.
+    kvm_mpidr
 }
 
 /// A wrapper around creating and using a kvm aarch64 vcpu.
@@ -368,19 +381,8 @@ impl KvmVcpu {
         boot_ip: u64,
         mem: &GuestMemoryMmap,
     ) -> Result<(), VcpuArchError> {
-        let has_el2 = 1 << KVM_ARM_VCPU_HAS_EL2;
-        let has_el2_e2h0 = 1 << KVM_ARM_VCPU_HAS_EL2_E2H0;
         let feature_word = self.kvi.features[0];
-        debug_assert_eq!(
-            feature_word & has_el2_e2h0,
-            0,
-            "KVM_ARM_VCPU_HAS_EL2_E2H0 must be rejected before boot register setup"
-        );
-        let boot_mode = if feature_word & has_el2 != 0 {
-            ArmBootMode::El2Vhe
-        } else {
-            ArmBootMode::El1
-        };
+        let boot_mode = boot_mode_from_validated_feature_word(feature_word);
         let kreg_off = offset_of!(kvm_regs, regs);
 
         // Get the register index of the PSTATE (Processor State) register.
@@ -403,15 +405,7 @@ impl KvmVcpu {
         // When HAS_EL2 is enabled, initialize EL2 system registers for VHE mode.
         // For VHE (E2H=1), the guest kernel runs at EL2 and can use kvm-arm.mode=nested.
         if boot_mode == ArmBootMode::El2Vhe {
-            // Set HCR_EL2 with E2H=1 for VHE mode.
-            // HCR_EL2.E2H (bit 34) enables VHE, allowing the guest kernel to run at EL2.
-            // This is required for kvm-arm.mode=nested to work in the guest.
-            const HCR_E2H: u64 = 1 << 34;
-            // Also set VM bit (bit 0) to enable stage-2 translation
-            const HCR_VM: u64 = 1 << 0;
-            // And TGE (bit 27) for EL0 exceptions to route to EL2
-            const HCR_TGE: u64 = 1 << 27;
-            let hcr_el2_value = HCR_E2H | HCR_VM | HCR_TGE;
+            let hcr_el2_value = el2_boot_hcr_value();
             self.fd
                 .set_one_reg(SYS_HCR_EL2, &hcr_el2_value.to_le_bytes())
                 .map_err(|err| {
@@ -421,9 +415,10 @@ impl KvmVcpu {
             // With HAS_EL2 (NV2), explicitly set VMPIDR_EL2 for the vCPU.
             // KVM's NV2 implementation resets VMPIDR_EL2 to "unknown" (garbage values),
             // causing the guest to read invalid MPIDR and fail to find boot CPU.
-            // VMPIDR_EL2 is what a nested guest sees when it reads MPIDR_EL1.
-            // Format: Aff3[39:32] | 1[31] | Aff2[23:16] | Aff1[15:8] | Aff0[7:0]
-            let expected_mpidr = 0x80000000u64 | (self.index as u64);
+            // VMPIDR_EL2 is what a nested guest sees when it reads MPIDR_EL1. Copy KVM's
+            // mapping verbatim: affinity levels do not form a linear function of the vCPU index.
+            let kvm_mpidr = self.get_mpidr()?;
+            let expected_mpidr = vmpidr_el2_value(self.index, kvm_mpidr);
             self.fd
                 .set_one_reg(SYS_VMPIDR_EL2, &expected_mpidr.to_le_bytes())
                 .map_err(|err| {
@@ -762,6 +757,25 @@ mod tests {
             validate_vcpu_init_feature_word(has_el2_e2h0),
             Err(KvmVcpuError::Init(error)) if error.errno() == libc::EINVAL
         ));
+    }
+
+    #[test]
+    fn test_el2_boot_hcr_disables_stage_two_translation() {
+        let hcr_el2 = el2_boot_hcr_value();
+
+        assert_eq!(hcr_el2 & 1, 0, "HCR_EL2.VM must be clear at boot");
+        assert_eq!(
+            hcr_el2, 0x0000_0004_0800_0000,
+            "only HCR_EL2.E2H and HCR_EL2.TGE must be set"
+        );
+    }
+
+    #[test]
+    fn test_vmpidr_el2_copies_kvm_mpidr_mapping() {
+        let kvm_mpidr = 0x8000_0100_u64.to_le_bytes();
+        let vmpidr = vmpidr_el2_value(16, u64::from_le_bytes(kvm_mpidr)).to_le_bytes();
+
+        assert_eq!(vmpidr, kvm_mpidr);
     }
 
     #[test]

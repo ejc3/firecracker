@@ -619,7 +619,8 @@ fn build_microvm_from_json(
     instance_info: InstanceInfo,
     boot_timer_enabled: bool,
     pci_enabled: bool,
-    _process_config: ProcessConfig,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+    process_config: ProcessConfig,
     mmds_size_limit: usize,
     metadata_json: Option<&str>,
 ) -> Result<Arc<Mutex<vmm::Vmm>>, BuildFromJsonError> {
@@ -634,7 +635,7 @@ fn build_microvm_from_json(
         &vm_resources,
         event_manager,
         seccomp_filters,
-        _process_config.nv2_enabled,
+        process_config.nv2_enabled,
     )
     .map_err(BuildFromJsonError::StartMicroVM)?;
     #[cfg(not(target_arch = "aarch64"))]

@@ -174,7 +174,8 @@ fn build_microvm_for_boot_with_process_config(
     vm_resources: &super::resources::VmResources,
     event_manager: &mut EventManager,
     seccomp_filters: &BpfThreadMap,
-    _process_config: ProcessBootConfig,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+    process_config: ProcessBootConfig,
 ) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     // Timestamp for measuring microVM boot duration.
     let request_ts = TimestampUs::default();
@@ -204,7 +205,7 @@ fn build_microvm_for_boot_with_process_config(
     #[cfg(target_arch = "aarch64")]
     // Process policy is intentionally applied last so an API-provided template cannot override it.
     let cpu_template =
-        crate::arch::aarch64::cpu_template_with_nv2(&cpu_template, _process_config.nv2_enabled);
+        crate::arch::aarch64::cpu_template_with_nv2(&cpu_template, process_config.nv2_enabled);
 
     let kvm = Kvm::new(cpu_template.kvm_capabilities.clone())?;
     // Set up KVM VM and register memory regions.

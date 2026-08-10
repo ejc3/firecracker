@@ -154,14 +154,24 @@ fn validate_arm_vcpu_init_feature_word(feature_word: u32) -> Result<(), ArmFeatu
 }
 
 fn arm_boot_mode(feature_word: u32) -> Result<ArmBootMode, ArmFeatureValidationError> {
-    let has_el2 = 1 << KVM_ARM_VCPU_HAS_EL2;
     validate_arm_vcpu_init_feature_word(feature_word)?;
 
-    Ok(if feature_word & has_el2 != 0 {
+    Ok(boot_mode_from_validated_feature_word(feature_word))
+}
+
+fn boot_mode_from_validated_feature_word(feature_word: u32) -> ArmBootMode {
+    let has_el2 = 1 << KVM_ARM_VCPU_HAS_EL2;
+    debug_assert_eq!(
+        feature_word & (1 << KVM_ARM_VCPU_HAS_EL2_E2H0),
+        0,
+        "KVM_ARM_VCPU_HAS_EL2_E2H0 must be rejected before selecting a boot mode"
+    );
+
+    if feature_word & has_el2 != 0 {
         ArmBootMode::El2Vhe
     } else {
         ArmBootMode::El1
-    })
+    }
 }
 
 pub(crate) fn validate_restored_vcpu_feature_words(

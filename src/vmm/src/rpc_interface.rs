@@ -769,14 +769,15 @@ impl<'a> PrebootApiController<'a> {
         let load_start_us = get_time_us(ClockType::Monotonic);
 
         let nv2_enabled = self.process_config.nv2_enabled();
-        if nv2_enabled && !self.boot_path {
-            info!(
-                "Loading a snapshot with --enable-nv2 is unsupported; vCPU features come from \
-                 the snapshot."
-            );
-        }
         if let Err(err) = validate_snapshot_load(self.boot_path, nv2_enabled) {
-            info!("{}", err);
+            if nv2_enabled && !self.boot_path {
+                info!(
+                    "Loading a snapshot with --enable-nv2 is unsupported because vCPU features \
+                     come from the snapshot: {err}"
+                );
+            } else {
+                info!("{err}");
+            }
             return Err(err);
         }
 
@@ -1480,6 +1481,10 @@ mod tests {
         ));
         assert!(matches!(
             validate_snapshot_load(true, true),
+            Err(LoadSnapshotError::LoadSnapshotNotAllowed)
+        ));
+        assert!(matches!(
+            validate_snapshot_load(true, false),
             Err(LoadSnapshotError::LoadSnapshotNotAllowed)
         ));
     }
