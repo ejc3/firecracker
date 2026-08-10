@@ -51,8 +51,23 @@ use crate::{EventManager, Vmm, vstate};
 // handshake must use a new magic rather than accepting ambiguous payloads on this stream.
 const UFFD_MINOR_BACKING_HELLO_V1: &[u8] = b"FCVM_UFFD_MINOR_BACKING";
 const UFFD_MINOR_BACKING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+// `userfaultfd` 0.9 exposes MINOR registration but not these Linux UAPI capability-probe bits.
+// Keep the values pinned to include/uapi/linux/userfaultfd.h in Linux v7.0.
+const UFFD_FEATURE_MINOR_HUGETLBFS: u64 = 1 << 9;
+const UFFD_FEATURE_MINOR_SHMEM: u64 = 1 << 10;
+
+fn uffd_minor_required_features(huge_pages: HugePageConfig) -> FeatureFlags {
+    let backing_feature = if huge_pages.is_hugetlbfs() {
+        UFFD_FEATURE_MINOR_HUGETLBFS
+    } else {
+        UFFD_FEATURE_MINOR_SHMEM
+    };
+    FeatureFlags::EVENT_REMOVE | FeatureFlags::from_bits_retain(backing_feature)
+}
 
 trait UffdHandshakeSocket {
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
+
     fn send_with_fd_once(
         &mut self,
         payload: &[u8],
@@ -63,6 +78,10 @@ trait UffdHandshakeSocket {
 }
 
 impl UffdHandshakeSocket for UnixStream {
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        UnixStream::set_write_timeout(self, timeout)
+    }
+
     fn send_with_fd_once(
         &mut self,
         payload: &[u8],
@@ -585,6 +604,8 @@ pub enum GuestMemoryFromUffdError {
     Send(#[from] vmm_sys_util::errno::Error),
     /// Failed to send the complete UFFD mappings payload: {0}
     SendPayload(std::io::Error),
+    /// Timed out while sending the UFFD mappings and descriptor handshake.
+    MappingsHandshakeTimeout,
     /// The UFFD handler did not send a guest memory backing file descriptor.
     NoBackingFile,
     /// The UFFD handler sent an invalid minor-backing protocol greeting.
@@ -654,7 +675,7 @@ fn guest_memory_from_uffd_minor(
     let backend_mappings = create_backend_mappings(&guest_memory, huge_pages);
 
     let mut uffd_builder = UffdBuilder::new();
-    uffd_builder.require_features(FeatureFlags::EVENT_REMOVE);
+    uffd_builder.require_features(uffd_minor_required_features(huge_pages));
     let uffd = uffd_builder
         .close_on_exec(true)
         .non_blocking(true)
@@ -834,8 +855,21 @@ fn send_uffd_payload(
     socket: &mut impl UffdHandshakeSocket,
     payload: &[u8],
     fd: RawFd,
+    timeout: Duration,
 ) -> Result<(), GuestMemoryFromUffdError> {
-    let written = socket.send_with_fd_once(payload, fd)?;
+    socket
+        .set_write_timeout(Some(timeout))
+        .map_err(map_uffd_payload_io_error)?;
+    let written = socket.send_with_fd_once(payload, fd).map_err(|error| {
+        if matches!(
+            io::Error::from_raw_os_error(error.errno()).kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ) {
+            GuestMemoryFromUffdError::MappingsHandshakeTimeout
+        } else {
+            GuestMemoryFromUffdError::Send(error)
+        }
+    })?;
     if written == 0 {
         return Err(GuestMemoryFromUffdError::SendPayload(io::Error::new(
             io::ErrorKind::WriteZero,
@@ -851,9 +885,20 @@ fn send_uffd_payload(
     if written < payload.len() {
         socket
             .write_remaining(&payload[written..])
-            .map_err(GuestMemoryFromUffdError::SendPayload)?;
+            .map_err(map_uffd_payload_io_error)?;
     }
     Ok(())
+}
+
+fn map_uffd_payload_io_error(error: io::Error) -> GuestMemoryFromUffdError {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ) {
+        GuestMemoryFromUffdError::MappingsHandshakeTimeout
+    } else {
+        GuestMemoryFromUffdError::SendPayload(error)
+    }
 }
 
 fn send_uffd_handshake(
@@ -899,6 +944,7 @@ fn send_uffd_handshake(
         // page fault handler process does not tear down Firecracker when necessary, the
         // uffd will still be alive but with no one to serve faults, leading to guest freeze.
         uffd.as_raw_fd(),
+        UFFD_MINOR_BACKING_HANDSHAKE_TIMEOUT,
     )?;
 
     // We prevent Rust from closing the socket file descriptor to avoid a potential race condition
@@ -941,11 +987,17 @@ mod tests {
         first_write_len: usize,
         payload: Vec<u8>,
         sent_fds: Vec<RawFd>,
+        write_timeouts: Vec<Option<Duration>>,
         remaining_writes: usize,
         remaining_error: Option<io::ErrorKind>,
     }
 
     impl UffdHandshakeSocket for PartialHandshakeSocket {
+        fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+            self.write_timeouts.push(timeout);
+            Ok(())
+        }
+
         fn send_with_fd_once(
             &mut self,
             payload: &[u8],
@@ -1091,6 +1143,25 @@ mod tests {
     }
 
     #[test]
+    fn test_uffd_minor_requires_matching_backing_feature() {
+        // These independent literals come from Linux's UAPI, not the production constants:
+        // UFFD_FEATURE_MINOR_HUGETLBFS is bit 9 and UFFD_FEATURE_MINOR_SHMEM is bit 10.
+        let event_remove = FeatureFlags::EVENT_REMOVE.bits();
+        assert_eq!(
+            uffd_minor_required_features(HugePageConfig::None).bits(),
+            event_remove | (1_u64 << 10)
+        );
+        assert_eq!(
+            uffd_minor_required_features(HugePageConfig::Transparent).bits(),
+            event_remove | (1_u64 << 10)
+        );
+        assert_eq!(
+            uffd_minor_required_features(HugePageConfig::Hugetlbfs2M).bits(),
+            event_remove | (1_u64 << 9)
+        );
+    }
+
+    #[test]
     fn test_send_uffd_handshake() {
         #[allow(deprecated)]
         let uffd_regions = vec![
@@ -1141,14 +1212,25 @@ mod tests {
             first_write_len: 5,
             payload: Vec::new(),
             sent_fds: Vec::new(),
+            write_timeouts: Vec::new(),
             remaining_writes: 0,
             remaining_error: None,
         };
 
-        send_uffd_payload(&mut socket, expected, sent_fd).unwrap();
+        send_uffd_payload(
+            &mut socket,
+            expected,
+            sent_fd,
+            UFFD_MINOR_BACKING_HANDSHAKE_TIMEOUT,
+        )
+        .unwrap();
 
         assert_eq!(socket.payload, expected);
         assert_eq!(socket.sent_fds, [sent_fd]);
+        assert_eq!(
+            socket.write_timeouts,
+            [Some(UFFD_MINOR_BACKING_HANDSHAKE_TIMEOUT)]
+        );
         assert_eq!(socket.remaining_writes, 1);
     }
 
@@ -1160,11 +1242,18 @@ mod tests {
             first_write_len: expected.len(),
             payload: Vec::new(),
             sent_fds: Vec::new(),
+            write_timeouts: Vec::new(),
             remaining_writes: 0,
             remaining_error: None,
         };
 
-        send_uffd_payload(&mut socket, expected, sent_fd).unwrap();
+        send_uffd_payload(
+            &mut socket,
+            expected,
+            sent_fd,
+            UFFD_MINOR_BACKING_HANDSHAKE_TIMEOUT,
+        )
+        .unwrap();
 
         assert_eq!(socket.payload, expected);
         assert_eq!(socket.sent_fds, [sent_fd]);
@@ -1182,11 +1271,18 @@ mod tests {
                 first_write_len,
                 payload: Vec::new(),
                 sent_fds: Vec::new(),
+                write_timeouts: Vec::new(),
                 remaining_writes: 0,
                 remaining_error: None,
             };
 
-            let error = send_uffd_payload(&mut socket, expected, 42).unwrap_err();
+            let error = send_uffd_payload(
+                &mut socket,
+                expected,
+                42,
+                UFFD_MINOR_BACKING_HANDSHAKE_TIMEOUT,
+            )
+            .unwrap_err();
 
             assert!(matches!(
                 error,
@@ -1204,11 +1300,18 @@ mod tests {
             first_write_len: 5,
             payload: Vec::new(),
             sent_fds: Vec::new(),
+            write_timeouts: Vec::new(),
             remaining_writes: 0,
             remaining_error: Some(io::ErrorKind::BrokenPipe),
         };
 
-        let error = send_uffd_payload(&mut socket, expected, 42).unwrap_err();
+        let error = send_uffd_payload(
+            &mut socket,
+            expected,
+            42,
+            UFFD_MINOR_BACKING_HANDSHAKE_TIMEOUT,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             error,
@@ -1216,6 +1319,34 @@ mod tests {
                 if error.kind() == io::ErrorKind::BrokenPipe
         ));
         assert_eq!(socket.payload, &expected[..5]);
+        assert_eq!(socket.sent_fds, [42]);
+        assert_eq!(socket.remaining_writes, 1);
+    }
+
+    #[test]
+    fn test_uffd_handshake_maps_write_timeout() {
+        let expected = b"complete mappings payload";
+        let mut socket = PartialHandshakeSocket {
+            first_write_len: 5,
+            payload: Vec::new(),
+            sent_fds: Vec::new(),
+            write_timeouts: Vec::new(),
+            remaining_writes: 0,
+            remaining_error: Some(io::ErrorKind::TimedOut),
+        };
+
+        let error = send_uffd_payload(
+            &mut socket,
+            expected,
+            42,
+            UFFD_MINOR_BACKING_HANDSHAKE_TIMEOUT,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            GuestMemoryFromUffdError::MappingsHandshakeTimeout
+        ));
         assert_eq!(socket.sent_fds, [42]);
         assert_eq!(socket.remaining_writes, 1);
     }
