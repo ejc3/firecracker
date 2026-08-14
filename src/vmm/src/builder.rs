@@ -22,6 +22,8 @@ use crate::Vcpu;
 use crate::arch::aarch64::counter::{
     CounterError, canonical_saved_counter, restore_vcpus_in_order,
 };
+#[cfg(target_arch = "aarch64")]
+use crate::arch::aarch64::validate_restored_vcpu_feature_words;
 use crate::arch::{ConfigurationError, configure_system_for_boot, load_kernel};
 #[cfg(target_arch = "aarch64")]
 use crate::construct_kvm_mpidrs;
@@ -63,6 +65,8 @@ use crate::vstate::memory::GuestRegionMmap;
 #[cfg(target_arch = "aarch64")]
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
+#[cfg(target_arch = "aarch64")]
+use crate::vstate::vcpu::VcpuState;
 use crate::vstate::vm::{KvmVm, Vm, VmError};
 use crate::{EventManager, Vmm, VmmError};
 
@@ -139,6 +143,12 @@ impl std::convert::From<linux_loader::cmdline::Error> for StartMicrovmError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ProcessBootConfig {
+    #[cfg(target_arch = "aarch64")]
+    nv2_enabled: bool,
+}
+
 /// Builds and starts a microVM based on the current Firecracker VmResources configuration.
 ///
 /// The built microVM and all the created vCPUs start off in the paused state.
@@ -149,6 +159,23 @@ pub fn build_microvm_for_boot(
     vm_resources: &super::resources::VmResources,
     event_manager: &mut EventManager,
     seccomp_filters: &BpfThreadMap,
+) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    build_microvm_for_boot_with_process_config(
+        instance_info,
+        vm_resources,
+        event_manager,
+        seccomp_filters,
+        ProcessBootConfig::default(),
+    )
+}
+
+fn build_microvm_for_boot_with_process_config(
+    instance_info: &InstanceInfo,
+    vm_resources: &super::resources::VmResources,
+    event_manager: &mut EventManager,
+    seccomp_filters: &BpfThreadMap,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+    process_config: ProcessBootConfig,
 ) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     // Timestamp for measuring microVM boot duration.
     let request_ts = TimestampUs::default();
@@ -175,6 +202,10 @@ pub fn build_microvm_for_boot(
         .machine_config
         .cpu_template
         .get_cpu_template()?;
+    #[cfg(target_arch = "aarch64")]
+    // Process policy is intentionally applied last so an API-provided template cannot override it.
+    let cpu_template =
+        crate::arch::aarch64::cpu_template_with_nv2(&cpu_template, process_config.nv2_enabled);
 
     let kvm = Kvm::new(cpu_template.kvm_capabilities.clone())?;
     // Set up KVM VM and register memory regions.
@@ -377,8 +408,49 @@ pub fn build_and_boot_microvm(
     event_manager: &mut EventManager,
     seccomp_filters: &BpfThreadMap,
 ) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    build_and_boot_microvm_with_process_config(
+        instance_info,
+        vm_resources,
+        event_manager,
+        seccomp_filters,
+        ProcessBootConfig::default(),
+    )
+}
+
+/// Builds and boots an Arm microVM with the process-level NV2 policy applied after its CPU
+/// template.
+#[cfg(target_arch = "aarch64")]
+pub fn build_and_boot_microvm_with_nv2(
+    instance_info: &InstanceInfo,
+    vm_resources: &super::resources::VmResources,
+    event_manager: &mut EventManager,
+    seccomp_filters: &BpfThreadMap,
+    nv2_enabled: bool,
+) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    build_and_boot_microvm_with_process_config(
+        instance_info,
+        vm_resources,
+        event_manager,
+        seccomp_filters,
+        ProcessBootConfig { nv2_enabled },
+    )
+}
+
+fn build_and_boot_microvm_with_process_config(
+    instance_info: &InstanceInfo,
+    vm_resources: &super::resources::VmResources,
+    event_manager: &mut EventManager,
+    seccomp_filters: &BpfThreadMap,
+    process_config: ProcessBootConfig,
+) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     debug!("event_start: build microvm for boot");
-    let vmm = build_microvm_for_boot(instance_info, vm_resources, event_manager, seccomp_filters)?;
+    let vmm = build_microvm_for_boot_with_process_config(
+        instance_info,
+        vm_resources,
+        event_manager,
+        seccomp_filters,
+        process_config,
+    )?;
     debug!("event_end: build microvm for boot");
     // The vcpus start off in the `Paused` state, let them run.
     debug!("event_start: boot microvm");
@@ -421,6 +493,21 @@ pub enum BuildMicrovmFromSnapshotError {
     RestoreDevices(#[from] DeviceManagerPersistError),
     /// clock_realtime is not supported on aarch64.
     UnsupportedClockRealtime,
+}
+
+#[cfg(target_arch = "aarch64")]
+fn with_validated_restored_vcpu_features<T>(
+    vcpu_states: &[VcpuState],
+    restore: impl FnOnce() -> T,
+) -> Result<T, BuildMicrovmFromSnapshotError> {
+    let feature_words = vcpu_states
+        .iter()
+        .map(|state| state.kvi.features[0])
+        .collect::<Vec<_>>();
+    validate_restored_vcpu_feature_words(&feature_words)
+        .map_err(StartMicrovmError::ConfigureSystem)
+        .map_err(BuildMicrovmFromSnapshotError::CreateMicrovmAndVcpus)?;
+    Ok(restore())
 }
 
 /// Builds and starts a microVM based on the provided MicrovmState.
@@ -479,33 +566,35 @@ pub fn build_microvm_from_snapshot(
     }
 
     #[cfg(target_arch = "aarch64")]
-    restore_vcpus_in_order(
-        &mut vcpus,
-        |index, vcpu| {
-            vcpu.kvm_vcpu
-                .prepare_restore_state(&microvm_state.vcpu_states[index])
-                .map_err(VcpuError::VcpuResponse)
-                .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)
-        },
-        |vcpus| {
-            let saved_counter = canonical_saved_counter(&microvm_state.vcpu_states)?;
-            let boot_vcpu = vcpus.first().ok_or(CounterError::NoBootVcpu)?;
-            vm.configure_counter_for_restore(&boot_vcpu.kvm_vcpu.fd, saved_counter)?;
-            Ok(())
-        },
-        |index, vcpu| {
-            vcpu.kvm_vcpu
-                .finalize_restore_state(&microvm_state.vcpu_states[index])
-                .map_err(VcpuError::VcpuResponse)
-                .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)
-        },
-        |index, vcpu| {
-            vcpu.kvm_vcpu
-                .replay_restore_state(&microvm_state.vcpu_states[index])
-                .map_err(VcpuError::VcpuResponse)
-                .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)
-        },
-    )?;
+    with_validated_restored_vcpu_features(&microvm_state.vcpu_states, || {
+        restore_vcpus_in_order(
+            &mut vcpus,
+            |index, vcpu| {
+                vcpu.kvm_vcpu
+                    .prepare_restore_state(&microvm_state.vcpu_states[index])
+                    .map_err(VcpuError::VcpuResponse)
+                    .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)
+            },
+            |vcpus| {
+                let saved_counter = canonical_saved_counter(&microvm_state.vcpu_states)?;
+                let boot_vcpu = vcpus.first().ok_or(CounterError::NoBootVcpu)?;
+                vm.configure_counter_for_restore(&boot_vcpu.kvm_vcpu.fd, saved_counter)?;
+                Ok(())
+            },
+            |index, vcpu| {
+                vcpu.kvm_vcpu
+                    .finalize_restore_state(&microvm_state.vcpu_states[index])
+                    .map_err(VcpuError::VcpuResponse)
+                    .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)
+            },
+            |index, vcpu| {
+                vcpu.kvm_vcpu
+                    .replay_restore_state(&microvm_state.vcpu_states[index])
+                    .map_err(VcpuError::VcpuResponse)
+                    .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)
+            },
+        )
+    })??;
 
     #[cfg(target_arch = "x86_64")]
     for (vcpu, state) in vcpus.iter_mut().zip(microvm_state.vcpu_states.iter()) {
@@ -813,6 +902,11 @@ fn attach_balloon_device(
 #[cfg(test)]
 pub(crate) mod tests {
 
+    #[cfg(target_arch = "aarch64")]
+    use std::cell::Cell;
+
+    #[cfg(target_arch = "aarch64")]
+    use kvm_bindings::KVM_ARM_VCPU_HAS_EL2_E2H0;
     use linux_loader::cmdline::Cmdline;
     use vmm_sys_util::tempfile::TempFile;
 
@@ -836,6 +930,31 @@ pub(crate) mod tests {
     use crate::vmm_config::vsock::{VsockBuilder, VsockDeviceConfig};
     use crate::vstate::vm::Vm;
     use crate::vstate::vm::tests::setup_vm_with_memory;
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_invalid_restored_kvi_blocks_vcpu_prepare() {
+        let mut vcpu_states = vec![VcpuState::default(), VcpuState::default()];
+        vcpu_states[1].kvi.features[0] = 1 << KVM_ARM_VCPU_HAS_EL2_E2H0;
+        let prepare_called = Cell::new(false);
+
+        let result = with_validated_restored_vcpu_features(&vcpu_states, || {
+            prepare_called.set(true);
+        });
+
+        assert!(
+            matches!(
+                result,
+                Err(BuildMicrovmFromSnapshotError::CreateMicrovmAndVcpus(
+                    StartMicrovmError::ConfigureSystem(ConfigurationError::VcpuConfigure(
+                        crate::arch::KvmVcpuError::Init(error)
+                    ))
+                )) if error.errno() == libc::EINVAL
+            ) && !prepare_called.get(),
+            "invalid saved KVI must fail before prepare: result={result:?}, prepare_called={}",
+            prepare_called.get()
+        );
+    }
 
     #[derive(Debug)]
     pub(crate) struct CustomBlockConfig {

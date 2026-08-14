@@ -56,6 +56,12 @@ const FIRECRACKER_VERSION: &str = if cfg!(feature = "fuzzing") {
 };
 const MMDS_CONTENT_ARG: &str = "metadata";
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ProcessConfig {
+    #[cfg(target_arch = "aarch64")]
+    nv2_enabled: bool,
+}
+
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 enum MainError {
     /// Failed to set the logger: {0}
@@ -118,6 +124,18 @@ fn main() -> ExitCode {
     }
 }
 
+fn add_nv2_argument<'a>(arg_parser: ArgParser<'a>, supported: bool) -> ArgParser<'a> {
+    if supported {
+        arg_parser.arg(
+            Argument::new("enable-nv2")
+                .takes_value(false)
+                .help("Enables nested virtualization (ARM64 NV2)."),
+        )
+    } else {
+        arg_parser
+    }
+}
+
 fn main_exec() -> Result<(), MainError> {
     // Initialize the logger.
     LOGGER.init().map_err(MainError::SetLogger)?;
@@ -154,7 +172,7 @@ fn main_exec() -> Result<(), MainError> {
 
     let http_max_payload_size_str = HTTP_MAX_PAYLOAD_SIZE.to_string();
 
-    let mut arg_parser =
+    let mut arg_parser = add_nv2_argument(
         ArgParser::new()
             .arg(
                 Argument::new("api-sock")
@@ -278,7 +296,9 @@ fn main_exec() -> Result<(), MainError> {
                 Argument::new("enable-pci")
                     .takes_value(false)
                     .help("Enables PCIe support."),
-            );
+            ),
+        cfg!(target_arch = "aarch64"),
+    );
 
     arg_parser.parse_from_cmdline()?;
     let arguments = arg_parser.arguments();
@@ -396,6 +416,12 @@ fn main_exec() -> Result<(), MainError> {
 
     let boot_timer_enabled = arguments.flag_present("boot-timer");
     let pci_enabled = arguments.flag_present("enable-pci");
+    #[cfg(target_arch = "aarch64")]
+    let process_config = ProcessConfig {
+        nv2_enabled: arguments.flag_present("enable-nv2"),
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let process_config = ProcessConfig::default();
     let api_enabled = !arguments.flag_present("no-api");
     let api_payload_limit = arg_parser
         .arguments()
@@ -450,6 +476,7 @@ fn main_exec() -> Result<(), MainError> {
             process_time_reporter,
             boot_timer_enabled,
             pci_enabled,
+            process_config,
             api_payload_limit,
             mmds_size_limit,
             metadata_json.as_deref(),
@@ -466,6 +493,7 @@ fn main_exec() -> Result<(), MainError> {
             instance_info,
             boot_timer_enabled,
             pci_enabled,
+            process_config,
             mmds_size_limit,
             metadata_json.as_deref(),
         )
@@ -591,6 +619,8 @@ fn build_microvm_from_json(
     instance_info: InstanceInfo,
     boot_timer_enabled: bool,
     pci_enabled: bool,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+    process_config: ProcessConfig,
     mmds_size_limit: usize,
     metadata_json: Option<&str>,
 ) -> Result<Arc<Mutex<vmm::Vmm>>, BuildFromJsonError> {
@@ -599,6 +629,16 @@ fn build_microvm_from_json(
             .map_err(BuildFromJsonError::ParseFromJson)?;
     vm_resources.boot_timer = boot_timer_enabled;
     vm_resources.pci_enabled = pci_enabled;
+    #[cfg(target_arch = "aarch64")]
+    let vmm = vmm::builder::build_and_boot_microvm_with_nv2(
+        &instance_info,
+        &vm_resources,
+        event_manager,
+        seccomp_filters,
+        process_config.nv2_enabled,
+    )
+    .map_err(BuildFromJsonError::StartMicroVM)?;
+    #[cfg(not(target_arch = "aarch64"))]
     let vmm = vmm::builder::build_and_boot_microvm(
         &instance_info,
         &vm_resources,
@@ -624,12 +664,14 @@ enum RunWithoutApiError {
     SeccompFilter(vmm::seccomp::InstallationError),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_without_api(
     seccomp_filters: &BpfThreadMap,
     config_json: Option<String>,
     instance_info: InstanceInfo,
     bool_timer_enabled: bool,
     pci_enabled: bool,
+    process_config: ProcessConfig,
     mmds_size_limit: usize,
     metadata_json: Option<&str>,
 ) -> Result<(), RunWithoutApiError> {
@@ -648,6 +690,7 @@ fn run_without_api(
         instance_info,
         bool_timer_enabled,
         pci_enabled,
+        process_config,
         mmds_size_limit,
         metadata_json,
     )
@@ -680,4 +723,29 @@ fn run_without_api(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use utils::arg_parser::UtilsArgParserError;
+
+    #[test]
+    fn test_enable_nv2_argument_is_arch_gated() {
+        let args = vec!["firecracker".to_string(), "--enable-nv2".to_string()];
+
+        let supported = add_nv2_argument(ArgParser::new(), true);
+        let mut supported_arguments = supported.arguments().clone();
+        supported_arguments.parse(&args).unwrap();
+        assert!(supported_arguments.flag_present("enable-nv2"));
+
+        let unsupported = add_nv2_argument(ArgParser::new(), false);
+        let mut unsupported_arguments = unsupported.arguments().clone();
+        assert_eq!(
+            unsupported_arguments.parse(&args),
+            Err(UtilsArgParserError::UnexpectedArgument(
+                "enable-nv2".to_string()
+            ))
+        );
+    }
 }

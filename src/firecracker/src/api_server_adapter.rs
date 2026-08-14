@@ -158,6 +158,7 @@ pub(crate) fn run_with_api(
     process_time_reporter: ProcessTimeReporter,
     boot_timer_enabled: bool,
     pci_enabled: bool,
+    process_config: super::ProcessConfig,
     api_payload_limit: usize,
     mmds_size_limit: usize,
     metadata_json: Option<&str>,
@@ -228,23 +229,41 @@ pub(crate) fn run_with_api(
             instance_info,
             boot_timer_enabled,
             pci_enabled,
+            process_config,
             mmds_size_limit,
             metadata_json,
         )
         .map_err(ApiServerError::BuildFromJson),
-        None => PrebootApiController::build_microvm_from_requests(
-            seccomp_filters,
-            &mut event_manager,
-            instance_info,
-            &from_api,
-            &to_api,
-            &api_event_fd,
-            boot_timer_enabled,
-            pci_enabled,
-            mmds_size_limit,
-            metadata_json,
-        )
-        .map_err(ApiServerError::BuildMicroVmError),
+        None => {
+            #[cfg(target_arch = "aarch64")]
+            let result = PrebootApiController::build_microvm_from_requests_with_nv2(
+                seccomp_filters,
+                &mut event_manager,
+                instance_info,
+                &from_api,
+                &to_api,
+                &api_event_fd,
+                boot_timer_enabled,
+                pci_enabled,
+                process_config.nv2_enabled,
+                mmds_size_limit,
+                metadata_json,
+            );
+            #[cfg(not(target_arch = "aarch64"))]
+            let result = PrebootApiController::build_microvm_from_requests(
+                seccomp_filters,
+                &mut event_manager,
+                instance_info,
+                &from_api,
+                &to_api,
+                &api_event_fd,
+                boot_timer_enabled,
+                pci_enabled,
+                mmds_size_limit,
+                metadata_json,
+            );
+            result.map_err(ApiServerError::BuildMicroVmError)
+        }
     };
 
     // INVARIANT: seccomp must be applied before entering the event loop.

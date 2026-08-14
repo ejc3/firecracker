@@ -34,6 +34,154 @@ use vmm::vmm_config::vsock::VsockDeviceConfig;
 use vmm::{DumpCpuConfigError, EventManager, FcExitCode, Vmm};
 use vmm_sys_util::tempfile::TempFile;
 
+#[test]
+#[allow(unreachable_code)]
+fn test_public_builder_apis_remain_source_compatible() {
+    // These calls intentionally use the pre-existing public signatures. Keep them in an
+    // unreachable branch: downstream crates only need to be able to type-check the APIs.
+    if false {
+        let _ = vmm::arch::configure_system_for_boot(
+            todo!(),
+            todo!(),
+            todo!(),
+            todo!(),
+            todo!(),
+            todo!(),
+            todo!(),
+            todo!(),
+            todo!(),
+        );
+        let _ = PrebootApiController::build_microvm_from_requests(
+            todo!(),
+            todo!(),
+            todo!(),
+            todo!(),
+            todo!(),
+            todo!(),
+            false,
+            false,
+            0,
+            None,
+        );
+    }
+}
+
+#[test]
+fn test_public_vm_resources_literal_remains_source_compatible() {
+    let _resources = VmResources {
+        machine_config: Default::default(),
+        boot_source: Default::default(),
+        block: Default::default(),
+        vsock: Default::default(),
+        balloon: Default::default(),
+        net_builder: Default::default(),
+        entropy: Default::default(),
+        pmem: Default::default(),
+        memory_hotplug: None,
+        mmds: None,
+        mmds_size_limit: 0,
+        boot_timer: false,
+        pci_enabled: false,
+        serial_out_path: None,
+        serial_rate_limiter_cfg: None,
+    };
+}
+
+#[test]
+fn test_public_error_enums_remain_exhaustively_matchable() {
+    fn match_load_snapshot_error(error: LoadSnapshotError) {
+        match error {
+            LoadSnapshotError::LoadSnapshotNotAllowed => {}
+            LoadSnapshotError::RestoreFromSnapshot(_) => {}
+            LoadSnapshotError::ResumeMicrovm(_) => {}
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn match_configuration_error(error: vmm::arch::ConfigurationError) {
+        match error {
+            vmm::arch::ConfigurationError::SetupFDT(_) => {}
+            vmm::arch::ConfigurationError::MemoryError(_) => {}
+            vmm::arch::ConfigurationError::KernelFile => {}
+            vmm::arch::ConfigurationError::KernelLoader(_) => {}
+            vmm::arch::ConfigurationError::VcpuConfig(_) => {}
+            vmm::arch::ConfigurationError::VcpuConfigure(_) => {}
+            vmm::arch::ConfigurationError::CacheInfo(_) => {}
+            vmm::arch::ConfigurationError::Counter(_) => {}
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn match_vcpu_arch_error(error: vmm::arch::aarch64::vcpu::VcpuArchError) {
+        match error {
+            vmm::arch::aarch64::vcpu::VcpuArchError::GetOneReg(_, _) => {}
+            vmm::arch::aarch64::vcpu::VcpuArchError::SetOneReg(_, _, _) => {}
+            vmm::arch::aarch64::vcpu::VcpuArchError::GetRegList(_) => {}
+            vmm::arch::aarch64::vcpu::VcpuArchError::GetMp(_) => {}
+            vmm::arch::aarch64::vcpu::VcpuArchError::SetMp(_) => {}
+            vmm::arch::aarch64::vcpu::VcpuArchError::Fam(_) => {}
+            vmm::arch::aarch64::vcpu::VcpuArchError::DeviceAttribute(_) => {}
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn match_kvm_vcpu_error(error: vmm::arch::KvmVcpuError) {
+        match error {
+            vmm::arch::KvmVcpuError::ConfigureRegisters(_) => {}
+            vmm::arch::KvmVcpuError::CreateVcpu(_) => {}
+            vmm::arch::KvmVcpuError::DumpCpuConfig(_) => {}
+            vmm::arch::KvmVcpuError::GetPreferredTarget(_) => {}
+            vmm::arch::KvmVcpuError::Init(_) => {}
+            vmm::arch::KvmVcpuError::ApplyCpuTemplate(_) => {}
+            vmm::arch::KvmVcpuError::RestoreState(_) => {}
+            vmm::arch::KvmVcpuError::SaveState(_) => {}
+            vmm::arch::KvmVcpuError::UnsupportedPmuV3 => {}
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn match_configuration_error(error: vmm::arch::ConfigurationError) {
+        match error {
+            vmm::arch::ConfigurationError::E820Configuration => {}
+            vmm::arch::ConfigurationError::MpTableSetup(_) => {}
+            vmm::arch::ConfigurationError::ZeroPageSetup => {}
+            vmm::arch::ConfigurationError::ModlistSetup => {}
+            vmm::arch::ConfigurationError::MemmapTableSetup => {}
+            vmm::arch::ConfigurationError::StartInfoSetup => {}
+            vmm::arch::ConfigurationError::KernelFile => {}
+            vmm::arch::ConfigurationError::KernelLoader(_) => {}
+            vmm::arch::ConfigurationError::BzImageMissing64BitEntry => {}
+            vmm::arch::ConfigurationError::LoadCommandline(_) => {}
+            vmm::arch::ConfigurationError::CreateGuestConfig(_) => {}
+            vmm::arch::ConfigurationError::VcpuConfigure(_) => {}
+            vmm::arch::ConfigurationError::Acpi(_) => {}
+        }
+    }
+
+    let _ = match_load_snapshot_error as fn(_);
+    let _ = match_configuration_error as fn(_);
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = match_vcpu_arch_error as fn(_);
+        let _ = match_kvm_vcpu_error as fn(_);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn test_public_arm_vcpu_api_remains_source_compatible() {
+    let _config = vmm::VcpuConfig {
+        vcpu_count: 1,
+        smt: false,
+        cpu_config: vmm::cpu_config::templates::CpuConfiguration::default(),
+    };
+    let _setup_boot_regs: fn(
+        &vmm::arch::KvmVcpu,
+        u64,
+        &vmm::vstate::memory::GuestMemoryMmap,
+    ) -> Result<(), vmm::arch::aarch64::vcpu::VcpuArchError> = vmm::arch::KvmVcpu::setup_boot_regs;
+}
+
 #[allow(unused_mut, unused_variables)]
 fn check_booted_microvm(vmm: Arc<Mutex<Vmm>>, mut evmgr: EventManager) {
     // On x86_64, the vmm should exit once its workload completes and signals the exit event.

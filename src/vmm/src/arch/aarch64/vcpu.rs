@@ -16,11 +16,12 @@ use vm_memory::GuestAddress;
 
 use super::get_fdt_addr;
 use super::regs::*;
+use super::{ArmBootMode, boot_mode_from_validated_feature_word};
 use crate::arch::EntryPoint;
 use crate::arch::aarch64::regs::{Aarch64RegisterVec, KVM_REG_ARM64_SVE_VLS};
 use crate::cpu_config::aarch64::custom_cpu_template::VcpuFeatures;
 use crate::cpu_config::templates::CpuConfiguration;
-use crate::logger::{IncMetric, METRICS, error};
+use crate::logger::{IncMetric, METRICS, error, warn};
 use crate::vcpu::{VcpuConfig, VcpuError};
 use crate::vstate::bus::Bus;
 use crate::vstate::memory::{Address, GuestMemoryMmap};
@@ -103,6 +104,26 @@ pub enum KvmVcpuError {
 
 /// Error type for [`KvmVcpu::configure`].
 pub type KvmVcpuConfigureError = KvmVcpuError;
+
+fn validate_vcpu_init_feature_word(feature_word: u32) -> Result<(), KvmVcpuError> {
+    super::validate_arm_vcpu_init_feature_word(feature_word).map_err(|error| {
+        warn!("Invalid Arm vCPU initialization features: {error}");
+        KvmVcpuError::Init(kvm_ioctls::Error::new(libc::EINVAL))
+    })
+}
+
+fn el2_boot_hcr_value() -> u64 {
+    const HCR_E2H: u64 = 1 << 34;
+    const HCR_TGE: u64 = 1 << 27;
+
+    HCR_E2H | HCR_TGE
+}
+
+fn vmpidr_el2_value(_vcpu_index: u8, kvm_mpidr: u64) -> u64 {
+    // Keep the index at this seam so the regression test can prove that a non-linear KVM
+    // affinity mapping is never replaced with a value synthesized from the index.
+    kvm_mpidr
+}
 
 /// A wrapper around creating and using a kvm aarch64 vcpu.
 #[derive(Debug)]
@@ -208,6 +229,11 @@ impl KvmVcpu {
         self.finalize_vcpu()?;
 
         Ok(())
+    }
+
+    /// Return the feature word used for Arm vCPU initialization.
+    pub(crate) fn boot_feature_word(&self) -> u32 {
+        self.kvi.features[0]
     }
 
     /// Creates default kvi struct based on vcpu index.
@@ -316,6 +342,8 @@ impl KvmVcpu {
 
     /// Initializes internal vcpufd.
     fn init_vcpu(&self) -> Result<(), KvmVcpuError> {
+        validate_vcpu_init_feature_word(self.kvi.features[0])?;
+
         // Setting KVM_ARM_VCPU_PMU_V3 without initialising the PMU causes KVM
         // to crash on KVM_RUN with EINVAL.
         //
@@ -353,16 +381,63 @@ impl KvmVcpu {
         boot_ip: u64,
         mem: &GuestMemoryMmap,
     ) -> Result<(), VcpuArchError> {
+        let feature_word = self.kvi.features[0];
+        let boot_mode = boot_mode_from_validated_feature_word(feature_word);
         let kreg_off = offset_of!(kvm_regs, regs);
 
         // Get the register index of the PSTATE (Processor State) register.
+        // When nested virtualization is enabled (HAS_EL2), boot at EL2 so the guest
+        // kernel's is_hyp_mode_available() returns true.
         let pstate = offset_of!(user_pt_regs, pstate) + kreg_off;
         let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, pstate);
+        // HAS_EL2 without HAS_EL2_E2H0 selects VHE. Boot at EL2h so the guest kernel sees
+        // HYP mode and can initialize its nested KVM implementation.
+        // The guest kernel's is_hyp_mode_available() checks CurrentEL on boot - it must
+        // see EL2 or it will assume no hypervisor mode is available.
+        let pstate_value = match boot_mode {
+            ArmBootMode::El1 => PSTATE_FAULT_BITS_64,
+            ArmBootMode::El2Vhe => PSTATE_FAULT_BITS_64_EL2,
+        };
         self.fd
-            .set_one_reg(id, &PSTATE_FAULT_BITS_64.to_le_bytes())
-            .map_err(|err| {
-                VcpuArchError::SetOneReg(id, format!("{PSTATE_FAULT_BITS_64:#x}"), err)
-            })?;
+            .set_one_reg(id, &pstate_value.to_le_bytes())
+            .map_err(|err| VcpuArchError::SetOneReg(id, format!("{pstate_value:#x}"), err))?;
+
+        // When HAS_EL2 is enabled, initialize EL2 system registers for VHE mode.
+        // For VHE (E2H=1), the guest kernel runs at EL2 and can use kvm-arm.mode=nested.
+        if boot_mode == ArmBootMode::El2Vhe {
+            let hcr_el2_value = el2_boot_hcr_value();
+            self.fd
+                .set_one_reg(SYS_HCR_EL2, &hcr_el2_value.to_le_bytes())
+                .map_err(|err| {
+                    VcpuArchError::SetOneReg(SYS_HCR_EL2, format!("{hcr_el2_value:#x}"), err)
+                })?;
+
+            // With HAS_EL2 (NV2), explicitly set VMPIDR_EL2 for the vCPU.
+            // KVM's NV2 implementation resets VMPIDR_EL2 to "unknown" (garbage values),
+            // causing the guest to read invalid MPIDR and fail to find boot CPU.
+            // VMPIDR_EL2 is what a nested guest sees when it reads MPIDR_EL1. Copy KVM's
+            // mapping verbatim: affinity levels do not form a linear function of the vCPU index.
+            let kvm_mpidr = self.get_mpidr()?;
+            let expected_mpidr = vmpidr_el2_value(self.index, kvm_mpidr);
+            self.fd
+                .set_one_reg(SYS_VMPIDR_EL2, &expected_mpidr.to_le_bytes())
+                .map_err(|err| {
+                    VcpuArchError::SetOneReg(SYS_VMPIDR_EL2, format!("{expected_mpidr:#x}"), err)
+                })?;
+
+            // Also set VPIDR_EL2 to the host's MIDR value.
+            // This is what a nested guest sees when it reads MIDR_EL1.
+            let mut midr_bytes = [0u8; 8];
+            self.fd
+                .get_one_reg(MIDR_EL1, &mut midr_bytes)
+                .map_err(|err| VcpuArchError::GetOneReg(MIDR_EL1, err))?;
+            let midr_value = u64::from_le_bytes(midr_bytes);
+            self.fd
+                .set_one_reg(SYS_VPIDR_EL2, &midr_value.to_le_bytes())
+                .map_err(|err| {
+                    VcpuArchError::SetOneReg(SYS_VPIDR_EL2, format!("{midr_value:#x}"), err)
+                })?;
+        }
 
         // Other vCPUs are powered off initially awaiting PSCI wakeup.
         if self.index == 0 {
@@ -672,6 +747,35 @@ mod tests {
 
         let res = vcpu.init(&vcpu_features);
         assert!(matches!(res.unwrap_err(), KvmVcpuError::UnsupportedPmuV3));
+    }
+
+    #[test]
+    fn test_direct_init_rejects_e2h0_before_ioctl() {
+        let has_el2_e2h0 = 1 << KVM_ARM_VCPU_HAS_EL2_E2H0;
+
+        assert!(matches!(
+            validate_vcpu_init_feature_word(has_el2_e2h0),
+            Err(KvmVcpuError::Init(error)) if error.errno() == libc::EINVAL
+        ));
+    }
+
+    #[test]
+    fn test_el2_boot_hcr_disables_stage_two_translation() {
+        let hcr_el2 = el2_boot_hcr_value();
+
+        assert_eq!(hcr_el2 & 1, 0, "HCR_EL2.VM must be clear at boot");
+        assert_eq!(
+            hcr_el2, 0x0000_0004_0800_0000,
+            "only HCR_EL2.E2H and HCR_EL2.TGE must be set"
+        );
+    }
+
+    #[test]
+    fn test_vmpidr_el2_copies_kvm_mpidr_mapping() {
+        let kvm_mpidr = 0x8000_0100_u64.to_le_bytes();
+        let vmpidr = vmpidr_el2_value(16, u64::from_le_bytes(kvm_mpidr)).to_le_bytes();
+
+        assert_eq!(vmpidr, kvm_mpidr);
     }
 
     #[test]
