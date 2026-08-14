@@ -94,21 +94,19 @@ arm64_sys_reg!(ID_AA64MMFR2_EL1, 3, 0, 0, 7, 2);
 // https://developer.arm.com/documentation/ddi0595/2021-12/AArch64-Registers/CLIDR-EL1--Cache-Level-ID-Register
 arm64_sys_reg!(CLIDR_EL1, 3, 1, 0, 0, 1);
 
-// Counter-timer Virtual Timer CompareValue register.
-// https://developer.arm.com/documentation/ddi0595/2021-12/AArch64-Registers/CNTV-CVAL-EL0--Counter-timer-Virtual-Timer-CompareValue-register
-// https://elixir.bootlin.com/linux/v6.8/source/arch/arm64/include/asm/sysreg.h#L468
-arm64_sys_reg!(SYS_CNTV_CVAL_EL0, 3, 3, 14, 3, 2);
+// KVM's stable userspace ABI accidentally swapped the architectural encodings
+// used for the virtual timer count and compare-value register IDs. These must
+// match KVM_REG_ARM_TIMER_{CNT,CVAL}, not the architectural register names. KVM
+// also remaps SYS_CNTVCT_EL0 to KVM_REG_ARM_TIMER_CNT while enumerating registers.
+// https://github.com/torvalds/linux/blob/v7.0/arch/arm64/include/uapi/asm/kvm.h#L262-L273
+// https://github.com/torvalds/linux/blob/v7.0/arch/arm64/kvm/sys_regs.c#L5473-L5479
+arm64_sys_reg!(KVM_REG_ARM_TIMER_CVAL, 3, 3, 14, 0, 2);
+arm64_sys_reg!(KVM_REG_ARM_TIMER_CNT, 3, 3, 14, 3, 2);
 
 // Counter-timer Physical Count Register
 // https://developer.arm.com/documentation/ddi0601/2023-12/AArch64-Registers/CNTPCT-EL0--Counter-timer-Physical-Count-Register
 // https://elixir.bootlin.com/linux/v6.8/source/arch/arm64/include/asm/sysreg.h#L459
 arm64_sys_reg!(SYS_CNTPCT_EL0, 3, 3, 14, 0, 1);
-
-// Physical Timer EL0 count Register
-// The id of this register is same as SYS_CNTPCT_EL0, but KVM defines it
-// separately, so we do as well.
-// https://elixir.bootlin.com/linux/v6.12.6/source/arch/arm64/include/uapi/asm/kvm.h#L259
-arm64_sys_reg!(KVM_REG_ARM_PTIMER_CNT, 3, 3, 14, 0, 1);
 
 // Translation Table Base Register
 // https://developer.arm.com/documentation/ddi0595/2021-03/AArch64-Registers/TTBR1-EL1--Translation-Table-Base-Register-1--EL1-

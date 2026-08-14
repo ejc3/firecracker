@@ -18,6 +18,10 @@ use vm_memory::GuestAddress;
 
 #[cfg(target_arch = "aarch64")]
 use crate::Vcpu;
+#[cfg(target_arch = "aarch64")]
+use crate::arch::aarch64::counter::{
+    CounterError, canonical_saved_counter, restore_vcpus_in_order,
+};
 use crate::arch::{ConfigurationError, configure_system_for_boot, load_kernel};
 #[cfg(target_arch = "aarch64")]
 use crate::construct_kvm_mpidrs;
@@ -408,6 +412,9 @@ pub enum BuildMicrovmFromSnapshotError {
     MissingVcpuSeccompFilters,
     /// Failed to start vCPUs: {0}
     StartVcpus(#[from] crate::StartVcpusError),
+    #[cfg(target_arch = "aarch64")]
+    /// Failed to restore the VM-wide generic-counter domain: {0}
+    Counter(#[from] CounterError),
     /// Failed to restore vCPUs: {0}
     RestoreVcpus(#[from] VcpuError),
     /// Failed to restore devices: {0}
@@ -461,7 +468,46 @@ pub fn build_microvm_from_snapshot(
         }
     }
 
-    // Restore vcpus kvm state.
+    // Restore vCPU KVM state. On Arm the VM-wide counter offset must be
+    // installed after every vCPU is initialized but before even the SVE
+    // pre-finalization register is replayed.
+    #[cfg(target_arch = "aarch64")]
+    if microvm_state.vcpu_states.len() != vcpus.len() {
+        return Err(
+            CounterError::VcpuStateCount(microvm_state.vcpu_states.len(), vcpus.len()).into(),
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    restore_vcpus_in_order(
+        &mut vcpus,
+        |index, vcpu| {
+            vcpu.kvm_vcpu
+                .prepare_restore_state(&microvm_state.vcpu_states[index])
+                .map_err(VcpuError::VcpuResponse)
+                .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)
+        },
+        |vcpus| {
+            let saved_counter = canonical_saved_counter(&microvm_state.vcpu_states)?;
+            let boot_vcpu = vcpus.first().ok_or(CounterError::NoBootVcpu)?;
+            vm.configure_counter_for_restore(&boot_vcpu.kvm_vcpu.fd, saved_counter)?;
+            Ok(())
+        },
+        |index, vcpu| {
+            vcpu.kvm_vcpu
+                .finalize_restore_state(&microvm_state.vcpu_states[index])
+                .map_err(VcpuError::VcpuResponse)
+                .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)
+        },
+        |index, vcpu| {
+            vcpu.kvm_vcpu
+                .replay_restore_state(&microvm_state.vcpu_states[index])
+                .map_err(VcpuError::VcpuResponse)
+                .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)
+        },
+    )?;
+
+    #[cfg(target_arch = "x86_64")]
     for (vcpu, state) in vcpus.iter_mut().zip(microvm_state.vcpu_states.iter()) {
         vcpu.kvm_vcpu
             .restore_state(state)
