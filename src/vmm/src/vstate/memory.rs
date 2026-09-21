@@ -774,9 +774,9 @@ impl GuestRegionMmapExt {
                 // replacement here is ordinary anonymous memory). Without it the replacement is
                 // subject to overcommit accounting and can fail with ENOMEM, by which point
                 // MAP_FIXED has already unmapped the range.
-                // TODO: this does not re-apply the region's madvise flags, so it would drop the
-                // MADV_HUGEPAGE hint on a THP + file-restore VM. That combination is unsupported
-                // today; revisit if it becomes supported.
+                // TODO: this does not re-apply the region's madvise flags, so a discarded range of
+                // a `Transparent` restore from a file, or through UFFD minor faults, loses its
+                // MADV_HUGEPAGE hint. Re-applying it needs the region to record those flags.
                 //
                 // Map each intersecting slot directly to its final protection: fully unplugged
                 // slots get PROT_NONE, plugged (or mixed) slots stay PROT_READ | PROT_WRITE. This

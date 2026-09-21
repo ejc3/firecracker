@@ -54,6 +54,13 @@ not try to reserve sufficient hugetlbfs pages at the time of the `mmap` call,
 trying to claim them from the pool on-demand. For details on how to manage this
 pool, please refer to the [Linux Documentation][hugetlbfs_docs].
 
+A snapshot restore through the `UffdMinor` backend with `2M` pages is the
+exception. Firecracker maps the handler's hugetlbfs backing file privately
+without `MAP_NORESERVE`, so the kernel reserves one huge page per guest page for
+copy-on-write at restore time, on top of the pages that hold the handler's file.
+A pool too small for both makes the restore fail with `ENOMEM` instead of a
+running guest receiving `SIGBUS`.
+
 ### Huge Pages and Snapshotting
 
 The `huge_pages` field on `PUT /snapshot/load` selects the page configuration
@@ -62,9 +69,10 @@ snapshot and is the default when the field is omitted. `None` uses the host's
 default memory-mapping behavior, while `Transparent` and `2M` select their
 corresponding huge page configurations.
 
-Explicit `2M` hugetlbfs pages require UFFD, so combining `2M` with file-backed
-restore returns an error. `Transparent` is accepted with UFFD, although UFFD may
-limit the effectiveness of transparent huge pages.
+Explicit `2M` hugetlbfs pages require a UFFD backend (`Uffd` or `UffdMinor`), so
+combining `2M` with file-backed restore returns an error. `Transparent` is
+accepted with UFFD, although UFFD may limit the effectiveness of transparent
+huge pages.
 
 When restoring snapshots via UFFD, Firecracker will send the configured page
 size (in KiB) for each memory region as part of the initial handshake, as
