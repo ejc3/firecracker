@@ -746,7 +746,22 @@ impl GuestRegionMmapExt {
         match (self.inner.file_offset(), self.inner.flags()) {
             // If and only if we are resuming from a snapshot file, we have a file and it's mapped
             // private
-            (Some(_), flags) if flags & libc::MAP_PRIVATE != 0 => {
+            (Some(file_offset), flags) if flags & libc::MAP_PRIVATE != 0 => {
+                // The kernel cannot split a hugetlbfs mapping inside a huge page, so the MAP_FIXED
+                // replacement below would fail with EINVAL for such a range, after which this
+                // function panics. A UFFD-minor restore with 2M pages maps a hugetlbfs file
+                // privately, so refuse any range that is not aligned to its huge page size.
+                let hugetlbfs_page_size = BackingFileSystem::of(file_offset.file())
+                    .map_err(GuestMemoryError::IOError)?
+                    .hugetlbfs_page_size();
+                if let Some(huge_page_size) = hugetlbfs_page_size
+                    && (!caddr.raw_value().is_multiple_of(huge_page_size)
+                        || !(len as u64).is_multiple_of(huge_page_size))
+                {
+                    return Err(GuestMemoryError::InvalidGuestAddress(
+                        self.start_addr().unchecked_add(caddr.raw_value()),
+                    ));
+                }
                 // Mmap a new anonymous region over the present one in order to create a hole
                 // with zero pages.
                 // This workaround is (only) needed after resuming from a snapshot file because the
@@ -880,6 +895,41 @@ impl GuestMemoryRegion for GuestRegionMmapExt {
         count: usize,
     ) -> vm_memory::guest_memory::Result<VolatileSlice<'_, BS<'_, Self::B>>> {
         self.inner.get_slice(offset, count)
+    }
+}
+
+/// The filesystem holding a guest memory backing file, as reported by `fstatfs(2)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackingFileSystem {
+    // The `statfs` field types differ between libc targets, so both are widened to i128.
+    magic: i128,
+    block_size: i128,
+}
+
+impl BackingFileSystem {
+    /// Reads the filesystem type and block size of `file`.
+    pub fn of(file: &File) -> io::Result<Self> {
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: `file` owns a valid descriptor and `stat` is writable storage for one `statfs`.
+        if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a successful `fstatfs` initialized `stat`.
+        let stat = unsafe { stat.assume_init() };
+        Ok(Self {
+            magic: i128::from(stat.f_type),
+            block_size: i128::from(stat.f_bsize),
+        })
+    }
+
+    /// Returns the huge page size in bytes when the file is on hugetlbfs, whose block size is its
+    /// page size, and `None` for any other filesystem.
+    pub fn hugetlbfs_page_size(&self) -> Option<u64> {
+        if self.magic == i128::from(libc::HUGETLBFS_MAGIC) {
+            u64::try_from(self.block_size).ok()
+        } else {
+            None
+        }
     }
 }
 
@@ -1288,6 +1338,59 @@ pub mod test_utils {
                 .collect(),
         )
         .unwrap()
+    }
+
+    /// Creates a memfd of `len` bytes filled with `fill`: on hugetlbfs with 2 MiB pages when
+    /// `hugetlbfs` is set, on shmem otherwise. hugetlbfs has no `write(2)`, so the contents are
+    /// written through a shared mapping, which also claims the huge pages up front.
+    ///
+    /// Panics, naming the host requirement, when the huge page pool cannot back the file.
+    #[cfg(test)]
+    pub(crate) fn test_memfd(len: usize, hugetlbfs: bool, fill: u8) -> File {
+        use std::os::fd::FromRawFd;
+
+        let mut flags = libc::MFD_CLOEXEC;
+        if hugetlbfs {
+            flags |= libc::MFD_HUGETLB | libc::MFD_HUGE_2MB;
+        }
+        // SAFETY: the name is a valid NUL-terminated string.
+        let fd = unsafe { libc::memfd_create(c"firecracker_test_memfd".as_ptr(), flags) };
+        assert!(
+            fd >= 0,
+            "memfd_create failed: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: `fd` was just created and has no other owner.
+        let file = unsafe { File::from_raw_fd(fd) };
+        file.set_len(len as u64).unwrap();
+        // SAFETY: a new shared mapping of the first `len` bytes of `file`, unmapped below.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(
+            addr,
+            libc::MAP_FAILED,
+            "mapping the test memfd failed: {}{}",
+            io::Error::last_os_error(),
+            if hugetlbfs {
+                "; this test needs free 2 MiB huge pages (vm.nr_hugepages)"
+            } else {
+                ""
+            }
+        );
+        // SAFETY: `addr` maps `len` writable bytes that nothing else references.
+        unsafe {
+            std::ptr::write_bytes(addr.cast::<u8>(), fill, len);
+            libc::munmap(addr, len);
+        }
+        file
     }
 }
 
@@ -1918,6 +2021,44 @@ mod tests {
                 .unwrap_err(),
             GuestMemoryError::InvalidGuestAddress(_)
         );
+    }
+
+    #[test]
+    fn test_discard_range_on_hugetlbfs_private_mapping() {
+        const HUGE_PAGE: usize = 2 << 20;
+        // Map a hugetlbfs file the way a UFFD-minor restore with `huge_pages: 2M` maps its
+        // backing: privately, with the copy-on-write huge pages reserved.
+        let backing = test_utils::test_memfd(2 * HUGE_PAGE, true, 0x5a);
+        let mem = into_region_ext(
+            snapshot_file(
+                backing,
+                std::iter::once((GuestAddress(0), 2 * HUGE_PAGE)),
+                false,
+                HugePageConfig::Hugetlbfs2M,
+                true,
+            )
+            .unwrap(),
+        );
+        let page_size = host_page_size();
+        let mut page = vec![0u8; page_size];
+
+        // A host-page range inside a huge page, such as one balloon PFN, cannot be discarded.
+        assert_match!(
+            mem.discard_range(GuestAddress(page_size as u64), page_size)
+                .unwrap_err(),
+            GuestMemoryError::InvalidGuestAddress(_)
+        );
+        // Refusing it left the huge page mapped with its contents.
+        mem.read(&mut page, GuestAddress(page_size as u64)).unwrap();
+        assert!(page.iter().all(|&byte| byte == 0x5a));
+
+        // A range aligned to the huge page size is discarded and reads back as zeros.
+        mem.discard_range(GuestAddress(HUGE_PAGE as u64), HUGE_PAGE)
+            .unwrap();
+        mem.read(&mut page, GuestAddress(HUGE_PAGE as u64)).unwrap();
+        assert!(page.iter().all(|&byte| byte == 0));
+        mem.read(&mut page, GuestAddress(0)).unwrap();
+        assert!(page.iter().all(|&byte| byte == 0x5a));
     }
 
     #[test]
