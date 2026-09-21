@@ -74,7 +74,7 @@ trait UffdHandshakeSocket {
         fd: RawFd,
     ) -> Result<usize, vmm_sys_util::errno::Error>;
 
-    fn write_remaining(&mut self, payload: &[u8]) -> io::Result<()>;
+    fn write_some(&mut self, payload: &[u8]) -> io::Result<usize>;
 }
 
 impl UffdHandshakeSocket for UnixStream {
@@ -90,8 +90,8 @@ impl UffdHandshakeSocket for UnixStream {
         self.send_with_fd(payload, fd)
     }
 
-    fn write_remaining(&mut self, payload: &[u8]) -> io::Result<()> {
-        self.write_all(payload)
+    fn write_some(&mut self, payload: &[u8]) -> io::Result<usize> {
+        self.write(payload)
     }
 }
 
@@ -903,6 +903,11 @@ fn send_uffd_payload(
     fd: RawFd,
     timeout: Duration,
 ) -> Result<(), GuestMemoryFromUffdError> {
+    // One deadline covers the whole reply. A per-write timeout alone lets a peer that drains a
+    // few bytes at a time hold the restore indefinitely.
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(GuestMemoryFromUffdError::MappingsHandshakeTimeout)?;
     socket
         .set_write_timeout(Some(timeout))
         .map_err(map_uffd_payload_io_error)?;
@@ -928,10 +933,32 @@ fn send_uffd_payload(
             "descriptor-bearing UFFD mappings send reported too many bytes",
         )));
     }
-    if written < payload.len() {
+    let mut sent = written;
+    while sent < payload.len() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or(GuestMemoryFromUffdError::MappingsHandshakeTimeout)?;
         socket
-            .write_remaining(&payload[written..])
+            .set_write_timeout(Some(remaining))
             .map_err(map_uffd_payload_io_error)?;
+        match socket.write_some(&payload[sent..]) {
+            Ok(0) => {
+                return Err(GuestMemoryFromUffdError::SendPayload(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "UFFD mappings write wrote zero bytes",
+                )));
+            }
+            Ok(count) if count > payload.len() - sent => {
+                return Err(GuestMemoryFromUffdError::SendPayload(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "UFFD mappings write reported too many bytes",
+                )));
+            }
+            Ok(count) => sent += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(map_uffd_payload_io_error(error)),
+        }
     }
     Ok(())
 }
@@ -1055,13 +1082,13 @@ mod tests {
             Ok(self.first_write_len)
         }
 
-        fn write_remaining(&mut self, payload: &[u8]) -> io::Result<()> {
+        fn write_some(&mut self, payload: &[u8]) -> io::Result<usize> {
             self.remaining_writes += 1;
             if let Some(error_kind) = self.remaining_error {
                 return Err(io::Error::from(error_kind));
             }
             self.payload.extend_from_slice(payload);
-            Ok(())
+            Ok(payload.len())
         }
     }
 
@@ -1273,10 +1300,13 @@ mod tests {
 
         assert_eq!(socket.payload, expected);
         assert_eq!(socket.sent_fds, [sent_fd]);
+        // The tail write gets whatever is left of the one deadline.
+        assert_eq!(socket.write_timeouts.len(), 2);
         assert_eq!(
-            socket.write_timeouts,
-            [Some(UFFD_MINOR_BACKING_HANDSHAKE_TIMEOUT)]
+            socket.write_timeouts[0],
+            Some(UFFD_MINOR_BACKING_HANDSHAKE_TIMEOUT)
         );
+        assert!(socket.write_timeouts[1].unwrap() <= UFFD_MINOR_BACKING_HANDSHAKE_TIMEOUT);
         assert_eq!(socket.remaining_writes, 1);
     }
 
@@ -1367,6 +1397,50 @@ mod tests {
         assert_eq!(socket.payload, &expected[..5]);
         assert_eq!(socket.sent_fds, [42]);
         assert_eq!(socket.remaining_writes, 1);
+    }
+
+    #[test]
+    fn test_uffd_handshake_bounds_the_whole_send() {
+        // A peer that drains one byte at a time never trips a per-write timeout, so the deadline
+        // has to cover the whole mappings reply.
+        struct SlowTailSocket {
+            tail_writes: usize,
+        }
+
+        impl UffdHandshakeSocket for SlowTailSocket {
+            fn set_write_timeout(&mut self, _timeout: Option<Duration>) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn send_with_fd_once(
+                &mut self,
+                _payload: &[u8],
+                _fd: RawFd,
+            ) -> Result<usize, vmm_sys_util::errno::Error> {
+                Ok(1)
+            }
+
+            fn write_some(&mut self, _payload: &[u8]) -> io::Result<usize> {
+                self.tail_writes += 1;
+                std::thread::sleep(Duration::from_millis(2));
+                Ok(1)
+            }
+        }
+
+        let payload = vec![b'x'; 1000];
+        let mut socket = SlowTailSocket { tail_writes: 0 };
+        let error =
+            send_uffd_payload(&mut socket, &payload, 42, Duration::from_millis(20)).unwrap_err();
+
+        assert!(
+            matches!(error, GuestMemoryFromUffdError::MappingsHandshakeTimeout),
+            "{error}"
+        );
+        assert!(
+            socket.tail_writes < payload.len() - 1,
+            "{} tail writes",
+            socket.tail_writes
+        );
     }
 
     #[test]
