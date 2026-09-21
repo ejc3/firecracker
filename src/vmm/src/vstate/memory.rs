@@ -931,6 +931,23 @@ impl BackingFileSystem {
             None
         }
     }
+
+    /// Returns whether the file is on tmpfs, where an ordinary memfd lives.
+    pub fn is_shmem(&self) -> bool {
+        self.magic == i128::from(libc::TMPFS_MAGIC)
+    }
+}
+
+impl std::fmt::Display for BackingFileSystem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(page_size) = self.hugetlbfs_page_size() {
+            write!(f, "hugetlbfs with {page_size}-byte pages")
+        } else if self.is_shmem() {
+            write!(f, "shmem")
+        } else {
+            write!(f, "a filesystem with magic {:#x}", self.magic)
+        }
+    }
 }
 
 /// Creates a `Vec` of `GuestRegionMmap` with the given configuration.

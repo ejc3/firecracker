@@ -41,7 +41,7 @@ use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, Mach
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
-    self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
+    self, BackingFileSystem, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
@@ -621,6 +621,15 @@ pub enum GuestMemoryFromUffdError {
     InvalidBackingHandshake,
     /// Timed out while receiving the UFFD minor-backing protocol greeting.
     BackingHandshakeTimeout,
+    /// Failed to inspect the UFFD minor backing file: {0}
+    BackingFileStat(std::io::Error),
+    /// UFFD minor backing on {file_system} does not match huge_pages {huge_pages:?}.
+    BackingFileMismatch {
+        /// The page configuration the restore resolved to.
+        huge_pages: HugePageConfig,
+        /// The filesystem holding the handler's backing file.
+        file_system: BackingFileSystem,
+    },
 }
 
 fn guest_memory_from_uffd(
@@ -782,14 +791,42 @@ fn map_uffd_minor_backing(
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
-) -> Result<Vec<GuestRegionMmap>, MemoryError> {
-    memory::snapshot_file(
+) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromUffdError> {
+    check_uffd_minor_backing(&backing, huge_pages)?;
+    Ok(memory::snapshot_file(
         backing,
         mem_state.regions(),
         track_dirty_pages,
         huge_pages,
         huge_pages.is_hugetlbfs(),
-    )
+    )?)
+}
+
+/// Firecracker maps the handler's backing file as given, while the userfaultfd feature, the
+/// copy-on-write reservation and the page size in the mappings reply all follow `huge_pages`.
+/// A hugetlbfs backing with 4 KiB pages leaves faults the handler cannot resolve, since
+/// `UFFDIO_CONTINUE` on a 4 KiB range fails with `EINVAL`, and a shmem backing with 2M pages
+/// works only when the kernel happens to 2 MiB-align the mapping. Require hugetlbfs with the
+/// matching page size exactly when `huge_pages` selects hugetlbfs, and shmem otherwise.
+fn check_uffd_minor_backing(
+    backing: &File,
+    huge_pages: HugePageConfig,
+) -> Result<(), GuestMemoryFromUffdError> {
+    let file_system =
+        BackingFileSystem::of(backing).map_err(GuestMemoryFromUffdError::BackingFileStat)?;
+    let matches = if huge_pages.is_hugetlbfs() {
+        file_system.hugetlbfs_page_size() == u64::try_from(huge_pages.page_size()).ok()
+    } else {
+        file_system.is_shmem()
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(GuestMemoryFromUffdError::BackingFileMismatch {
+            huge_pages,
+            file_system,
+        })
+    }
 }
 
 trait UffdRegistrar {
@@ -1363,10 +1400,8 @@ mod tests {
     #[test]
     fn test_uffd_minor_same_stream_backing_and_reply() {
         let (firecracker, handler) = UnixStream::pair().unwrap();
-        let mut backing = TempFile::new().unwrap().into_file();
         let mem_size = 0x20_000usize;
-        backing.set_len(u64::try_from(mem_size).unwrap()).unwrap();
-        backing.write_all(&vec![0x5a; mem_size]).unwrap();
+        let backing = memory::test_utils::test_memfd(mem_size, false, 0x5a);
         handler
             .send_with_fd(UFFD_MINOR_BACKING_HELLO_V1, backing.as_raw_fd())
             .unwrap();
@@ -1492,9 +1527,47 @@ mod tests {
     }
 
     #[test]
+    fn test_uffd_minor_backing_must_match_huge_pages() {
+        const HUGE_PAGE: usize = 2 << 20;
+        let mem_state = GuestMemoryState {
+            regions: vec![GuestMemoryRegionState {
+                base_address: 0,
+                size: HUGE_PAGE,
+                region_type: GuestRegionType::Dram,
+                plugged: vec![true],
+            }],
+        };
+
+        // hugetlbfs with 4 KiB pages leaves faults the handler cannot resolve, and shmem with 2M
+        // pages only works when the kernel happens to 2 MiB-align the mapping.
+        for (hugetlbfs_backing, huge_pages) in [
+            (true, HugePageConfig::None),
+            (true, HugePageConfig::Transparent),
+            (false, HugePageConfig::Hugetlbfs2M),
+        ] {
+            let backing = memory::test_utils::test_memfd(HUGE_PAGE, hugetlbfs_backing, 0x5a);
+            let error = map_uffd_minor_backing(backing, &mem_state, false, huge_pages)
+                .expect_err("a backing that does not match huge_pages must be rejected");
+            assert!(
+                matches!(error, GuestMemoryFromUffdError::BackingFileMismatch { .. })
+                    && error.to_string().contains("does not match"),
+                "hugetlbfs_backing={hugetlbfs_backing} huge_pages={huge_pages:?}: {error}"
+            );
+        }
+
+        for (hugetlbfs_backing, huge_pages) in [
+            (false, HugePageConfig::None),
+            (false, HugePageConfig::Transparent),
+            (true, HugePageConfig::Hugetlbfs2M),
+        ] {
+            let backing = memory::test_utils::test_memfd(HUGE_PAGE, hugetlbfs_backing, 0x5a);
+            map_uffd_minor_backing(backing, &mem_state, false, huge_pages).unwrap();
+        }
+    }
+
+    #[test]
     fn test_uffd_minor_rejects_undersized_backing() {
-        let backing = TempFile::new().unwrap().into_file();
-        backing.set_len(0x1000).unwrap();
+        let backing = memory::test_utils::test_memfd(0x1000, false, 0);
         let mem_state = GuestMemoryState {
             regions: vec![GuestMemoryRegionState {
                 base_address: 0,
@@ -1505,7 +1578,9 @@ mod tests {
         };
         assert!(matches!(
             map_uffd_minor_backing(backing, &mem_state, false, HugePageConfig::None),
-            Err(MemoryError::OffsetTooLarge)
+            Err(GuestMemoryFromUffdError::Restore(
+                MemoryError::OffsetTooLarge
+            ))
         ));
     }
 

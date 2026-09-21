@@ -477,8 +477,9 @@ omitted; `None` uses the host's default memory-mapping behavior. Explicit `2M`
 hugetlbfs pages require the `Uffd` or `UffdMinor` backend, so combining `2M`
 with `File` returns an error. For `UffdMinor`, the handler's backing file must
 match the page configuration the restore resolves to: a hugetlbfs file for `2M`
-and a shmem file, such as a memfd, otherwise. With either UFFD backend, the
-effectiveness of transparent huge pages may be limited.
+and a shmem file, such as a memfd, otherwise. Firecracker rejects a backing file
+that does not match. With either UFFD backend, the effectiveness of transparent
+huge pages may be limited.
 
 When relying on the OS to handle page faults, the command below is also
 accepted. Note that `mem_file_path` field is currently under the deprecation
