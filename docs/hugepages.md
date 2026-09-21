@@ -56,10 +56,10 @@ pool, please refer to the [Linux Documentation][hugetlbfs_docs].
 
 A snapshot restore through the `UffdMinor` backend with `2M` pages is the
 exception. Firecracker maps the handler's hugetlbfs backing file privately
-without `MAP_NORESERVE`, so the kernel reserves one huge page per guest page for
-copy-on-write at restore time, on top of the pages that hold the handler's file.
-A pool too small for both makes the restore fail with `ENOMEM` instead of a
-running guest receiving `SIGBUS`.
+without `MAP_NORESERVE`, so at restore time the kernel reserves one 2 MiB page
+for each 2 MiB of guest memory for copy-on-write, on top of the pages that hold
+the handler's file. A pool too small for both makes the restore fail with
+`ENOMEM` instead of a running guest receiving `SIGBUS`.
 
 ### Huge Pages and Snapshotting
 
