@@ -1409,6 +1409,39 @@ pub mod test_utils {
         }
         file
     }
+
+    /// Serializes the unit tests that allocate 2 MiB huge pages and checks the pool first, so a
+    /// host needs only the pages of the largest single test, whatever the harness runs at once.
+    ///
+    /// Like `test_guest_region_alignment_and_size_huge`, a test skips when the host cannot
+    /// provide its pages: this prints why and returns `None`.
+    #[cfg(test)]
+    pub(crate) fn lock_free_huge_pages(pages: u64) -> Option<std::sync::MutexGuard<'static, ()>> {
+        static HUGE_PAGE_TESTS: Mutex<()> = Mutex::new(());
+        let guard = HUGE_PAGE_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let counter = |name: &str| {
+            std::fs::read_to_string(format!("/sys/kernel/mm/hugepages/hugepages-2048kB/{name}"))
+                .ok()?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        };
+        // Pages that another mapping has reserved count as free but cannot be claimed.
+        let available = counter("free_hugepages")
+            .zip(counter("resv_hugepages"))
+            .map(|(free, reserved)| free.saturating_sub(reserved));
+        if available.is_some_and(|available| available >= pages) {
+            return Some(guard);
+        }
+        let available = available.map_or_else(|| "none".to_string(), |count| count.to_string());
+        println!(
+            "Skipping: this test needs {pages} free 2 MiB hugepages and {available} are \
+             available; raise vm.nr_hugepages to provide them"
+        );
+        None
+    }
 }
 
 #[cfg(test)]
@@ -2043,6 +2076,10 @@ mod tests {
     #[test]
     fn test_discard_range_on_hugetlbfs_private_mapping() {
         const HUGE_PAGE: usize = 2 << 20;
+        // Two huge pages hold the memfd and two are reserved for the private copy-on-write.
+        let Some(_huge_pages) = test_utils::lock_free_huge_pages(4) else {
+            return;
+        };
         // Map a hugetlbfs file the way a UFFD-minor restore with `huge_pages: 2M` maps its
         // backing: privately, with the copy-on-write huge pages reserved.
         let backing = test_utils::test_memfd(2 * HUGE_PAGE, true, 0x5a);
@@ -2076,6 +2113,12 @@ mod tests {
         assert!(page.iter().all(|&byte| byte == 0));
         mem.read(&mut page, GuestAddress(0)).unwrap();
         assert!(page.iter().all(|&byte| byte == 0x5a));
+    }
+
+    #[test]
+    fn test_lock_free_huge_pages_skips_when_the_pool_is_short() {
+        // The skip path must be reachable, or a short pool would fail the huge page tests.
+        assert!(test_utils::lock_free_huge_pages(u64::MAX).is_none());
     }
 
     #[test]

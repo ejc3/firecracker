@@ -1603,6 +1603,9 @@ mod tests {
     #[test]
     fn test_uffd_minor_backing_must_match_huge_pages() {
         const HUGE_PAGE: usize = 2 << 20;
+        // A hugetlbfs case holds one huge page for the memfd and, when it maps, one reserved for
+        // the private copy-on-write. Without them only the shmem cases run.
+        let huge_pages_lock = memory::test_utils::lock_free_huge_pages(2);
         let mem_state = GuestMemoryState {
             regions: vec![GuestMemoryRegionState {
                 base_address: 0,
@@ -1619,6 +1622,9 @@ mod tests {
             (true, HugePageConfig::Transparent),
             (false, HugePageConfig::Hugetlbfs2M),
         ] {
+            if hugetlbfs_backing && huge_pages_lock.is_none() {
+                continue;
+            }
             let backing = memory::test_utils::test_memfd(HUGE_PAGE, hugetlbfs_backing, 0x5a);
             let error = map_uffd_minor_backing(backing, &mem_state, false, huge_pages)
                 .expect_err("a backing that does not match huge_pages must be rejected");
@@ -1634,6 +1640,9 @@ mod tests {
             (false, HugePageConfig::Transparent),
             (true, HugePageConfig::Hugetlbfs2M),
         ] {
+            if hugetlbfs_backing && huge_pages_lock.is_none() {
+                continue;
+            }
             let backing = memory::test_utils::test_memfd(HUGE_PAGE, hugetlbfs_backing, 0x5a);
             map_uffd_minor_backing(backing, &mem_state, false, huge_pages).unwrap();
         }
