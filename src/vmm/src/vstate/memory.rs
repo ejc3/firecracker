@@ -750,18 +750,30 @@ impl GuestRegionMmapExt {
                 // The kernel cannot split a hugetlbfs mapping inside a huge page, so the MAP_FIXED
                 // replacement below would fail with EINVAL for such a range, after which this
                 // function panics. A UFFD-minor restore with 2M pages maps a hugetlbfs file
-                // privately, so refuse any range that is not aligned to its huge page size.
+                // privately. Discard the huge pages the range covers whole, which leaves the
+                // partly covered ones at either end mapped, and refuse a range that covers none.
                 let hugetlbfs_page_size = BackingFileSystem::of(file_offset.file())
                     .map_err(GuestMemoryError::IOError)?
                     .hugetlbfs_page_size();
-                if let Some(huge_page_size) = hugetlbfs_page_size
-                    && (!caddr.raw_value().is_multiple_of(huge_page_size)
-                        || !(len as u64).is_multiple_of(huge_page_size))
-                {
-                    return Err(GuestMemoryError::InvalidGuestAddress(
-                        self.start_addr().unchecked_add(caddr.raw_value()),
-                    ));
-                }
+                let (caddr, len) = match hugetlbfs_page_size {
+                    Some(huge_page_size) => {
+                        let start = caddr.raw_value();
+                        let end = start
+                            .checked_add(len as u64)
+                            .ok_or(GuestMemoryError::GuestAddressOverflow)?;
+                        let first = start
+                            .checked_next_multiple_of(huge_page_size)
+                            .ok_or(GuestMemoryError::GuestAddressOverflow)?;
+                        let last = end - end % huge_page_size;
+                        if first >= last {
+                            return Err(GuestMemoryError::InvalidGuestAddress(
+                                self.start_addr().unchecked_add(start),
+                            ));
+                        }
+                        (MemoryRegionAddress(first), u64_to_usize(last - first))
+                    }
+                    None => (caddr, len),
+                };
                 // Mmap a new anonymous region over the present one in order to create a hole
                 // with zero pages.
                 // This workaround is (only) needed after resuming from a snapshot file because the
@@ -926,7 +938,7 @@ impl BackingFileSystem {
     /// page size, and `None` for any other filesystem.
     pub fn hugetlbfs_page_size(&self) -> Option<u64> {
         if self.magic == i128::from(libc::HUGETLBFS_MAGIC) {
-            u64::try_from(self.block_size).ok()
+            u64::try_from(self.block_size).ok().filter(|size| *size > 0)
         } else {
             None
         }
@@ -2113,6 +2125,44 @@ mod tests {
         assert!(page.iter().all(|&byte| byte == 0));
         mem.read(&mut page, GuestAddress(0)).unwrap();
         assert!(page.iter().all(|&byte| byte == 0x5a));
+    }
+
+    #[test]
+    fn test_discard_range_on_hugetlbfs_discards_whole_covered_pages() {
+        const HUGE_PAGE: usize = 2 << 20;
+        // Two huge pages hold the memfd and two are reserved for the private copy-on-write.
+        let Some(_huge_pages) = test_utils::lock_free_huge_pages(4) else {
+            return;
+        };
+        let backing = test_utils::test_memfd(2 * HUGE_PAGE, true, 0x5a);
+        let mem = into_region_ext(
+            snapshot_file(
+                backing,
+                std::iter::once((GuestAddress(0), 2 * HUGE_PAGE)),
+                false,
+                HugePageConfig::Hugetlbfs2M,
+                true,
+            )
+            .unwrap(),
+        );
+        let mut page = vec![0u8; host_page_size()];
+
+        // Balloon page frame runs rarely start on a huge page boundary. This one starts halfway
+        // into the first huge page and ends with the second, so only the second is covered whole.
+        mem.discard_range(
+            GuestAddress((HUGE_PAGE / 2) as u64),
+            HUGE_PAGE + HUGE_PAGE / 2,
+        )
+        .unwrap();
+        for offset in [HUGE_PAGE, 2 * HUGE_PAGE - page.len()] {
+            mem.read(&mut page, GuestAddress(offset as u64)).unwrap();
+            assert!(page.iter().all(|&byte| byte == 0), "offset {offset:#x}");
+        }
+        // The partly covered first huge page keeps its contents, including the part in range.
+        for offset in [0, HUGE_PAGE / 2, HUGE_PAGE - page.len()] {
+            mem.read(&mut page, GuestAddress(offset as u64)).unwrap();
+            assert!(page.iter().all(|&byte| byte == 0x5a), "offset {offset:#x}");
+        }
     }
 
     #[test]
