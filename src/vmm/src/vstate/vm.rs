@@ -38,7 +38,7 @@ use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorGroup};
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{
     GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemoryState, GuestRegionMmap,
-    GuestRegionMmapExt, MemoryError,
+    GuestRegionMmapExt, MemoryError, ZeroPages,
 };
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
@@ -596,7 +596,8 @@ impl KvmVm {
     ///
     /// If `snapshot_type` is [`SnapshotType::Diff`], and `mem_file_path` exists and is a snapshot
     /// file of matching size, then the diff snapshot will be directly merged into the existing
-    /// snapshot. Otherwise, existing files are simply overwritten.
+    /// snapshot. Otherwise, existing files are simply overwritten. A full snapshot into a file
+    /// that held no data (a new file, or one of the wrong size) can leave all-zero pages as holes.
     pub(crate) fn snapshot_memory_to_file(
         &self,
         mem_file_path: &Path,
@@ -604,9 +605,6 @@ impl KvmVm {
         sync_snapshot_files: bool,
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::*;
-
-        // Need to check this here, as we create the file in the line below
-        let file_existed = mem_file_path.exists();
 
         let mut file = OpenOptions::new()
             .write(true)
@@ -619,23 +617,26 @@ impl KvmVm {
         let mem_size_mib = mem_size_mib(self.guest_memory());
         let expected_size = mem_size_mib * 1024 * 1024;
 
-        if file_existed {
-            let file_size = file
-                .metadata()
-                .map_err(|e| MemoryBackingFile("get_metadata", e))?
-                .len();
+        // The size comes from the file just opened, not from a check before the open, so a file
+        // created in between is never taken for an empty one.
+        let file_size = file
+            .metadata()
+            .map_err(|e| MemoryBackingFile("get_metadata", e))?
+            .len();
 
-            // Here we only truncate the file if the size mismatches.
-            // - For full snapshots, the entire file's contents will be overwritten anyway. We have
-            //   to avoid truncating here to deal with the edge case where it represents the
-            //   snapshot file from which this very microVM was loaded (as modifying the memory file
-            //   would be reflected in the mmap of the file, meaning a truncate operation would zero
-            //   out guest memory, and thus corrupt the VM).
-            // - For diff snapshots, we want to merge the diff layer directly into the file.
-            if file_size != expected_size {
-                file.set_len(0)
-                    .map_err(|err| MemoryBackingFile("truncate", err))?;
-            }
+        // Here we only truncate the file if the size mismatches.
+        // - For full snapshots, the entire file's contents will be overwritten anyway. We have to
+        //   avoid truncating here to deal with the edge case where it represents the snapshot file
+        //   from which this very microVM was loaded (as modifying the memory file would be
+        //   reflected in the mmap of the file, meaning a truncate operation would zero out guest
+        //   memory, and thus corrupt the VM).
+        // - For diff snapshots, we want to merge the diff layer directly into the file.
+        // A file this call created is empty, so it takes the truncate branch, where truncating
+        // changes nothing. Either way the file holds no data afterwards.
+        let starts_empty = file_size != expected_size;
+        if starts_empty {
+            file.set_len(0)
+                .map_err(|err| MemoryBackingFile("truncate", err))?;
         }
 
         // Set the length of the file to the full size of the memory area.
@@ -648,7 +649,15 @@ impl KvmVm {
                 self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
             }
             SnapshotType::Full => {
-                self.guest_memory().dump(&mut file)?;
+                // A file that held no data reads as one hole after the set_len above, so the dump
+                // may skip zero pages. In a file that already had the right size a skipped page
+                // would keep its old bytes, so every page is written.
+                let zero_pages = if starts_empty {
+                    ZeroPages::Hole
+                } else {
+                    ZeroPages::Write
+                };
+                self.guest_memory().dump(&mut file, zero_pages)?;
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
             }
@@ -802,9 +811,12 @@ fn mincore_bitmap(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::assert_matches;
+    use std::fs::File;
     use std::sync::atomic::Ordering;
 
     use vm_memory::GuestAddress;
+    use vmm_sys_util::tempdir::TempDir;
+    use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
     use crate::arch;
@@ -815,7 +827,8 @@ pub(crate) mod tests {
     use crate::utils::mib_to_bytes;
     use crate::vmm_config::machine_config::HugePageConfig;
     use crate::vstate::kvm::Kvm;
-    use crate::vstate::memory::anonymous;
+    use crate::vstate::memory::test_utils::data_runs;
+    use crate::vstate::memory::{Bytes, HOLE_GRANULE, anonymous};
 
     // Auxiliary function being used throughout the tests.
     pub(crate) fn setup_vm() -> KvmVm {
@@ -829,6 +842,67 @@ pub(crate) mod tests {
         let gm = single_region_mem_raw(mem_size);
         vm.register_dram_memory_regions(gm).unwrap();
         vm
+    }
+
+    // Offset of the one all-zero page in the guest memory of setup_vm_with_one_zero_page.
+    const ZERO_PAGE: usize = 2 * HOLE_GRANULE;
+
+    // A VM with 1 MiB of guest memory holding 0x11 everywhere but one all-zero page at
+    // ZERO_PAGE. Returns the VM and its memory contents.
+    fn setup_vm_with_one_zero_page() -> (KvmVm, Vec<u8>) {
+        let mem_size = mib_to_bytes(1);
+        let vm = setup_vm_with_memory(mem_size);
+        let mut contents = vec![0x11u8; mem_size];
+        contents[ZERO_PAGE..ZERO_PAGE + HOLE_GRANULE].fill(0);
+        vm.guest_memory()
+            .write_slice(&contents, GuestAddress(0))
+            .unwrap();
+        (vm, contents)
+    }
+
+    // Offset of the first byte where the file differs from `expected`, or None.
+    fn first_difference(path: &Path, expected: &[u8]) -> Option<usize> {
+        let contents = std::fs::read(path).unwrap();
+        assert_eq!(contents.len(), expected.len());
+        contents.iter().zip(expected).position(|(a, b)| a != b)
+    }
+
+    #[test]
+    fn test_full_snapshot_overwrites_zero_pages_in_an_existing_file() {
+        let (vm, contents) = setup_vm_with_one_zero_page();
+        // A file of the snapshot's size full of 0xFF stands in for an earlier snapshot.
+        let file = TempFile::new().unwrap();
+        std::fs::write(file.as_path(), vec![0xFFu8; contents.len()]).unwrap();
+
+        vm.snapshot_memory_to_file(file.as_path(), SnapshotType::Full, false)
+            .unwrap();
+
+        // Seeking over the zero page would leave the old 0xFF bytes under it.
+        assert_eq!(first_difference(file.as_path(), &contents), None);
+    }
+
+    #[test]
+    fn test_full_snapshot_leaves_zero_pages_as_holes_in_an_empty_target() {
+        let (vm, contents) = setup_vm_with_one_zero_page();
+        // A path with no file yet, and a file of the wrong size, which the snapshot truncates.
+        let dir = TempDir::new().unwrap();
+        let new_path = dir.as_path().join("new");
+        let wrong_size_path = dir.as_path().join("wrong-size");
+        std::fs::write(&wrong_size_path, vec![0xFFu8; 2 * contents.len()]).unwrap();
+
+        for path in [new_path, wrong_size_path] {
+            vm.snapshot_memory_to_file(&path, SnapshotType::Full, false)
+                .unwrap();
+
+            let len = contents.len() as u64;
+            let (zero_page, page) = (ZERO_PAGE as u64, HOLE_GRANULE as u64);
+            assert_eq!(
+                data_runs(&File::open(&path).unwrap()),
+                vec![(0, zero_page), (zero_page + page, len - zero_page - page)],
+                "{path:?}"
+            );
+            assert_eq!(first_difference(&path, &contents), None, "{path:?}");
+        }
     }
 
     #[test]

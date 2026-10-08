@@ -209,9 +209,13 @@ the microVM in the `Paused` state. **Effects**:
 
 Now that the microVM is paused, you can create a snapshot, which can be either a
 `full`one or a `diff` one. Full snapshots always create a complete, resume-able
-snapshot of the current microVM state and memory. Diff snapshots save at least
-the current microVM state and the memory accessed since the last snapshot (full
-or diff) in a sparse file (but they might include more pages than strictly
+snapshot of the current microVM state and memory. A full snapshot written to a
+new memory file, or to one whose size differs from guest memory, can leave
+all-zero pages as holes, so never pass a full snapshot's memory file to
+`rebase-snap` or `snapshot-editor` as the diff: they copy only its data, and the
+base would keep its old bytes where the guest held zeros. Diff snapshots save at
+least the current microVM state and the memory accessed since the last snapshot
+(full or diff) in a sparse file (but they might include more pages than strictly
 needed due to technical limitation in Firecracker's ability to accurately track
 accesses). Diff snapshots are generally not resume-able, but must be merged with
 a base snapshot into a full snapshot. The exception here are diff snapshots of
