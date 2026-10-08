@@ -625,11 +625,12 @@ impl KvmVm {
             .len();
 
         // Here we only truncate the file if the size mismatches.
-        // - For full snapshots, the contents of every plugged slot will be overwritten anyway. We
-        //   have to avoid truncating here to deal with the edge case where it represents the
-        //   snapshot file from which this very microVM was loaded (as modifying the memory file
-        //   would be reflected in the mmap of the file, meaning a truncate operation would zero
-        //   out guest memory, and thus corrupt the VM).
+        // - For full snapshots, the file's contents will be overwritten anyway, except under an
+        //   unplugged slot, where the dump writes at most the pages a discard emptied. We have to
+        //   avoid truncating here to deal with the edge case where it represents the snapshot file
+        //   from which this very microVM was loaded (as modifying the memory file would be
+        //   reflected in the mmap of the file, meaning a truncate operation would zero out guest
+        //   memory, and thus corrupt the VM).
         // - For diff snapshots, we want to merge the diff layer directly into the file.
         // A file this call created is empty, so it takes the truncate branch, where truncating
         // changes nothing. Either way the file holds no data afterwards.
@@ -652,15 +653,18 @@ impl KvmVm {
                 // A file that held no data reads as one hole after the set_len above, so the dump
                 // may skip zero pages. In a file that already had the right size a skipped page
                 // would keep its old bytes, so every page of a plugged slot is written. An
-                // unplugged slot is seeked over in both modes and keeps the file's bytes.
+                // unplugged slot cannot be read. With dirty tracking the dump writes the pages a
+                // discard emptied there as zeros and leaves the file's bytes under the rest of the
+                // slot. Without it nothing records a discard, and the file keeps its bytes under
+                // the whole slot.
                 let zero_pages = if starts_empty {
                     ZeroPages::Hole
                 } else {
                     ZeroPages::Write
                 };
+                // The dump clears the marks of what it wrote.
                 self.guest_memory().dump(&mut file, zero_pages)?;
                 self.reset_dirty_bitmap();
-                self.guest_memory().reset_dirty();
             }
         };
 
@@ -829,7 +833,7 @@ pub(crate) mod tests {
     use crate::vmm_config::machine_config::HugePageConfig;
     use crate::vstate::kvm::Kvm;
     use crate::vstate::memory::test_utils::data_runs;
-    use crate::vstate::memory::{Bytes, HOLE_GRANULE, anonymous};
+    use crate::vstate::memory::{Bytes, GuestRegionType, HOLE_GRANULE, anonymous};
 
     // Auxiliary function being used throughout the tests.
     pub(crate) fn setup_vm() -> KvmVm {
@@ -904,6 +908,114 @@ pub(crate) mod tests {
             );
             assert_eq!(first_difference(&path, &contents), None, "{path:?}");
         }
+    }
+
+    // A VM with 1 MiB of DRAM and one hotpluggable slot of 1 MiB, both with dirty tracking, and
+    // the guest address of the slot. The slot starts unplugged.
+    fn setup_vm_with_hotplug_slot() -> (KvmVm, GuestAddress) {
+        let size = mib_to_bytes(1);
+        let hotplug = GuestAddress(1 << 30);
+        let mut vm = setup_vm();
+        vm.register_dram_memory_regions(
+            anonymous(
+                std::iter::once((GuestAddress(0), size)),
+                true,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        vm.register_hotpluggable_memory_region(
+            anonymous(std::iter::once((hotplug, size)), true, HugePageConfig::None)
+                .unwrap()
+                .pop()
+                .unwrap(),
+            size,
+        )
+        .unwrap();
+        (vm, hotplug)
+    }
+
+    // Plugs or unplugs the slot of setup_vm_with_hotplug_slot, and discards it when unplugging,
+    // as virtio-mem does.
+    fn set_hotplug_slot_plugged(vm: &KvmVm, plugged: bool) {
+        let region = vm
+            .guest_memory()
+            .iter()
+            .find(|region| region.region_type == GuestRegionType::Hotpluggable)
+            .unwrap();
+        let slot = region.mem_slot(region.slot_from);
+        region.update_slot(vm, &slot, plugged).unwrap();
+        if !plugged {
+            vm.guest_memory()
+                .discard_range(slot.guest_addr, slot.slice.len())
+                .unwrap();
+        }
+    }
+
+    // Plugs the slot of setup_vm_with_hotplug_slot, fills all guest memory with 0x11, and takes a
+    // Full snapshot of it to `path`. Returns the memory file's expected contents.
+    fn snapshot_vm_with_hotplug_slot(vm: &KvmVm, hotplug: GuestAddress, path: &Path) -> Vec<u8> {
+        let size = mib_to_bytes(1);
+        set_hotplug_slot_plugged(vm, true);
+        let mem = vm.guest_memory();
+        mem.write_slice(&vec![0x11; size], GuestAddress(0)).unwrap();
+        mem.write_slice(&vec![0x11; size], hotplug).unwrap();
+        vm.snapshot_memory_to_file(path, SnapshotType::Full, false)
+            .unwrap();
+        vec![0x11; 2 * size]
+    }
+
+    #[test]
+    fn test_diff_snapshot_writes_the_discarded_pages_of_an_unplugged_slot() {
+        // virtio-mem takes a slot out of KVM before it discards it, and no dump reads an
+        // unplugged slot. The zeros still have to reach the memory file, or a VM restored from it
+        // that plugs the slot back reads old bytes where this one reads zeros.
+        let (vm, hotplug) = setup_vm_with_hotplug_slot();
+        let file = TempFile::new().unwrap();
+        let mut expected = snapshot_vm_with_hotplug_slot(&vm, hotplug, file.as_path());
+        let size = mib_to_bytes(1);
+
+        set_hotplug_slot_plugged(&vm, false);
+        vm.snapshot_memory_to_file(file.as_path(), SnapshotType::Diff, false)
+            .unwrap();
+        expected[size..].fill(0);
+        assert_eq!(
+            first_difference(file.as_path(), &expected),
+            None,
+            "the Diff taken with the slot unplugged"
+        );
+
+        set_hotplug_slot_plugged(&vm, true);
+        let page = host_page_size();
+        vm.guest_memory()
+            .write_slice(&vec![0x22; page], hotplug)
+            .unwrap();
+        vm.snapshot_memory_to_file(file.as_path(), SnapshotType::Diff, false)
+            .unwrap();
+        expected[size..size + page].fill(0x22);
+        assert_eq!(
+            first_difference(file.as_path(), &expected),
+            None,
+            "the Diff taken after the slot was plugged back"
+        );
+    }
+
+    #[test]
+    fn test_full_snapshot_writes_the_discarded_pages_of_an_unplugged_slot() {
+        // A Full snapshot into a file of the right size overwrites the file in place, so it has
+        // to write the zeros an unplugged slot's discard left too. Only dirty tracking records
+        // the discard, and this VM has it: without it the dump seeks over the whole unplugged
+        // slot, and the file keeps its bytes there.
+        let (vm, hotplug) = setup_vm_with_hotplug_slot();
+        let file = TempFile::new().unwrap();
+        let mut expected = snapshot_vm_with_hotplug_slot(&vm, hotplug, file.as_path());
+
+        set_hotplug_slot_plugged(&vm, false);
+        vm.snapshot_memory_to_file(file.as_path(), SnapshotType::Full, false)
+            .unwrap();
+        expected[mib_to_bytes(1)..].fill(0);
+        assert_eq!(first_difference(file.as_path(), &expected), None);
     }
 
     #[test]

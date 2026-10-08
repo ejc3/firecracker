@@ -324,13 +324,21 @@ Diff snapshots come in two flavors. If `track_dirty_pages` was set to `true`
 when configuring the `/machine-config` resource or when restoring from a
 snapshot via `/snapshot/load`, Firecracker will use KVM's dirty page log runtime
 functionality to ensure the diff snapshot only contains exactly pages that were
-written to since boot / snapshot restoration. If `track_dirty_pages` is not
-enabled, Firecracker uses the [`mincore(2)`][man mincore] syscall to determine
-which pages to include in the snapshot. As such, this mode of snapshot taking
-will only work _if swap is disabled_, as mincore does not consider pages written
-to swap to be "in core". This potentially results in bigger memory files
-(although they are still sparse), but avoids the runtime overhead of dirty page
-logging.
+written to since boot / snapshot restoration. Such a diff also holds zeros for
+the pages a discard emptied in that time (balloon inflation, free page hinting
+and reporting, virtio-mem unplug), an unplugged slot's included, so the memory
+file a diff is merged into reads the way guest memory does. Firecracker writes
+those zeros without reading the pages back. A discarded page of a plugged slot
+that was also written in that time is read instead, unless `/proc/self/pagemap`
+and [`mincore(2)`][man mincore] both show that it has no page table entry. If
+`track_dirty_pages` is not enabled, Firecracker uses the
+[`mincore(2)`][man mincore] syscall to determine which pages to include in the
+snapshot. As such, this mode of snapshot taking will only work _if swap is
+disabled_, as mincore does not consider pages written to swap to be "in core". A
+discarded page is not in core either, so these diffs leave it out, and a file
+they are merged into keeps its old bytes there. This potentially results in
+bigger memory files (although they are still sparse), but avoids the runtime
+overhead of dirty page logging.
 
 > [!NOTE]
 >

@@ -86,8 +86,11 @@ benefits of using huge pages. This is because KVM will unconditionally establish
 guest page tables at 4K granularity if dirty page tracking is enabled, even if
 the host uses huge mappings.
 
-The traditional balloon device reports free pages at 4k granularity, this means
-the device is unable to reclaim the hugepage backing of the guest and drop RSS.
+The traditional balloon device reports free pages at 4k granularity, so it
+reclaims the hugepage backing of the guest and drops RSS only where a run of
+reported pages covers whole huge pages. For guest memory shared with a
+vhost-user backend it drops the page table entries and RSS there, but the memfd
+keeps its pages, so no host memory is freed.
 However, the balloon can still be inflated and used to restrict memory usage in
 the guest.
 

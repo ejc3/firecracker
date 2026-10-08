@@ -8,7 +8,7 @@
 use std::ffi::c_void;
 use std::fs::File;
 use std::io;
-use std::io::SeekFrom;
+use std::io::{Read, Seek, SeekFrom};
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
@@ -28,8 +28,8 @@ use vm_memory::{
 };
 
 use crate::arch::host_page_size;
-use crate::logger::error;
-use crate::utils::{mib_to_bytes, u64_to_usize};
+use crate::logger::{error, warn};
+use crate::utils::{mib_to_bytes, u64_to_usize, usize_to_u64};
 use crate::vmm_config::machine_config::HugePageConfig;
 use crate::vstate::vm::{KvmVm, VmError};
 use crate::{DirtyBitmap, align_up, warn_unrestricted};
@@ -54,6 +54,13 @@ pub const HOLE_GRANULE: usize = 4096;
 /// non-zero pages is written where the scan ends it or at the end of its chunk, so the chunk
 /// bounds the size of each write and the time between populating a chunk and writing it.
 const DUMP_CHUNK: usize = mib_to_bytes(2);
+
+/// The bits of a /proc/self/pagemap entry that say a page has a page table entry: 63, the page is
+/// in memory, and 62, it is swapped out. For small pages and transparent huge pages the kernel
+/// sets 62 for every entry that is neither empty nor present: swap, migration, and markers. A
+/// hugetlb entry that is not present (migration, hwpoison) gets neither bit, so this alone cannot
+/// say that a page has no entry.
+const PAGEMAP_PRESENT_OR_SWAPPED: u64 = 0b11 << 62;
 
 /// What a Full dump does with an all-zero page of [`HOLE_GRANULE`] bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +143,202 @@ fn populate_read<B: BitmapSlice>(slice: &VolatileSlice<'_, B>) -> Result<bool, M
         return Ok(false);
     }
     Err(MemoryError::WriteMemory(GuestMemoryError::IOError(err)))
+}
+
+/// What a dump does with one page of guest memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageAction {
+    /// Seek over it, so the file keeps what it holds there.
+    Skip,
+    /// Write zeros, without reading the page.
+    Zeros,
+    /// Read the page from guest memory and write it.
+    Copy,
+}
+
+/// What a dump does with a page, given whether its slot is plugged, whether a write and a discard
+/// marked it since the last dump, and whether it has a page table entry ([`with_entries`]).
+///
+/// A discarded page of a plugged slot is written as zeros, without reading it, when nothing wrote
+/// it since, or when it has no page table entry: a page written before its discard has none, and
+/// a page written after it has one. Every discarded page of an unplugged slot is written as zeros:
+/// virtio-mem unplugs a slot before it discards it, so nothing writes the page after its discard,
+/// and the guest cannot read the slot. Every other marked page of a plugged slot is read and
+/// written. In an unplugged slot such a page is seeked over, and its marks stay for a dump after
+/// the slot is plugged back.
+fn page_action(plugged: bool, written: bool, discarded: bool, has_entry: bool) -> PageAction {
+    if discarded && (!plugged || !written || !has_entry) {
+        PageAction::Zeros
+    } else if plugged && (written || discarded) {
+        PageAction::Copy
+    } else {
+        PageAction::Skip
+    }
+}
+
+/// Which pages have a page table entry, as bit `i` for page `i`, given each page's
+/// /proc/self/pagemap entry and its mincore(2) byte.
+///
+/// A page has no entry only when pagemap shows it neither present nor swapped and mincore reports
+/// it not resident. Neither is enough alone. pagemap shows a small page that is swapped out or
+/// migrating as swapped, and mincore reports it resident only while it is in the swap cache. A
+/// hugetlb entry that is not present, such as a migration entry, gets neither pagemap bit, and
+/// mincore reports it resident. Taking both needs no knowledge of the mapping, which matters
+/// because a private-file discard leaves ordinary anonymous memory in a hugetlbfs region.
+fn with_entries(pagemap: &[u64], resident: &[u8]) -> u64 {
+    pagemap
+        .iter()
+        .zip(resident)
+        .enumerate()
+        .fold(0, |mapped, (page, (&entry, &resident))| {
+            let has_entry = entry & PAGEMAP_PRESENT_OR_SWAPPED != 0 || resident & 1 != 0;
+            mapped | (u64::from(has_entry) << page)
+        })
+}
+
+/// State that one dump shares across the slots it writes.
+#[derive(Debug, Default)]
+struct DumpScratch {
+    /// The zeros the dump writes from, allocated on first use.
+    zeros: Vec<u8>,
+    /// /proc/self/pagemap: `None` until first use, then the open file, or `None` when it cannot
+    /// be read.
+    pagemap: Option<Option<File>>,
+    /// The guest ranges of unplugged slots that the dump wrote as zeros. Their marks are cleared
+    /// once the whole dump has succeeded.
+    zeroed_unplugged: Vec<(GuestAddress, usize)>,
+}
+
+impl DumpScratch {
+    /// Writes `len` zeros.
+    fn write_zeros<T: WriteVolatile>(
+        &mut self,
+        writer: &mut T,
+        mut len: usize,
+    ) -> Result<(), MemoryError> {
+        if self.zeros.is_empty() {
+            self.zeros = vec![0; DUMP_CHUNK];
+        }
+        while len > 0 {
+            let chunk = len.min(self.zeros.len());
+            writer.write_all_volatile(&VolatileSlice::from(&mut self.zeros[..chunk]))?;
+            len -= chunk;
+        }
+        Ok(())
+    }
+
+    /// Which of the `count` host pages from host address `addr` have a page table entry, as bit
+    /// `i` for page `i`, by [`with_entries`]. `count` is 1 to 64.
+    ///
+    /// /proc/self/pagemap is read with lseek(2) and read(2), which Firecracker's seccomp filters
+    /// allow, and not with pread64(2), which they do not. When pagemap or mincore(2) cannot be
+    /// read every bit is set, so the caller reads those pages instead.
+    fn mapped(&mut self, addr: usize, count: usize, page_size: usize) -> u64 {
+        let all = u64::MAX >> (64 - count);
+        let mut entries = [0u8; 64 * 8];
+        let entries = &mut entries[..count * 8];
+        let pagemap = self.pagemap.get_or_insert_with(|| {
+            File::open("/proc/self/pagemap")
+                .inspect_err(|err| {
+                    warn!(
+                        "Cannot open /proc/self/pagemap ({err}), so a snapshot reads the \
+                         discarded pages of plugged slots that were also written"
+                    )
+                })
+                .ok()
+        });
+        let Some(file) = pagemap else {
+            return all;
+        };
+        let offset = usize_to_u64(addr / page_size * 8);
+        if let Err(err) = file
+            .seek(SeekFrom::Start(offset))
+            .and_then(|_| file.read_exact(entries))
+        {
+            warn!(
+                "Cannot read /proc/self/pagemap ({err}), so a snapshot reads the discarded pages \
+                 of plugged slots that were also written"
+            );
+            self.pagemap = Some(None);
+            return all;
+        }
+        let mut resident = [0u8; 64];
+        // SAFETY: `addr` is page aligned, and the `count` pages from it are guest memory, which
+        // stays mapped while the dump runs. `resident` has a byte for each of them.
+        let ret = unsafe {
+            libc::mincore(
+                addr as *mut c_void,
+                count * page_size,
+                resident.as_mut_ptr(),
+            )
+        };
+        if ret != 0 {
+            warn!(
+                "mincore failed ({}), so a snapshot reads these discarded pages that were also \
+                 written",
+                io::Error::last_os_error()
+            );
+            return all;
+        }
+        let mut pagemap = [0u64; 64];
+        for (entry, bytes) in pagemap.iter_mut().zip(entries.chunks_exact(8)) {
+            *entry = u64::from_ne_bytes(bytes.try_into().unwrap());
+        }
+        with_entries(&pagemap[..count], &resident[..count])
+    }
+}
+
+/// Writes one slot of a dump as runs of adjacent pages with the same [`PageAction`]: one seek,
+/// one write of zeros or one write from guest memory per run.
+struct SlotWriter<'s, 'a, T> {
+    slot: &'s GuestMemorySlot<'a>,
+    writer: &'s mut T,
+    scratch: &'s mut DumpScratch,
+    /// Whether zeros are written, or left as holes in a file that holds no data.
+    zeros: ZeroPages,
+    /// Whether the slot is unplugged, so the ranges written as zeros are recorded.
+    unplugged: bool,
+    /// The pending run: its action, and its offset and length in the slot.
+    action: PageAction,
+    start: usize,
+    len: usize,
+}
+
+impl<T: WriteVolatile + std::io::Seek> SlotWriter<'_, '_, T> {
+    /// Adds `len` bytes at `offset` in the slot to the pending run, writing the run first when
+    /// the action changes.
+    fn push(&mut self, offset: usize, len: usize, action: PageAction) -> Result<(), MemoryError> {
+        if self.len > 0 && self.action != action {
+            self.flush()?;
+        }
+        if self.len == 0 {
+            self.action = action;
+            self.start = offset;
+        }
+        self.len += len;
+        Ok(())
+    }
+
+    /// Writes the pending run.
+    fn flush(&mut self) -> Result<(), MemoryError> {
+        match (self.action, self.zeros) {
+            (PageAction::Skip, _) | (PageAction::Zeros, ZeroPages::Hole) => {
+                seek_forward(self.writer, self.len)?
+            }
+            (PageAction::Zeros, ZeroPages::Write) => {
+                self.scratch.write_zeros(self.writer, self.len)?
+            }
+            (PageAction::Copy, _) => self
+                .writer
+                .write_all_volatile(&self.slot.slice.subslice(self.start, self.len)?)?,
+        }
+        if self.unplugged && self.action == PageAction::Zeros {
+            let start = self.slot.guest_addr.unchecked_add(usize_to_u64(self.start));
+            self.scratch.zeroed_unplugged.push((start, self.len));
+        }
+        self.len = 0;
+        Ok(())
+    }
 }
 
 /// Errors associated with dumping guest memory to file.
@@ -502,6 +705,17 @@ pub struct GuestRegionMmapExt {
     pub slot_size: usize,
     /// a bitvec indicating whether slot `i` is plugged into KVM (1) or not (0)
     pub plugged: Mutex<BitVec>,
+    /// With dirty tracking on, the pages that a discard emptied since a dump last wrote them. A
+    /// discard changes guest memory without a guest write, so KVM's dirty log never has it.
+    pub discarded: Option<AtomicBitmap>,
+}
+
+/// The bitmap of a region's discarded pages, present only when the region tracks dirty pages.
+fn discard_bitmap(region: &GuestRegionMmap) -> Option<AtomicBitmap> {
+    region
+        .bitmap()
+        .is_some()
+        .then(|| AtomicBitmap::with_len(u64_to_usize(region.len())))
 }
 
 /// A guest memory slot, which is a slice of a guest memory region
@@ -513,6 +727,8 @@ pub struct GuestMemorySlot<'a> {
     pub(crate) guest_addr: GuestAddress,
     /// Corresponding slice in host memory
     pub(crate) slice: VolatileSlice<'a, BS<'a, Option<AtomicBitmap>>>,
+    /// The slot's part of the region's bitmap of discarded pages
+    pub(crate) discarded: BS<'a, Option<AtomicBitmap>>,
 }
 
 impl From<&GuestMemorySlot<'_>> for kvm_userspace_memory_region {
@@ -533,81 +749,89 @@ impl From<&GuestMemorySlot<'_>> for kvm_userspace_memory_region {
 }
 
 impl<'a> GuestMemorySlot<'a> {
-    /// Dumps the dirty pages in this slot onto the writer
-    pub(crate) fn dump_dirty<T: WriteVolatile + std::io::Seek>(
+    /// Dumps the marked pages of this slot onto the writer and seeks over the rest. Given the
+    /// slot's KVM dirty log the slot is plugged; without one it is unplugged and cannot be read.
+    ///
+    /// A page is marked when KVM's log or Firecracker's bitmap says it was written, or when a
+    /// discard emptied it, since the last dump. [`page_action`] decides what each marked page
+    /// gets. Without dirty tracking nothing records a discard, so an unplugged slot is seeked
+    /// over whole. With [`ZeroPages::Hole`] the zeros are left as holes. The ranges of an
+    /// unplugged slot written as zeros are recorded in `scratch`.
+    fn dump_marked<T: WriteVolatile + std::io::Seek>(
         &self,
         writer: &mut T,
-        kvm_bitmap: &[u64],
+        kvm_bitmap: Option<&[u64]>,
+        zero_pages: ZeroPages,
         page_size: usize,
+        scratch: &mut DumpScratch,
     ) -> Result<(), MemoryError> {
-        let firecracker_bitmap = self.slice.bitmap();
-        let mut write_size = 0;
-        let mut skip_size = 0;
-        let mut dirty_batch_start = 0;
-
-        let expected_bitmap_array_len = (self.slice.len() / page_size).div_ceil(64);
-        if kvm_bitmap.len() > expected_bitmap_array_len {
-            return Err(MemoryError::DirtyBitmapTooLarge);
-        } else if kvm_bitmap.len() < expected_bitmap_array_len {
-            return Err(MemoryError::DirtyBitmapTooSmall);
+        let num_pages = self.slice.len() / page_size;
+        let words = num_pages.div_ceil(64);
+        match kvm_bitmap {
+            Some(kvm_bitmap) if kvm_bitmap.len() > words => {
+                return Err(MemoryError::DirtyBitmapTooLarge);
+            }
+            Some(kvm_bitmap) if kvm_bitmap.len() < words => {
+                return Err(MemoryError::DirtyBitmapTooSmall);
+            }
+            None if self.discarded.is_none() => return seek_forward(writer, self.slice.len()),
+            _ => {}
         }
+        let plugged = kvm_bitmap.is_some();
+        let firecracker_bitmap = self.slice.bitmap();
+        let host = self.slice.ptr_guard().as_ptr() as usize;
+        let mut out = SlotWriter {
+            slot: self,
+            writer,
+            scratch,
+            zeros: zero_pages,
+            unplugged: !plugged,
+            action: PageAction::Skip,
+            start: 0,
+            len: 0,
+        };
 
-        for (i, v) in kvm_bitmap.iter().enumerate() {
-            for j in 0..64 {
-                let is_kvm_page_dirty = ((v >> j) & 1u64) != 0u64;
-                let page_offset = ((i * 64) + j) * page_size;
-                let is_firecracker_page_dirty = firecracker_bitmap.dirty_at(page_offset);
-
-                // We process 64 pages at a time, however the number of pages
-                // in the slot might not be a multiple of 64. We need to break
-                // once we go past the last page that is actually part of the
-                // region.
-                if page_offset >= self.slice.len() {
-                    // Ensure there are no more dirty bits after this point
-                    if (v >> j) != 0 {
-                        return Err(MemoryError::DirtyBitmapTooLarge);
-                    }
-                    break;
+        for word in 0..words {
+            let first = word * 64;
+            let count = (num_pages - first).min(64);
+            // An unplugged slot's write marks change nothing, so they are not read.
+            let mut written = 0u64;
+            if let Some(kvm_bitmap) = kvm_bitmap {
+                written = kvm_bitmap[word];
+                // The last word can have bits for pages past the end of the slot, which must be
+                // clear.
+                if count < 64 && written >> count != 0 {
+                    return Err(MemoryError::DirtyBitmapTooLarge);
                 }
-
-                if is_kvm_page_dirty || is_firecracker_page_dirty {
-                    // We are at the start of a new batch of dirty pages.
-                    if skip_size > 0 {
-                        // Seek forward over the unmodified pages.
-                        let offset = skip_size
-                            .try_into()
-                            .map_err(|_| MemoryError::SlotSizeTooLarge)?;
-                        writer
-                            .seek(SeekFrom::Current(offset))
-                            .map_err(MemoryError::SeekError)?;
-                        dirty_batch_start = page_offset;
-                        skip_size = 0;
-                    }
-                    write_size += page_size;
-                } else {
-                    // We are at the end of a batch of dirty pages.
-                    if write_size > 0 {
-                        // Dump the dirty pages.
-                        let slice = &self.slice.subslice(dirty_batch_start, write_size)?;
-                        writer.write_all_volatile(slice)?;
-                        write_size = 0;
-                    }
-                    skip_size += page_size;
+                for page in 0..count {
+                    written |=
+                        u64::from(firecracker_bitmap.dirty_at((first + page) * page_size)) << page;
                 }
+            }
+            let mut discarded = 0u64;
+            for page in 0..count {
+                discarded |= u64::from(self.discarded.dirty_at((first + page) * page_size)) << page;
+            }
+            if written | discarded == 0 {
+                out.push(first * page_size, count * page_size, PageAction::Skip)?;
+                continue;
+            }
+            // A discarded page with a write mark was written before its discard or after it.
+            let mapped = if discarded & written == 0 {
+                0
+            } else {
+                out.scratch
+                    .mapped(host + first * page_size, count, page_size)
+            };
+            for page in 0..count {
+                let bit = |bits: u64| bits & (1 << page) != 0;
+                let action = page_action(plugged, bit(written), bit(discarded), bit(mapped));
+                out.push((first + page) * page_size, page_size, action)?;
             }
         }
 
-        if write_size > 0 {
-            writer.write_all_volatile(&self.slice.subslice(dirty_batch_start, write_size)?)?;
-        }
-
-        // Advance the cursor even if the trailing pages are clean, so that the
-        // next slot starts writing at the correct offset.
-        if skip_size > 0 {
-            seek_forward(writer, skip_size)?;
-        }
-
-        Ok(())
+        // Write the last run, a seek included, so that the next slot starts at its own offset.
+        out.flush()
     }
 
     /// Dumps this slot onto the writer, seeking over each all-zero page of [`HOLE_GRANULE`]
@@ -710,12 +934,14 @@ impl GuestRegionMmapExt {
     /// Adds a DRAM region which only contains a single plugged slot
     pub(crate) fn dram_from_mmap_region(region: GuestRegionMmap, slot: u32) -> Self {
         let slot_size = u64_to_usize(region.len());
+        let discarded = discard_bitmap(&region);
         GuestRegionMmapExt {
             inner: region,
             region_type: GuestRegionType::Dram,
             slot_from: slot,
             slot_size,
             plugged: Mutex::new(BitVec::repeat(true, 1)),
+            discarded,
         }
     }
 
@@ -726,6 +952,7 @@ impl GuestRegionMmapExt {
         slot_size: usize,
     ) -> Self {
         let slot_cnt = (u64_to_usize(region.len())) / slot_size;
+        let discarded = discard_bitmap(&region);
 
         GuestRegionMmapExt {
             inner: region,
@@ -733,6 +960,7 @@ impl GuestRegionMmapExt {
             slot_from,
             slot_size,
             plugged: Mutex::new(BitVec::repeat(false, slot_cnt)),
+            discarded,
         }
     }
 
@@ -753,12 +981,14 @@ impl GuestRegionMmapExt {
             });
         }
 
+        let discarded = discard_bitmap(&region);
         Ok(GuestRegionMmapExt {
             inner: region,
             slot_size,
             region_type: state.region_type,
             slot_from,
             plugged: Mutex::new(BitVec::from_iter(state.plugged.iter())),
+            discarded,
         })
     }
 
@@ -799,6 +1029,7 @@ impl GuestRegionMmapExt {
                 .inner
                 .get_slice(MemoryRegionAddress(offset), self.slot_size)
                 .expect("slot range should be valid"),
+            discarded: self.discarded.slice_at(u64_to_usize(offset)),
         }
     }
 
@@ -909,6 +1140,9 @@ impl GuestRegionMmapExt {
             ));
         }
 
+        // With dirty tracking on, the pages a discard empties are recorded in `discarded`, so the
+        // next dump writes them as zeros: a discard changes guest memory without a guest write,
+        // so KVM's dirty log never has it.
         match (self.inner.file_offset(), self.inner.flags()) {
             // If and only if we are resuming from a snapshot file, we have a file and it's mapped
             // private
@@ -922,22 +1156,11 @@ impl GuestRegionMmapExt {
                     .map_err(GuestMemoryError::IOError)?
                     .hugetlbfs_page_size();
                 let (caddr, len) = match hugetlbfs_page_size {
-                    Some(huge_page_size) => {
-                        let start = caddr.raw_value();
-                        let end = start
-                            .checked_add(len as u64)
-                            .ok_or(GuestMemoryError::GuestAddressOverflow)?;
-                        let first = start
-                            .checked_next_multiple_of(huge_page_size)
-                            .ok_or(GuestMemoryError::GuestAddressOverflow)?;
-                        let last = end - end % huge_page_size;
-                        if first >= last {
-                            return Err(GuestMemoryError::InvalidGuestAddress(
-                                self.start_addr().unchecked_add(start),
-                            ));
-                        }
-                        (MemoryRegionAddress(first), u64_to_usize(last - first))
-                    }
+                    Some(huge_page_size) => self
+                        .whole_huge_pages(caddr, len, huge_page_size)?
+                        .ok_or(GuestMemoryError::InvalidGuestAddress(
+                            self.start_addr().unchecked_add(caddr.raw_value()),
+                        ))?,
                     None => (caddr, len),
                 };
                 // Mmap a new anonymous region over the present one in order to create a hole
@@ -1003,28 +1226,93 @@ impl GuestRegionMmapExt {
                             std::io::Error::last_os_error()
                         );
                     }
+                    // Record this slot before the next one is replaced, which can fail.
+                    self.discarded
+                        .mark_dirty(u64_to_usize(start - base), u64_to_usize(end - start));
                 }
                 Ok(())
             }
-            // Match either the case of an anonymous mapping, or the case
-            // of a shared file mapping.
+            // A shared file mapping keeps its pages in the file's page cache: MADV_DONTNEED drops
+            // only the page table entries, and the guest reads the same data afterwards. Nothing
+            // changed, so nothing is recorded.
             // TODO: madvise(MADV_DONTNEED) doesn't actually work with memfd
             // (or in general MAP_SHARED of a fd). In those cases we should use
             // fallocate64(FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE).
             // We keep falling to the madvise branch to keep the previous behaviour.
+            (Some(_), flags) if flags & libc::MAP_SHARED != 0 => self.madvise_dontneed(caddr, len),
+            // An anonymous private mapping, where a dropped page reads as zeros.
             _ => {
-                // Madvise the region in order to mark it as not used.
-                let host_addr = self.get_host_address(caddr)?;
-                // SAFETY: The address and length are known to be valid.
-                let ret = unsafe { libc::madvise(host_addr.cast(), len, libc::MADV_DONTNEED) };
-                if ret < 0 {
-                    let os_error = std::io::Error::last_os_error();
-                    error!("discard_range: madvise failed: {:?}", os_error);
-                    Err(GuestMemoryError::IOError(os_error))
+                // madvise(2) cannot drop part of a huge page, and keeps one the range covers only
+                // in part at its end. The range is narrowed to the huge pages it covers whole, so
+                // what is recorded is what was dropped. Guest memory is only mapped with 2 MiB
+                // huge pages (see `RawGuestRegionMmap::allocate_protected`). A range that covers
+                // none drops nothing, and succeeds, as madvise does when it rounds the end of a
+                // hugetlb range down to its start.
+                let (caddr, len) = if self.inner.flags() & libc::MAP_HUGETLB != 0 {
+                    match self.whole_huge_pages(caddr, len, usize_to_u64(mib_to_bytes(2)))? {
+                        Some(range) => range,
+                        None => return Ok(()),
+                    }
                 } else {
-                    Ok(())
+                    (caddr, len)
+                };
+                let offset = u64_to_usize(caddr.raw_value());
+                if let Err(err) = self.madvise_dontneed(caddr, len) {
+                    // madvise drops the pages of one mapping at a time, so a failure can leave the
+                    // pages before it dropped and the rest as they were. Mark the whole range
+                    // written, so the next Diff reads it, which gives the right bytes either way.
+                    (**self).bitmap().mark_dirty(offset, len);
+                    return Err(err);
                 }
+                self.discarded.mark_dirty(offset, len);
+                Ok(())
             }
+        }
+    }
+
+    /// The huge pages of `huge_page_size` bytes that the `len` bytes at `caddr` cover whole, or
+    /// `None` when they cover none.
+    fn whole_huge_pages(
+        &self,
+        caddr: MemoryRegionAddress,
+        len: usize,
+        huge_page_size: u64,
+    ) -> Result<Option<(MemoryRegionAddress, usize)>, GuestMemoryError> {
+        let start = caddr.raw_value();
+        let end = start
+            .checked_add(len as u64)
+            .ok_or(GuestMemoryError::GuestAddressOverflow)?;
+        let first = start
+            .checked_next_multiple_of(huge_page_size)
+            .ok_or(GuestMemoryError::GuestAddressOverflow)?;
+        let last = end - end % huge_page_size;
+        Ok((first < last).then(|| (MemoryRegionAddress(first), u64_to_usize(last - first))))
+    }
+
+    /// Drops the `len` bytes at `caddr` with madvise(MADV_DONTNEED).
+    fn madvise_dontneed(
+        &self,
+        caddr: MemoryRegionAddress,
+        len: usize,
+    ) -> Result<(), GuestMemoryError> {
+        let host_addr = self.get_host_address(caddr)?;
+        // SAFETY: The address and length are known to be valid.
+        let ret = unsafe { libc::madvise(host_addr.cast(), len, libc::MADV_DONTNEED) };
+        if ret < 0 {
+            let os_error = std::io::Error::last_os_error();
+            error!("discard_range: madvise failed: {:?}", os_error);
+            return Err(GuestMemoryError::IOError(os_error));
+        }
+        Ok(())
+    }
+
+    /// Clears the write and discard marks of the `len` bytes at `offset` in the region.
+    fn clear_marks(&self, offset: usize, len: usize) {
+        if let Some(bitmap) = (**self).bitmap() {
+            bitmap.reset_addr_range(offset, len);
+        }
+        if let Some(discarded) = &self.discarded {
+            discarded.reset_addr_range(offset, len);
         }
     }
 }
@@ -1268,21 +1556,30 @@ where
     fn mark_dirty(&self, addr: GuestAddress, len: usize);
 
     /// Dumps all contents of GuestMemoryMmap to a writer. With [`ZeroPages::Hole`], all-zero
-    /// pages are seeked over instead of written.
+    /// pages are seeked over instead of written. An unplugged slot cannot be read: with dirty
+    /// tracking, which records discards, the pages a discard emptied are written as zeros, or left
+    /// as holes with [`ZeroPages::Hole`], and the rest of the slot is seeked over, so the file
+    /// keeps what it held there. Without dirty tracking the whole slot is seeked over. Once the
+    /// dump has succeeded it clears the marks of what it wrote.
     fn dump<T: WriteVolatile + std::io::Seek>(
         &self,
         writer: &mut T,
         zero_pages: ZeroPages,
     ) -> Result<(), MemoryError>;
 
-    /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
+    /// Dumps the pages of GuestMemoryMmap that `dirty_bitmap` or Firecracker's bitmaps mark to a
+    /// writer and seeks over the rest. With dirty tracking, the pages a discard emptied are
+    /// written as zeros, an unplugged slot's included, and read only when a plugged slot's page
+    /// was also written and may hold data. Once the dump has succeeded it clears the marks of what
+    /// it wrote; after a failure it keeps them and adds `dirty_bitmap` to them.
     fn dump_dirty<T: WriteVolatile + std::io::Seek>(
         &self,
         writer: &mut T,
         dirty_bitmap: &DirtyBitmap,
     ) -> Result<(), MemoryError>;
 
-    /// Resets all the memory region bitmaps
+    /// Clears the write and discard marks of every plugged slot. An unplugged slot keeps its
+    /// marks until a dump writes them.
     fn reset_dirty(&self);
 
     /// Store the dirty bitmap in internal store
@@ -1298,7 +1595,10 @@ where
     where
         F: FnMut(&GuestRegionMmapExt, MemoryRegionAddress, usize) -> Result<(), GuestMemoryError>;
 
-    /// Discards a memory range, freeing up memory pages
+    /// Discards a memory range, freeing up memory pages. With dirty tracking on, the pages it
+    /// empties are recorded, so the next dump writes them as zeros. A shared mapping keeps its
+    /// data, so nothing is recorded for it. When madvise(2) fails partway the range is marked
+    /// written instead, so the next Diff reads it.
     fn discard_range(&self, addr: GuestAddress, range_len: usize) -> Result<(), GuestMemoryError>;
 
     /// Check whether the given guest address range falls entirely within plugged memory.
@@ -1362,69 +1662,86 @@ impl GuestMemoryExtension for GuestMemoryMmap {
     }
 
     /// Dumps all contents of GuestMemoryMmap to a writer. With [`ZeroPages::Hole`], all-zero
-    /// pages are seeked over instead of written.
+    /// pages are seeked over instead of written. An unplugged slot cannot be read: with dirty
+    /// tracking, which records discards, the pages a discard emptied are written as zeros, or left
+    /// as holes with [`ZeroPages::Hole`], and the rest of the slot is seeked over, so the file
+    /// keeps what it held there. Without dirty tracking the whole slot is seeked over. Once the
+    /// dump has succeeded it clears the marks of what it wrote.
     fn dump<T: WriteVolatile + std::io::Seek>(
         &self,
         writer: &mut T,
         zero_pages: ZeroPages,
     ) -> Result<(), MemoryError> {
+        let page_size = host_page_size();
+        let mut scratch = DumpScratch::default();
         self.iter()
             .flat_map(|region| region.slots())
             .try_for_each(|(mem_slot, plugged)| {
                 if !plugged {
-                    seek_forward(writer, mem_slot.slice.len())
+                    mem_slot.dump_marked(writer, None, zero_pages, page_size, &mut scratch)
                 } else {
                     match zero_pages {
                         ZeroPages::Write => write_memory(writer, &mem_slot.slice),
                         ZeroPages::Hole => mem_slot.dump_nonzero(writer),
                     }
                 }
-            })
+            })?;
+        clear_dumped_marks(self, &scratch.zeroed_unplugged);
+        Ok(())
     }
 
-    /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
+    /// Dumps the pages of GuestMemoryMmap that `dirty_bitmap` or Firecracker's bitmaps mark to a
+    /// writer and seeks over the rest. With dirty tracking, the pages a discard emptied are
+    /// written as zeros, an unplugged slot's included, and read only when a plugged slot's page
+    /// was also written and may hold data. Once the dump has succeeded it clears the marks of what
+    /// it wrote; after a failure it keeps them and adds `dirty_bitmap` to them.
     fn dump_dirty<T: WriteVolatile + std::io::Seek>(
         &self,
         writer: &mut T,
         dirty_bitmap: &DirtyBitmap,
     ) -> Result<(), MemoryError> {
         let page_size = host_page_size();
+        let mut scratch = DumpScratch::default();
 
         let write_result =
             self.iter()
                 .flat_map(|region| region.slots())
                 .try_for_each(|(mem_slot, plugged)| {
-                    if !plugged {
-                        let ilen = i64::try_from(mem_slot.slice.len())
-                            .map_err(|_| MemoryError::SlotSizeTooLarge)?;
-                        writer
-                            .seek(SeekFrom::Current(ilen))
-                            .map_err(MemoryError::SeekError)?;
-                    } else {
+                    let kvm_bitmap = if plugged {
                         let kvm_bitmap = dirty_bitmap
                             .get(&mem_slot.slot)
                             .ok_or(MemoryError::DirtyBitmapNotFound(mem_slot.slot))?;
-                        mem_slot.dump_dirty(writer, kvm_bitmap, page_size)?;
-                    }
-                    Ok(())
+                        Some(kvm_bitmap.as_slice())
+                    } else {
+                        None
+                    };
+                    mem_slot.dump_marked(
+                        writer,
+                        kvm_bitmap,
+                        ZeroPages::Write,
+                        page_size,
+                        &mut scratch,
+                    )
                 });
 
         if write_result.is_err() {
             self.store_dirty_bitmap(dirty_bitmap, page_size);
         } else {
-            self.reset_dirty();
+            clear_dumped_marks(self, &scratch.zeroed_unplugged);
         }
 
         write_result
     }
 
-    /// Resets all the memory region bitmaps
+    /// Clears the write and discard marks of every plugged slot. An unplugged slot keeps its
+    /// marks until a dump writes them.
     fn reset_dirty(&self) {
-        self.iter().for_each(|region| {
-            if let Some(bitmap) = (**region).bitmap() {
-                bitmap.reset();
+        for region in self.iter() {
+            for slot in region.plugged_slots() {
+                let offset = slot.guest_addr.unchecked_offset_from(region.start_addr());
+                region.clear_marks(u64_to_usize(offset), slot.slice.len());
             }
-        })
+        }
     }
 
     /// Stores the dirty bitmap inside into the internal bitmap
@@ -1496,6 +1813,18 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         self.try_for_each_region_in_range(addr, len, |region, offset, chunk_len| {
             region.check_range_plugged(offset, chunk_len)
         })
+    }
+}
+
+/// Clears the marks of what a dump wrote, once it has succeeded: every mark of a plugged slot,
+/// and the marks of the unplugged ranges it wrote as zeros.
+fn clear_dumped_marks(mem: &GuestMemoryMmap, zeroed_unplugged: &[(GuestAddress, usize)]) {
+    mem.reset_dirty();
+    for &(addr, len) in zeroed_unplugged {
+        if let Some(region) = mem.find_region(addr) {
+            let offset = addr.unchecked_offset_from(region.start_addr());
+            region.clear_marks(u64_to_usize(offset), len);
+        }
     }
 }
 
@@ -2693,6 +3022,512 @@ mod tests {
                 .unwrap_err(),
             GuestMemoryError::InvalidGuestAddress(_)
         );
+    }
+
+    /// The KVM dirty log of every plugged slot of `mem` as a VM whose vCPUs wrote nothing
+    /// reports it.
+    fn clean_kvm_log(mem: &GuestMemoryMmap) -> DirtyBitmap {
+        let page_size = host_page_size();
+        mem.iter()
+            .flat_map(|region| region.plugged_slots())
+            .map(|slot| {
+                (
+                    slot.slot,
+                    vec![0; (slot.slice.len() / page_size).div_ceil(64)],
+                )
+            })
+            .collect()
+    }
+
+    /// Runs `dump_dirty` with a clean KVM log over a file that holds `parent`, as a Diff
+    /// snapshot merged into its parent's memory file does, and returns the file's bytes.
+    fn merge_diff_with_clean_kvm_log(mem: &GuestMemoryMmap, parent: &[u8]) -> Vec<u8> {
+        let mut file = TempFile::new().unwrap().into_file();
+        file.write_all(parent).unwrap();
+        file.rewind().unwrap();
+        mem.dump_dirty(&mut file, &clean_kvm_log(mem)).unwrap();
+        let mut bytes = vec![0u8; parent.len()];
+        file.rewind().unwrap();
+        file.read_exact(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// Whether each host page of the `len` bytes of guest memory at `addr` is resident, by
+    /// mincore(2). Asking does not fault the pages in.
+    fn resident(mem: &GuestMemoryMmap, addr: GuestAddress, len: usize) -> Vec<bool> {
+        let page_size = host_page_size();
+        let host = mem.get_host_address(addr).unwrap();
+        let mut pages = vec![0u8; len / page_size];
+        let ret = unsafe { libc::mincore(host.cast(), len, pages.as_mut_ptr()) };
+        assert_eq!(ret, 0, "mincore: {}", io::Error::last_os_error());
+        pages.iter().map(|page| page & 1 != 0).collect()
+    }
+
+    /// The offset of the first byte where `actual` differs from `expected`, with both bytes.
+    fn first_difference(actual: &[u8], expected: &[u8]) -> Option<(usize, u8, u8)> {
+        assert_eq!(actual.len(), expected.len());
+        actual
+            .iter()
+            .zip(expected)
+            .position(|(a, b)| a != b)
+            .map(|offset| (offset, actual[offset], expected[offset]))
+    }
+
+    /// Tracked guest memory of `len` bytes in the two kinds a discard handles differently:
+    /// anonymous, and mapped privately from a file as after a restore from a snapshot file.
+    fn tracked_memories(len: usize) -> [(&'static str, GuestMemoryMmap); 2] {
+        let mut backing = TempFile::new().unwrap().into_file();
+        backing.write_all(&vec![2u8; len]).unwrap();
+        let region = std::iter::once((GuestAddress(0), len));
+        [
+            (
+                "anonymous",
+                into_region_ext(anonymous(region.clone(), true, HugePageConfig::None).unwrap()),
+            ),
+            (
+                "private file",
+                into_region_ext(
+                    snapshot_file(backing, region, true, HugePageConfig::None, false).unwrap(),
+                ),
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_diff_writes_discarded_pages_as_zeros_without_reading_them() {
+        // A discard empties guest pages without a guest write, so KVM's dirty log never has it.
+        // The next Diff has to write zeros over the parent's bytes there, and without reading
+        // the pages: a read brings each one back, from the huge page pool on hugetlbfs and from
+        // the page server on a UFFD restore.
+        let page_size = host_page_size();
+        let len = 4 * page_size;
+        for (kind, mem) in tracked_memories(len) {
+            mem.write(&vec![0xab; len], GuestAddress(0)).unwrap();
+            mem.reset_dirty();
+            // Page 2 is written after the last snapshot, so it carries a dirty mark when it is
+            // discarded.
+            mem.write(&vec![0x77; page_size], GuestAddress(2 * page_size as u64))
+                .unwrap();
+            mem.discard_range(GuestAddress(page_size as u64), 2 * page_size)
+                .unwrap();
+
+            let mut expected = vec![0xcd; len];
+            expected[page_size..3 * page_size].fill(0);
+            let diff = merge_diff_with_clean_kvm_log(&mem, &vec![0xcd; len]);
+            assert_eq!(first_difference(&diff, &expected), None, "{kind}: the Diff");
+            assert_eq!(
+                resident(&mem, GuestAddress(0), len),
+                [true, false, false, true],
+                "{kind}: the Diff must not read the discarded pages back"
+            );
+        }
+    }
+
+    #[test]
+    fn test_diff_reads_pages_written_after_their_discard() {
+        let page_size = host_page_size();
+        let len = 3 * page_size;
+        for (kind, mem) in tracked_memories(len) {
+            mem.write(&vec![0xab; len], GuestAddress(0)).unwrap();
+            mem.reset_dirty();
+            mem.discard_range(GuestAddress(0), 2 * page_size).unwrap();
+            mem.write(&vec![0x77; page_size], GuestAddress(page_size as u64))
+                .unwrap();
+
+            let mut expected = vec![0xcd; len];
+            expected[..page_size].fill(0);
+            expected[page_size..2 * page_size].fill(0x77);
+            let diff = merge_diff_with_clean_kvm_log(&mem, &vec![0xcd; len]);
+            assert_eq!(first_difference(&diff, &expected), None, "{kind}");
+        }
+    }
+
+    #[test]
+    fn test_diff_reads_a_page_written_after_its_discard_and_swapped_out() {
+        // Once the host swaps out a page the guest wrote after its discard, mincore(2) no longer
+        // counts it as resident, the same as a page the discard emptied. Its swap entry is what
+        // tells the two apart.
+        let page_size = host_page_size();
+        let len = 2 * page_size;
+        let second = GuestAddress(page_size as u64);
+        let mem = into_region_ext(
+            anonymous(
+                std::iter::once((GuestAddress(0), len)),
+                true,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        mem.write(&vec![0xab; len], GuestAddress(0)).unwrap();
+        mem.reset_dirty();
+        mem.discard_range(second, page_size).unwrap();
+        mem.write(&vec![0x66; page_size], second).unwrap();
+        let host = mem.get_host_address(second).unwrap();
+        let paged_out = unsafe { libc::madvise(host.cast(), page_size, libc::MADV_PAGEOUT) };
+        // Reclaim frees the page once its write to swap completes.
+        let swapped = paged_out == 0
+            && (0..250).any(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                resident(&mem, second, page_size) == [false]
+            });
+        if !swapped {
+            println!(
+                "Skipping: the host did not swap the page out (MADV_PAGEOUT returned {paged_out}); \
+                 this test needs swap"
+            );
+            return;
+        }
+
+        let mut expected = vec![0xcd; len];
+        expected[page_size..].fill(0x66);
+        let diff = merge_diff_with_clean_kvm_log(&mem, &vec![0xcd; len]);
+        assert_eq!(first_difference(&diff, &expected), None);
+    }
+
+    #[test]
+    fn test_diff_after_a_madvise_discard_that_failed_partway() {
+        // MADV_DONTNEED drops the pages of one mapping at a time, so a failure on a later mapping
+        // leaves the pages before it discarded. Locking the second page makes it fail with EINVAL
+        // there, after the first page was dropped. One host page fits the 64 KiB memlock limit
+        // of a 64 KiB-page host.
+        let page_size = host_page_size();
+        let len = 2 * page_size;
+        let mem = into_region_ext(
+            anonymous(
+                std::iter::once((GuestAddress(0), len)),
+                true,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        mem.write(&vec![0xab; len], GuestAddress(0)).unwrap();
+        mem.reset_dirty();
+        let second = mem
+            .get_host_address(GuestAddress(page_size as u64))
+            .unwrap();
+        let locked = unsafe { libc::mlock(second.cast(), page_size) };
+        assert_eq!(locked, 0, "mlock: {}", io::Error::last_os_error());
+        assert_match!(
+            mem.discard_range(GuestAddress(0), len).unwrap_err(),
+            GuestMemoryError::IOError(_)
+        );
+
+        let mut expected = vec![0u8; len];
+        expected[page_size..].fill(0xab);
+        let diff = merge_diff_with_clean_kvm_log(&mem, &vec![0xcd; len]);
+        assert_eq!(first_difference(&diff, &expected), None, "the Diff");
+        let mut live = vec![0xffu8; len];
+        mem.read(&mut live, GuestAddress(0)).unwrap();
+        assert_eq!(first_difference(&live, &expected), None, "guest memory");
+        unsafe { libc::munlock(second.cast(), page_size) };
+    }
+
+    #[test]
+    fn test_diff_after_a_private_file_discard_that_failed_partway() {
+        // A private file mapping is discarded by mapping anonymous memory over it one slot at a
+        // time. A replacement that fails panics, since MAP_FIXED may already have unmapped the
+        // range, and the slots replaced before it must already be marked. Sealing the second
+        // slot (mseal(2), Linux 6.10) makes its replacement fail with EPERM, before anything is
+        // unmapped.
+        let page_size = host_page_size();
+        let len = 2 * page_size;
+        let mut backing = TempFile::new().unwrap().into_file();
+        backing.write_all(&vec![2u8; len]).unwrap();
+        let region = snapshot_file(
+            backing,
+            std::iter::once((GuestAddress(0), len)),
+            true,
+            HugePageConfig::None,
+            false,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let state = GuestMemoryRegionState {
+            base_address: 0,
+            size: len,
+            region_type: GuestRegionType::Hotpluggable,
+            plugged: vec![true, true],
+        };
+        let mem = GuestMemoryMmap::from_regions(vec![
+            GuestRegionMmapExt::from_state(region, &state, 0).unwrap(),
+        ])
+        .unwrap();
+        mem.write(&vec![0xab; len], GuestAddress(0)).unwrap();
+        mem.reset_dirty();
+        let second = mem
+            .get_host_address(GuestAddress(page_size as u64))
+            .unwrap();
+        if unsafe { libc::syscall(libc::SYS_mseal, second, page_size, 0) } != 0 {
+            println!(
+                "Skipping: mseal failed ({}); this test needs Linux 6.10 or later",
+                io::Error::last_os_error()
+            );
+            return;
+        }
+        let discard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mem.discard_range(GuestAddress(0), len)
+        }));
+        if discard.is_ok() {
+            std::mem::forget(mem);
+            panic!("replacing the sealed slot must fail");
+        }
+
+        let diff = merge_diff_with_clean_kvm_log(&mem, &vec![0xcd; len]);
+        let mut sealed = vec![0u8; page_size];
+        mem.read(&mut sealed, GuestAddress(page_size as u64))
+            .unwrap();
+        // A sealed mapping cannot be unmapped, and the munmap on drop would abort the test
+        // binary, so the memory is leaked before anything can fail.
+        std::mem::forget(mem);
+
+        let mut expected = vec![0xcd; len];
+        expected[..page_size].fill(0);
+        assert_eq!(first_difference(&diff, &expected), None, "the Diff");
+        assert!(
+            sealed.iter().all(|&byte| byte == 0xab),
+            "the sealed slot keeps its data"
+        );
+    }
+
+    #[test]
+    fn test_diff_writes_the_huge_pages_a_private_hugetlbfs_discard_replaced() {
+        const HUGE_PAGE: usize = 2 << 20;
+        // Two huge pages hold the memfd and two are reserved for the private copy-on-write.
+        let Some(_huge_pages) = test_utils::lock_free_huge_pages(4) else {
+            return;
+        };
+        let backing = test_utils::test_memfd(2 * HUGE_PAGE, true, 0x5a);
+        let mem = into_region_ext(
+            snapshot_file(
+                backing,
+                std::iter::once((GuestAddress(0), 2 * HUGE_PAGE)),
+                true,
+                HugePageConfig::Hugetlbfs2M,
+                true,
+            )
+            .unwrap(),
+        );
+        // The range covers the second huge page whole and the first in part, so only the second
+        // is discarded.
+        mem.discard_range(
+            GuestAddress((HUGE_PAGE / 2) as u64),
+            HUGE_PAGE + HUGE_PAGE / 2,
+        )
+        .unwrap();
+
+        let mut expected = vec![0xcd; 2 * HUGE_PAGE];
+        expected[HUGE_PAGE..].fill(0);
+        let diff = merge_diff_with_clean_kvm_log(&mem, &vec![0xcd; 2 * HUGE_PAGE]);
+        assert_eq!(first_difference(&diff, &expected), None, "the Diff");
+        assert!(
+            !resident(&mem, GuestAddress(HUGE_PAGE as u64), HUGE_PAGE).contains(&true),
+            "the Diff must not read the discarded huge page back"
+        );
+    }
+
+    #[test]
+    fn test_diff_writes_the_huge_pages_an_anonymous_hugetlbfs_discard_dropped() {
+        // madvise(2) cannot drop part of a huge page. Linux 6.2 and later drop the huge pages up
+        // to the last one the range covers whole; older kernels also dropped the partly covered
+        // last one.
+        const HUGE_PAGE: usize = 2 << 20;
+        let Some(_huge_pages) = test_utils::lock_free_huge_pages(3) else {
+            return;
+        };
+        let len = 3 * HUGE_PAGE;
+        let mem = into_region_ext(
+            anonymous(
+                std::iter::once((GuestAddress(0), len)),
+                true,
+                HugePageConfig::Hugetlbfs2M,
+            )
+            .unwrap(),
+        );
+        mem.write(&vec![0x5a; len], GuestAddress(0)).unwrap();
+        mem.reset_dirty();
+        // The range ends halfway into the third huge page, so only the second is discarded.
+        mem.discard_range(GuestAddress(HUGE_PAGE as u64), HUGE_PAGE + HUGE_PAGE / 2)
+            .unwrap();
+
+        let mut expected = vec![0xcd; len];
+        expected[HUGE_PAGE..2 * HUGE_PAGE].fill(0);
+        let diff = merge_diff_with_clean_kvm_log(&mem, &vec![0xcd; len]);
+        assert_eq!(first_difference(&diff, &expected), None, "the Diff");
+        assert!(
+            !resident(&mem, GuestAddress(HUGE_PAGE as u64), HUGE_PAGE).contains(&true),
+            "the Diff must not read the discarded huge page back"
+        );
+        let mut live = vec![0u8; len];
+        mem.read(&mut live, GuestAddress(0)).unwrap();
+        expected[..HUGE_PAGE].fill(0x5a);
+        expected[2 * HUGE_PAGE..].fill(0x5a);
+        assert_eq!(first_difference(&live, &expected), None, "guest memory");
+    }
+
+    #[test]
+    fn test_diff_after_a_discard_of_shared_memory() {
+        // MADV_DONTNEED on a shared mapping drops the page table entries and leaves the pages in
+        // the file's page cache, so the guest still reads its data and the Diff has nothing to
+        // write. On hugetlbfs mincore(2) then reports the pages as not resident.
+        let check = |kind: &str, len: usize, huge_pages: HugePageConfig| {
+            let mem =
+                into_region_ext(memfd_backed(&[(GuestAddress(0), len)], true, huge_pages).unwrap());
+            mem.write(&vec![0xab; len], GuestAddress(0)).unwrap();
+            mem.reset_dirty();
+            mem.discard_range(GuestAddress(0), len).unwrap();
+
+            let diff = merge_diff_with_clean_kvm_log(&mem, &vec![0xcd; len]);
+            assert_eq!(
+                first_difference(&diff, &vec![0xcd; len]),
+                None,
+                "{kind}: the Diff"
+            );
+            let mut live = vec![0u8; len];
+            mem.read(&mut live, GuestAddress(0)).unwrap();
+            assert!(
+                live.iter().all(|&byte| byte == 0xab),
+                "{kind}: the guest still reads its data"
+            );
+        };
+        check("shmem", 2 * host_page_size(), HugePageConfig::None);
+        if let Some(_huge_pages) = test_utils::lock_free_huge_pages(1) {
+            check("hugetlbfs", 2 << 20, HugePageConfig::Hugetlbfs2M);
+        }
+    }
+
+    #[test]
+    fn test_discard_range_marks_nothing_without_dirty_tracking() {
+        // Without dirty tracking the region has no bitmap. The discard succeeds, and a Diff with
+        // a clean KVM log writes nothing.
+        let page_size = host_page_size();
+        let len = 2 * page_size;
+        let mem = into_region_ext(
+            anonymous(
+                std::iter::once((GuestAddress(0), len)),
+                false,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        mem.write(&vec![0xab; len], GuestAddress(0)).unwrap();
+        mem.discard_range(GuestAddress(0), page_size).unwrap();
+        let mut page = vec![0xffu8; page_size];
+        mem.read(&mut page, GuestAddress(0)).unwrap();
+        assert!(page.iter().all(|&byte| byte == 0));
+        assert!(mem.iter().next().unwrap().bitmap().is_none());
+        let diff = merge_diff_with_clean_kvm_log(&mem, &vec![0xcd; len]);
+        assert_eq!(first_difference(&diff, &vec![0xcd; len]), None);
+    }
+
+    #[test]
+    fn test_unplugged_slot_writes_discarded_pages_as_zeros_without_pagemap() {
+        // An unplugged slot is never read, and virtio-mem unplugs a slot before it discards it,
+        // so nothing writes a page there after its discard. Every discarded page of the slot is
+        // written as zeros, whatever its write marks, and without asking /proc/self/pagemap: the
+        // dump here has already found pagemap unreadable.
+        let page_size = host_page_size();
+        let len = 2 * page_size;
+        let region = anonymous(
+            std::iter::once((GuestAddress(0), len)),
+            true,
+            HugePageConfig::None,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let state = GuestMemoryRegionState {
+            base_address: 0,
+            size: len,
+            region_type: GuestRegionType::Hotpluggable,
+            plugged: vec![false],
+        };
+        let mem = GuestMemoryMmap::from_regions(vec![
+            GuestRegionMmapExt::from_state(region, &state, 0).unwrap(),
+        ])
+        .unwrap();
+        // A write mark left from before the slot was unplugged and discarded.
+        mem.mark_dirty(GuestAddress(0), page_size);
+        mem.discard_range(GuestAddress(0), len).unwrap();
+
+        let mut file = TempFile::new().unwrap().into_file();
+        file.write_all(&vec![0xcd; len]).unwrap();
+        file.rewind().unwrap();
+        let mut scratch = DumpScratch {
+            pagemap: Some(None),
+            ..Default::default()
+        };
+        let (slot, plugged) = mem.iter().next().unwrap().slots().next().unwrap();
+        assert!(!plugged);
+        slot.dump_marked(&mut file, None, ZeroPages::Write, page_size, &mut scratch)
+            .unwrap();
+
+        let mut bytes = vec![0xffu8; len];
+        file.rewind().unwrap();
+        file.read_exact(&mut bytes).unwrap();
+        assert_eq!(first_difference(&bytes, &vec![0; len]), None);
+        assert_eq!(scratch.zeroed_unplugged, [(GuestAddress(0), len)]);
+    }
+
+    #[test]
+    fn test_anonymous_hugetlbfs_discard_of_less_than_a_huge_page_does_nothing() {
+        // madvise(2) rounds the end of a hugetlb range down to a huge page and succeeds without
+        // dropping anything when that leaves nothing, so a balloon report shorter than a huge page
+        // is not a failure, and nothing is marked.
+        const HUGE_PAGE: usize = 2 << 20;
+        let Some(_huge_pages) = test_utils::lock_free_huge_pages(1) else {
+            return;
+        };
+        let mem = into_region_ext(
+            anonymous(
+                std::iter::once((GuestAddress(0), HUGE_PAGE)),
+                true,
+                HugePageConfig::Hugetlbfs2M,
+            )
+            .unwrap(),
+        );
+        mem.write(&vec![0x5a; HUGE_PAGE], GuestAddress(0)).unwrap();
+        mem.reset_dirty();
+        mem.discard_range(GuestAddress(0), host_page_size())
+            .unwrap();
+
+        let diff = merge_diff_with_clean_kvm_log(&mem, &vec![0xcd; HUGE_PAGE]);
+        assert_eq!(
+            first_difference(&diff, &vec![0xcd; HUGE_PAGE]),
+            None,
+            "the Diff"
+        );
+        let mut live = vec![0u8; HUGE_PAGE];
+        mem.read(&mut live, GuestAddress(0)).unwrap();
+        assert!(live.iter().all(|&byte| byte == 0x5a), "guest memory");
+    }
+
+    /// A page whose pagemap entry has neither bit 63 nor bit 62 still has a page table entry when
+    /// mincore(2) reports it resident, as for a hugetlb migration or hwpoison entry. Such a page,
+    /// discarded and then written, is read, not written as zeros. No real entry of that kind is
+    /// made here: MADV_HWPOISON poisons a host frame, and a migration window cannot be observed
+    /// deterministically.
+    #[test]
+    fn test_a_page_mincore_reports_resident_has_a_page_table_entry() {
+        assert_eq!(
+            page_action(true, true, true, with_entries(&[0], &[1]) == 1),
+            PageAction::Copy
+        );
+        assert_eq!(with_entries(&[0, 0], &[1, 0]), 0b01);
+        assert_eq!(page_action(true, true, true, false), PageAction::Zeros);
+    }
+
+    #[test]
+    fn test_a_swapped_pagemap_entry_counts_as_a_page_table_entry() {
+        // A small page written after its discard and then swapped out has only pagemap's bit 62,
+        // and mincore(2) reports it not resident once it has left the swap cache. It is read, not
+        // written as zeros. test_diff_reads_a_page_written_after_its_discard_and_swapped_out
+        // covers a real one on a host with swap.
+        assert_eq!(
+            page_action(true, true, true, with_entries(&[1 << 62], &[0]) == 1),
+            PageAction::Copy
+        );
+        assert_eq!(with_entries(&[1 << 63, 0, 1 << 62], &[0, 0, 0]), 0b101);
     }
 
     /// Verifies that `slots_intersecting_range` returns the correct slots for
