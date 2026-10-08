@@ -625,11 +625,11 @@ impl KvmVm {
             .len();
 
         // Here we only truncate the file if the size mismatches.
-        // - For full snapshots, the entire file's contents will be overwritten anyway. We have to
-        //   avoid truncating here to deal with the edge case where it represents the snapshot file
-        //   from which this very microVM was loaded (as modifying the memory file would be
-        //   reflected in the mmap of the file, meaning a truncate operation would zero out guest
-        //   memory, and thus corrupt the VM).
+        // - For full snapshots, the contents of every plugged slot will be overwritten anyway. We
+        //   have to avoid truncating here to deal with the edge case where it represents the
+        //   snapshot file from which this very microVM was loaded (as modifying the memory file
+        //   would be reflected in the mmap of the file, meaning a truncate operation would zero
+        //   out guest memory, and thus corrupt the VM).
         // - For diff snapshots, we want to merge the diff layer directly into the file.
         // A file this call created is empty, so it takes the truncate branch, where truncating
         // changes nothing. Either way the file holds no data afterwards.
@@ -651,7 +651,8 @@ impl KvmVm {
             SnapshotType::Full => {
                 // A file that held no data reads as one hole after the set_len above, so the dump
                 // may skip zero pages. In a file that already had the right size a skipped page
-                // would keep its old bytes, so every page is written.
+                // would keep its old bytes, so every page of a plugged slot is written. An
+                // unplugged slot is seeked over in both modes and keeps the file's bytes.
                 let zero_pages = if starts_empty {
                     ZeroPages::Hole
                 } else {

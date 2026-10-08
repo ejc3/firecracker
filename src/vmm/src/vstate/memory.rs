@@ -604,9 +604,7 @@ impl<'a> GuestMemorySlot<'a> {
         // Advance the cursor even if the trailing pages are clean, so that the
         // next slot starts writing at the correct offset.
         if skip_size > 0 {
-            writer
-                .seek(SeekFrom::Current(skip_size.try_into().unwrap()))
-                .map_err(MemoryError::SeekError)?;
+            seek_forward(writer, skip_size)?;
         }
 
         Ok(())
@@ -1374,9 +1372,7 @@ impl GuestMemoryExtension for GuestMemoryMmap {
             .flat_map(|region| region.slots())
             .try_for_each(|(mem_slot, plugged)| {
                 if !plugged {
-                    let ilen = i64::try_from(mem_slot.slice.len()).unwrap();
-                    writer.seek(SeekFrom::Current(ilen)).unwrap();
-                    Ok(())
+                    seek_forward(writer, mem_slot.slice.len())
                 } else {
                     match zero_pages {
                         ZeroPages::Write => write_memory(writer, &mem_slot.slice),
