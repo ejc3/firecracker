@@ -3,6 +3,7 @@
 
 //! Configurations used in the snapshotting context.
 
+use crate::vmm_config::device_passthrough::DevicePassthroughConfig;
 use std::path::PathBuf;
 
 /// For crates that depend on `vmm` we export.
@@ -132,6 +133,10 @@ pub struct LoadSnapshotParams {
     pub clock_realtime: bool,
     /// Selects the huge-page configuration to use for the restored microVM.
     pub huge_pages: SnapshotLoadHugePageConfig,
+    /// Host PCI devices to pass through to the restored microVM. They are attached while the
+    /// snapshot loads, before any vCPU runs, so a snapshot taken without them can be restored
+    /// with them. The guest is not notified; it must rescan its PCI bus.
+    pub device_passthrough: Vec<DevicePassthroughConfig>,
 }
 
 /// Stores the configuration for loading a snapshot that is provided by the user.
@@ -170,6 +175,9 @@ pub struct LoadSnapshotConfig {
     /// Selects the huge-page configuration to use for the restored microVM.
     #[serde(default)]
     pub huge_pages: SnapshotLoadHugePageConfig,
+    /// Host PCI devices to pass through to the restored microVM.
+    #[serde(default)]
+    pub device_passthrough: Vec<DevicePassthroughConfig>,
 }
 
 /// Stores the configuration used for managing snapshot memory.

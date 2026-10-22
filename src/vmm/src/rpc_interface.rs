@@ -9,7 +9,7 @@ use utils::time::{ClockType, get_time_us};
 
 use super::builder::build_and_boot_microvm;
 use super::persist::{create_snapshot, restore_from_snapshot};
-use super::resources::VmResources;
+use super::resources::{ResourcesError, VmResources};
 use super::{Vmm, VmmError};
 use crate::EventManager;
 use crate::builder::StartMicrovmError;
@@ -23,12 +23,14 @@ use crate::mmds::data_store::{self, Mmds, MmdsDatastoreError};
 use crate::persist::{CreateSnapshotError, RestoreFromSnapshotError, VmInfo};
 use crate::resources::VmmConfig;
 use crate::seccomp::BpfThreadMap;
-use crate::vmm_config::HotplugDeviceConfig;
 use crate::vmm_config::balloon::{
     BalloonConfigError, BalloonDeviceConfig, BalloonStats, BalloonUpdateConfig,
     BalloonUpdateStatsConfig,
 };
 use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
+use crate::vmm_config::device_passthrough::{
+    DevicePassthroughConfig, DevicePassthroughConfigError,
+};
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
 use crate::vmm_config::instance_info::InstanceInfo;
@@ -45,7 +47,7 @@ use crate::vmm_config::pmem::{PmemConfig, PmemConfigError, PmemDeviceUpdateConfi
 use crate::vmm_config::serial::SerialConfig;
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, SnapshotType};
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
-use crate::vmm_config::{self, RateLimiterUpdate};
+use crate::vmm_config::{self, HotplugDeviceConfig, RateLimiterUpdate};
 
 /// This enum represents the public interface of the VMM. Each action contains various
 /// bits of information (ids, paths, etc.).
@@ -119,6 +121,9 @@ pub enum VmmAction {
     /// Set the entropy device using `EntropyDeviceConfig` as input. This action can only be called
     /// before the microVM has booted.
     SetEntropyDevice(EntropyDeviceConfig),
+    /// Add a passthrough device using `DevicePassthroughConfig` as input. This action can only be called
+    /// before the microVM has booted.
+    InsertPassthroughDevice(DevicePassthroughConfig),
     /// Get the memory hotplug device configuration and status.
     GetMemoryHotplugStatus,
     /// Set the memory hotplug device using `MemoryHotplugConfig` as input. This action can only be
@@ -218,6 +223,10 @@ pub enum VmmActionError {
     PciNotEnabled,
     /// PCI manager error: {0}
     PciManager(#[from] PciManagerError),
+    /// Device passthrough config error: {0}
+    DevicePassthroughConfig(#[from] DevicePassthroughConfigError),
+    /// Incompatible device configuration: {0}
+    IncompatibleDeviceConfiguration(#[from] ResourcesError),
 }
 
 /// The enum represents the response sent by the VMM in case of success. The response is either
@@ -498,6 +507,7 @@ impl<'a> PrebootApiController<'a> {
             StartMicroVm => self.start_microvm(),
             UpdateMachineConfiguration(config) => self.update_machine_config(config),
             SetEntropyDevice(config) => self.set_entropy_device(config),
+            InsertPassthroughDevice(config) => self.insert_passthrough_device(config),
             SetMemoryHotplugDevice(config) => self.set_memory_hotplug_device(config),
             // Operations not allowed pre-boot.
             CreateSnapshot(_)
@@ -549,6 +559,8 @@ impl<'a> PrebootApiController<'a> {
     }
 
     fn insert_pmem_device(&mut self, cfg: PmemConfig) -> Result<VmmData, VmmActionError> {
+        self.vm_resources.compatible_with_pmem()?;
+
         self.boot_path = true;
         self.vm_resources
             .build_pmem_device(cfg)
@@ -557,11 +569,13 @@ impl<'a> PrebootApiController<'a> {
     }
 
     fn set_balloon_device(&mut self, cfg: BalloonDeviceConfig) -> Result<VmmData, VmmActionError> {
+        self.vm_resources.compatible_with_balloon()?;
+
         self.boot_path = true;
         self.vm_resources
             .set_balloon_device(cfg)
-            .map(|()| VmmData::Empty)
-            .map_err(VmmActionError::BalloonConfig)
+            .map_err(VmmActionError::BalloonConfig)?;
+        Ok(VmmData::Empty)
     }
 
     fn set_boot_source(&mut self, cfg: BootSourceConfig) -> Result<VmmData, VmmActionError> {
@@ -613,10 +627,26 @@ impl<'a> PrebootApiController<'a> {
         Ok(VmmData::Empty)
     }
 
+    fn insert_passthrough_device(
+        &mut self,
+        cfg: DevicePassthroughConfig,
+    ) -> Result<VmmData, VmmActionError> {
+        self.vm_resources.compatible_with_passthrough_device()?;
+
+        log_dev_preview_warning("device passthrough", None);
+        self.boot_path = true;
+        self.vm_resources
+            .set_passthrough_device(cfg)
+            .map(|()| VmmData::Empty)
+            .map_err(VmmActionError::DevicePassthroughConfig)
+    }
+
     fn set_memory_hotplug_device(
         &mut self,
         cfg: MemoryHotplugConfig,
     ) -> Result<VmmData, VmmActionError> {
+        self.vm_resources.compatible_with_memory_hotplug()?;
+
         self.boot_path = true;
         self.vm_resources.set_memory_hotplug_config(cfg)?;
         Ok(VmmData::Empty)
@@ -856,6 +886,7 @@ impl RuntimeApiController {
             | SetMmdsConfiguration(_)
             | SetEntropyDevice(_)
             | SetMemoryHotplugDevice(_)
+            | InsertPassthroughDevice(_)
             | StartMicroVm
             | UpdateMachineConfiguration(_) => Err(VmmActionError::OperationNotSupportedPostBoot),
         }
@@ -1036,6 +1067,7 @@ mod tests {
     use crate::HTTP_MAX_PAYLOAD_SIZE;
     use crate::builder::tests::default_vmm;
     use crate::mmds::data_store::MmdsVersion;
+    use crate::pci::PciSBDF;
     use crate::seccomp::BpfThreadMap;
     use crate::vmm_config::snapshot::{
         MemBackendConfig, MemBackendType, SnapshotLoadHugePageConfig,
@@ -1337,6 +1369,7 @@ mod tests {
                 vsock_override: None,
                 clock_realtime: false,
                 huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+                device_passthrough: vec![],
             },
         )));
         check_unsupported(runtime_request(VmmAction::SetEntropyDevice(
@@ -1344,6 +1377,12 @@ mod tests {
         )));
         check_unsupported(runtime_request(VmmAction::SetMemoryHotplugDevice(
             MemoryHotplugConfig::default(),
+        )));
+        check_unsupported(runtime_request(VmmAction::InsertPassthroughDevice(
+            DevicePassthroughConfig {
+                id: String::new(),
+                sbdf: PciSBDF::new(0x0, 0x0, 0x0, 0x0),
+            },
         )));
     }
 }

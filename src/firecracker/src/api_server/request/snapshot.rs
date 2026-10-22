@@ -110,6 +110,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
             || snapshot_config.track_dirty_pages,
         resume_vm: snapshot_config.resume_vm,
         network_overrides: snapshot_config.network_overrides,
+        device_passthrough: snapshot_config.device_passthrough,
         vsock_override: snapshot_config.vsock_override,
         clock_realtime: snapshot_config.clock_realtime,
         huge_pages: snapshot_config.huge_pages,
@@ -215,6 +216,7 @@ mod tests {
             vsock_override: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Hugetlbfs2M,
+            device_passthrough: vec![],
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -248,6 +250,7 @@ mod tests {
             vsock_override: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+            device_passthrough: vec![],
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -281,6 +284,7 @@ mod tests {
             vsock_override: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+            device_passthrough: vec![],
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -315,6 +319,7 @@ mod tests {
             vsock_override: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+            device_passthrough: vec![],
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -327,6 +332,34 @@ mod tests {
             vmm_action_from_request(parsed_request),
             VmmAction::LoadSnapshot(expected_config)
         );
+
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_backend": {
+                "backend_path": "bar",
+                "backend_type": "Uffd"
+            },
+            "device_passthrough": [
+                { "id": "gpu0", "sbdf": "0000:01:00.0" }
+            ]
+        }"#;
+        let parsed = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+        let VmmAction::LoadSnapshot(params) = vmm_action_from_request(parsed) else {
+            panic!("not a snapshot load");
+        };
+        assert_eq!(params.device_passthrough.len(), 1);
+        assert_eq!(params.device_passthrough[0].id, "gpu0");
+        assert_eq!(
+            params.device_passthrough[0].sbdf.to_string(),
+            "0000:01:00.0"
+        );
+
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_backend": { "backend_path": "bar", "backend_type": "Uffd" },
+            "device_passthrough": [ { "id": "gpu0", "sbdf": "not-a-pci-address" } ]
+        }"#;
+        parse_put_snapshot(&Body::new(body), Some("load")).unwrap_err();
 
         let body = r#"{
             "snapshot_path": "foo",
@@ -357,6 +390,7 @@ mod tests {
             vsock_override: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+            device_passthrough: vec![],
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -387,6 +421,7 @@ mod tests {
             vsock_override: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+            device_passthrough: vec![],
         };
         let parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert_eq!(
