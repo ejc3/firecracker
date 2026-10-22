@@ -278,8 +278,7 @@ impl PciDevices {
 
         // This is for config space
         self.pci_segment
-            .pci_buses
-            .root_bus()
+            .pci_bus
             .lock()
             .unwrap()
             // SAFETY: we should never add 2 devices with same device id
