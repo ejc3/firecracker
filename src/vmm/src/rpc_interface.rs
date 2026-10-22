@@ -1369,6 +1369,7 @@ mod tests {
                 vsock_override: None,
                 clock_realtime: false,
                 huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+                device_passthrough: vec![],
             },
         )));
         check_unsupported(runtime_request(VmmAction::SetEntropyDevice(

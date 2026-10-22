@@ -1819,6 +1819,16 @@ definitions:
         description: Network host device names to override
         items:
           $ref: "#/definitions/NetworkOverride"
+      device_passthrough:
+        type: array
+        description:
+          Host PCI devices to pass through to the restored microVM. They are attached while
+          the snapshot loads, before any vCPU runs, so a snapshot taken without them can be
+          restored with them. The snapshot must have been taken with PCI enabled and without
+          a balloon, memory-hotplug or pmem device. The guest is not notified and must rescan
+          its PCI bus. A microVM with a passthrough device cannot be snapshotted.
+        items:
+          $ref: "#/definitions/DevicePassthrough"
       vsock_override:
         $ref: "#/definitions/VsockOverride"
         description:

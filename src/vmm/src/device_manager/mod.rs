@@ -116,6 +116,19 @@ pub enum FindDeviceError {
     DeviceNotFound,
 }
 
+/// Errors attaching a passthrough device to a built VM.
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum PassthroughAttachError {
+    /// Passthrough device is incompatible with this VM: {0}
+    Incompatible(ResourcesError),
+    /// A passthrough device with id {0} is already attached
+    DuplicateId(String),
+    /// A passthrough device at {0} is already attached
+    DuplicateSbdf(String),
+    /// Attaching the passthrough device failed: {0}
+    Attach(PciManagerError),
+}
+
 #[derive(Debug, Default)]
 /// A manager of all peripheral devices of Firecracker
 pub struct DeviceManager {
@@ -465,6 +478,58 @@ impl DeviceManager {
         }
     }
 
+    /// Attaches a host PCI device by VFIO passthrough to a VM that was built without it, such
+    /// as one just restored from a snapshot. Applies the same rules as
+    /// `VmResources::compatible_with_passthrough_device` does before boot, to the devices the
+    /// VM actually has: the PCI transport is required, and a balloon, memory-hotplug or pmem
+    /// device is refused because all guest memory is pinned for the device's DMA. The guest is
+    /// not notified; it finds the device by rescanning its PCI bus.
+    pub fn attach_passthrough_device(
+        &mut self,
+        vm: &Arc<KvmVm>,
+        config: DevicePassthroughConfig,
+    ) -> Result<(), PassthroughAttachError> {
+        let VirtioDevices::Pci(pci_devices) = &mut self.virtio_devices else {
+            return Err(PassthroughAttachError::Incompatible(
+                ResourcesError::DevicePassthroughWithoutPci,
+            ));
+        };
+        let mut incompatible = None;
+        pci_devices.for_each_virtio_device(
+            &mut |dev_type: VirtioDeviceType, _: &dyn VirtioDevice| {
+                if incompatible.is_none() {
+                    incompatible = match dev_type {
+                        VirtioDeviceType::Balloon => {
+                            Some(ResourcesError::DevicePassthroughWithBalloon)
+                        }
+                        VirtioDeviceType::Mem => {
+                            Some(ResourcesError::DevicePassthroughWithMemHotplug)
+                        }
+                        VirtioDeviceType::Pmem => Some(ResourcesError::DevicePassthroughWithPmem),
+                        _ => None,
+                    };
+                }
+            },
+        );
+        if let Some(err) = incompatible {
+            return Err(PassthroughAttachError::Incompatible(err));
+        }
+        for device in pci_devices.vfio_devices.iter() {
+            let device = device.lock().expect("Poisoned lock");
+            if device.config.id == config.id {
+                return Err(PassthroughAttachError::DuplicateId(config.id));
+            }
+            if device.config.sbdf == config.sbdf {
+                return Err(PassthroughAttachError::DuplicateSbdf(
+                    config.sbdf.to_string(),
+                ));
+            }
+        }
+        pci_devices
+            .attach_vfio_device(vm, config)
+            .map_err(PassthroughAttachError::Attach)
+    }
+
     /// Attaches a device after VM start
     pub fn hotplug_device(
         &mut self,
@@ -807,13 +872,14 @@ pub(crate) mod tests {
     use super::*;
     use crate::builder::tests::{
         CustomBlockConfig, default_kernel_cmdline, default_vmm, default_vmm_with_pci,
-        insert_block_devices,
+        insert_balloon_device, insert_block_devices,
     };
     use crate::devices::acpi::vmclock::VmClock;
     use crate::devices::acpi::vmgenid::VmGenId;
     use crate::devices::virtio::block::CacheType;
     use crate::rpc_interface::VmmActionError;
     use crate::vmm_config::HotplugDeviceConfig;
+    use crate::vmm_config::balloon::BalloonDeviceConfig;
     use crate::vmm_config::drive::{BlockDeviceConfig, DriveError};
     use crate::vmm_config::net::{NetworkInterfaceConfig, NetworkInterfaceError};
     use crate::vmm_config::pmem::{PmemConfig, PmemConfigError};
@@ -1025,6 +1091,78 @@ pub(crate) mod tests {
         let cfg = HotplugDeviceConfig::Block(make_hotplug_block_cfg("block1", &f, false));
         vmm.hotplug_device(cfg, &mut evt_manager).unwrap();
         assert_eq!(bar_addr(&vmm, "block1"), first_addr);
+    }
+
+    fn passthrough_config(id: &str, sbdf: &str) -> DevicePassthroughConfig {
+        serde_json::from_str(&format!(r#"{{"id": "{id}", "sbdf": "{sbdf}"}}"#)).unwrap()
+    }
+
+    #[test]
+    fn test_passthrough_attach_requires_pci() {
+        let mut vmm = default_vmm();
+        let kvm_vm = vmm.vm.as_kvm().unwrap().clone();
+        let err = vmm
+            .device_manager
+            .attach_passthrough_device(&kvm_vm, passthrough_config("gpu0", "0000:01:00.0"))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PassthroughAttachError::Incompatible(ResourcesError::DevicePassthroughWithoutPci)
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_passthrough_attach_refuses_a_balloon() {
+        let mut vmm = default_vmm_with_pci();
+        let mut event_manager = EventManager::new().unwrap();
+        let mut cmdline = default_kernel_cmdline();
+        insert_balloon_device(
+            &mut vmm,
+            &mut cmdline,
+            &mut event_manager,
+            BalloonDeviceConfig {
+                amount_mib: 0,
+                deflate_on_oom: false,
+                stats_polling_interval_s: 0,
+                free_page_hinting: false,
+                free_page_reporting: false,
+            },
+        );
+        let kvm_vm = vmm.vm.as_kvm().unwrap().clone();
+        let err = vmm
+            .device_manager
+            .attach_passthrough_device(&kvm_vm, passthrough_config("gpu0", "0000:01:00.0"))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PassthroughAttachError::Incompatible(ResourcesError::DevicePassthroughWithBalloon)
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_passthrough_attach_reports_a_device_it_cannot_open() {
+        // No such host device: VFIO setup fails, and the attach reports it as an error
+        // instead of panicking, so a restore can fail cleanly.
+        let mut vmm = default_vmm_with_pci();
+        let kvm_vm = vmm.vm.as_kvm().unwrap().clone();
+        let err = vmm
+            .device_manager
+            .attach_passthrough_device(&kvm_vm, passthrough_config("gpu0", "0000:ff:1f.7"))
+            .unwrap_err();
+        assert!(matches!(err, PassthroughAttachError::Attach(_)), "{err}");
+        assert!(
+            vmm.device_manager
+                .pci_devices()
+                .unwrap()
+                .vfio_devices
+                .is_empty()
+        );
     }
 
     #[test]
