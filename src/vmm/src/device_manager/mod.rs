@@ -530,6 +530,22 @@ impl DeviceManager {
             .map_err(PassthroughAttachError::Attach)
     }
 
+    /// Detaches the passthrough device `id` (see `PciDevices::detach_vfio_device`).
+    pub fn detach_passthrough_device(
+        &mut self,
+        vm: &KvmVm,
+        id: &str,
+    ) -> Result<(), VmmActionError> {
+        let VirtioDevices::Pci(pci_devices) = &mut self.virtio_devices else {
+            return Err(VmmActionError::PciNotEnabled);
+        };
+        if pci_devices.detach_vfio_device(vm, id)? {
+            Ok(())
+        } else {
+            Err(VmmActionError::DeviceNotFound)
+        }
+    }
+
     /// Attaches a device after VM start
     pub fn hotplug_device(
         &mut self,
@@ -1163,6 +1179,40 @@ pub(crate) mod tests {
                 .vfio_devices
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn test_passthrough_hotplug_on_a_running_vm_attempts_the_attach() {
+        // After boot an attach goes on to VFIO setup instead of being refused as pre-boot only.
+        let mut vmm = default_vmm_with_pci();
+        let err = vmm
+            .hotplug_passthrough_device(passthrough_config("gpu0", "0000:ff:1f.7"))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VmmActionError::PassthroughAttach(PassthroughAttachError::Attach(_))
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_passthrough_hot_unplug_of_an_unknown_id_is_not_found() {
+        let mut vmm = default_vmm_with_pci();
+        assert!(matches!(
+            vmm.hot_unplug_passthrough_device("gpu0"),
+            Err(VmmActionError::DeviceNotFound)
+        ));
+    }
+
+    #[test]
+    fn test_passthrough_hot_unplug_requires_pci() {
+        let mut vmm = default_vmm();
+        assert!(matches!(
+            vmm.hot_unplug_passthrough_device("gpu0"),
+            Err(VmmActionError::PciNotEnabled)
+        ));
     }
 
     #[test]
