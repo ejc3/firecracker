@@ -341,11 +341,11 @@ paths:
 
   /device-passthrough/{id}:
     put:
-      summary: Creates or updates a passthrough device. Pre-boot only.
+      summary: Creates or updates a passthrough device, or attaches one to a running VM.
       description:
-        Creates new passthrough device with ID specified by id parameter.
-        If a device with the specified ID already exists, it updates
-        device state based on new input.
+        Before boot, creates a new passthrough device with ID specified by id parameter,
+        or updates the one with that ID. After boot (or a snapshot load), attaches the
+        device to the VM. The guest is not notified and must rescan its PCI bus.
       operationId: putGuestDevicePassthroughByID
       parameters:
         - name: id
@@ -364,6 +364,31 @@ paths:
           description: passthrough device is created/updated
         400:
           description: passthrough device cannot be created/updated due to bad input
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error.
+          schema:
+            $ref: "#/definitions/Error"
+    delete:
+      summary: Detaches a passthrough device from a running VM. Post-boot only.
+      description:
+        Detaches the passthrough device with ID specified by id parameter. The guest is
+        not notified; it must remove the device itself first (on Linux, by writing 1 to
+        /sys/bus/pci/devices/<address>/remove). A VM whose passthrough devices are all
+        detached can be snapshotted.
+      operationId: deleteGuestDevicePassthroughByID
+      parameters:
+        - name: id
+          in: path
+          description: The id of the passthrough device
+          required: true
+          type: string
+      responses:
+        204:
+          description: passthrough device is detached
+        400:
+          description: passthrough device cannot be detached
           schema:
             $ref: "#/definitions/Error"
         default:

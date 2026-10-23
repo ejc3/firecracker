@@ -38,6 +38,15 @@ pub(crate) fn parse_put_device_passthrough(
     }
 }
 
+pub(crate) fn parse_delete_device_passthrough(
+    id_from_path: Option<&str>,
+) -> Result<ParsedRequest, RequestError> {
+    let id = checked_id(id_from_path.ok_or(RequestError::EmptyID)?)?;
+    Ok(ParsedRequest::new_sync(
+        VmmAction::HotUnplugPassthroughDevice(id.to_string()),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use vmm::pci::PciSBDF;
@@ -79,5 +88,15 @@ mod tests {
             sbdf: PciSBDF::new(0x0, 0x0, 0x1f, 0x0),
         };
         assert_eq!(r, VmmAction::InsertPassthroughDevice(expected_config));
+    }
+
+    #[test]
+    fn test_parse_delete_device_passthrough_request() {
+        parse_delete_device_passthrough(None).unwrap_err();
+        parse_delete_device_passthrough(Some("bad id!")).unwrap_err();
+        assert_eq!(
+            vmm_action_from_request(parse_delete_device_passthrough(Some("gpu0")).unwrap()),
+            VmmAction::HotUnplugPassthroughDevice("gpu0".to_string())
+        );
     }
 }

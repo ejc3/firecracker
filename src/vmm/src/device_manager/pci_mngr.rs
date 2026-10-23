@@ -298,6 +298,49 @@ impl PciDevices {
         Ok(())
     }
 
+    /// Detach the passthrough device `id`, if it is attached. Returns whether it was.
+    ///
+    /// The guest is not told: it must have removed the device itself (for Linux,
+    /// `echo 1 > /sys/bus/pci/devices/<addr>/remove`) and must not touch its BARs again.
+    /// The device is reset, its BAR mappings and MSI-X routes are removed, its group leaves
+    /// the container and the KVM VFIO device, and its PCI slot is freed. When it was the last
+    /// one, the container is dropped too, which unpins guest memory; a later attach creates a
+    /// new container and maps guest memory again.
+    pub fn detach_vfio_device(&mut self, vm: &KvmVm, id: &str) -> Result<bool, PciManagerError> {
+        let Some(index) = self
+            .vfio_devices
+            .iter()
+            .position(|device| device.lock().expect("Poisoned lock").config.id == id)
+        else {
+            return Ok(false);
+        };
+        let device = self.vfio_devices.remove(index);
+        let (slot, emulated_areas) = {
+            let device = device.lock().expect("Poisoned lock");
+            (device.sbdf.device(), device.emulated_areas.clone())
+        };
+
+        // Off the PCI bus first, so no config access reaches it; then off the MMIO bus.
+        self.pci_segment
+            .pci_bus
+            .lock()
+            .expect("Poisoned lock")
+            .remove_device(slot);
+        for area in emulated_areas {
+            vm.common.mmio_bus.remove(area.gpa, area.size)?;
+        }
+
+        // The buses held the only other references; dropping this one runs the teardown
+        // (VfioDevice::drop, then the vfio-ioctls device and group drops).
+        assert_eq!(Arc::strong_count(&device), 1);
+        drop(device);
+
+        if self.vfio_devices.is_empty() {
+            self.vfio_container = None;
+        }
+        Ok(true)
+    }
+
     fn restore_pci_device<T: 'static + VirtioDevice + MutEventSubscriber + Debug>(
         &mut self,
         vm: &Arc<KvmVm>,
