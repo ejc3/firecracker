@@ -24,7 +24,7 @@ use vm_memory::{GuestMemoryError, GuestMemoryRegionBytes, VolatileSlice, WriteVo
 
 use crate::DirtyBitmap;
 use crate::arch::host_page_size;
-use crate::logger::error;
+use crate::logger::{error, info, warn};
 use crate::utils::u64_to_usize;
 use crate::vmm_config::machine_config::HugePageConfig;
 use crate::vstate::vm::{KvmVm, VmError};
@@ -76,12 +76,120 @@ pub enum MemoryError {
     SeekError(std::io::Error),
     /// Volatile memory error: {0}
     VolatileMemoryError(vm_memory::VolatileMemoryError),
+    /// Cannot read which guest pages have a page table entry: {0}
+    PageEntries(std::io::Error),
 }
 
 impl From<vm_memory::VolatileMemoryError> for MemoryError {
     fn from(e: vm_memory::VolatileMemoryError) -> Self {
         MemoryError::VolatileMemoryError(e)
     }
+}
+
+/// What a Full dump does with the pages of anonymous guest memory that nothing ever wrote.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AbsentPages {
+    /// Read them like any other page. Reading an anonymous page that was never written maps the
+    /// shared zero page (or the huge zero page) into the VMM, so the guest's first write to it
+    /// after the snapshot is a copy-on-write instead of an ordinary fault, and each such
+    /// copy-on-write sends KVM an MMU notifier invalidation. On an arm64 host running a nested
+    /// guest, a kernel without Linux commit e6084aecaeef ("KVM: arm64: nv: Avoid full shadow
+    /// stage-2 unmap") unmaps every shadow stage-2 in full on each invalidation.
+    Read,
+    /// Seek over them and leave a hole, without touching them. Correct only when such a page is
+    /// all zeros, which no userfaultfd handler can contradict, and the file holds no data under
+    /// it.
+    Skip,
+}
+
+/// The bits of a `/proc/self/pagemap` entry that say a page has a page table entry: 63, the page
+/// is in memory, and 62, it is swapped out. For small pages and transparent huge pages the kernel
+/// sets 62 for every entry that is neither empty nor present (swap, migration, markers). A hugetlb
+/// entry that is not present (migration, hwpoison) gets neither bit, so this alone cannot say that
+/// a page has no entry; mincore(2) reports such a page resident.
+const PAGEMAP_PRESENT_OR_SWAPPED: u64 = 0b11 << 62;
+/// Number of pages whose entries are read per `read` and `mincore` call.
+const PAGEMAP_BATCH: usize = 4096;
+
+/// Finds the pages of this process's address space that have no page table entry.
+///
+/// A page of anonymous private memory with no entry was never written, or was discarded with
+/// `MADV_DONTNEED`, so it reads as zeros. A page has no entry only when `/proc/self/pagemap` shows
+/// it neither present nor swapped and mincore(2) reports it not resident. Neither is enough alone:
+/// mincore reports a swapped-out small page resident only while it is in the swap cache, and
+/// pagemap gives a hugetlb migration entry neither bit. Reading pagemap's flags needs no
+/// privilege (only the frame numbers are hidden), and it is read with lseek(2) and read(2), which
+/// Firecracker's seccomp filters allow, and not with pread64(2), which they do not.
+#[derive(Debug)]
+struct PageEntries {
+    pagemap: File,
+    page_size: usize,
+    entries: Vec<u8>,
+    resident: Vec<u8>,
+}
+
+impl PageEntries {
+    fn open() -> std::io::Result<Self> {
+        Ok(PageEntries {
+            pagemap: File::open("/proc/self/pagemap")?,
+            page_size: host_page_size(),
+            entries: vec![0; PAGEMAP_BATCH * 8],
+            resident: vec![0; PAGEMAP_BATCH],
+        })
+    }
+
+    /// Calls `f(has_entry)` for each of the `pages` pages from the page-aligned host address
+    /// `addr`, in order.
+    fn for_each_page(
+        &mut self,
+        addr: usize,
+        pages: usize,
+        mut f: impl FnMut(bool) -> Result<(), MemoryError>,
+    ) -> Result<(), MemoryError> {
+        use std::io::{Read, Seek};
+
+        let mut done = 0;
+        while done < pages {
+            let count = (pages - done).min(PAGEMAP_BATCH);
+            let first = addr + done * self.page_size;
+            let position = u64::try_from(first / self.page_size)
+                .ok()
+                .and_then(|index| index.checked_mul(8))
+                .ok_or(MemoryError::OffsetTooLarge)?;
+            self.pagemap
+                .seek(SeekFrom::Start(position))
+                .map_err(MemoryError::PageEntries)?;
+            let entries = &mut self.entries[..count * 8];
+            self.pagemap
+                .read_exact(entries)
+                .map_err(MemoryError::PageEntries)?;
+            // SAFETY: `first` is page aligned, the `count` pages from it are guest memory, which
+            // stays mapped while the dump runs, and `resident` has a byte for each of them.
+            let ret = unsafe {
+                libc::mincore(
+                    first as *mut libc::c_void,
+                    count * self.page_size,
+                    self.resident.as_mut_ptr(),
+                )
+            };
+            if ret != 0 {
+                return Err(MemoryError::PageEntries(std::io::Error::last_os_error()));
+            }
+            for (entry, resident) in entries.chunks_exact(8).zip(&self.resident[..count]) {
+                let entry = u64::from_ne_bytes(entry.try_into().unwrap());
+                f(entry & PAGEMAP_PRESENT_OR_SWAPPED != 0 || resident & 1 != 0)?;
+            }
+            done += count;
+        }
+        Ok(())
+    }
+}
+
+/// Byte counts of a Full dump.
+#[derive(Debug, Default)]
+struct DumpCounts {
+    written: usize,
+    left_as_holes: usize,
 }
 
 /// Type of the guest region
@@ -214,6 +322,63 @@ impl<'a> GuestMemorySlot<'a> {
                 .map_err(MemoryError::SeekError)?;
         }
 
+        Ok(())
+    }
+
+    /// Dumps this slot onto the writer, reading only the pages that hold data and seeking over
+    /// the rest. The slot must be anonymous private memory that only this process fills.
+    fn dump_populated<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        pages: &mut PageEntries,
+        counts: &mut DumpCounts,
+    ) -> Result<(), MemoryError> {
+        let len = self.slice.len();
+        let page_size = pages.page_size;
+        let base = self.slice.ptr_guard().as_ptr() as usize;
+
+        // One run of pages that all hold data, or that all hold none, is flushed with one write
+        // or one seek.
+        let mut flush = |start: usize, end: usize, populated: bool| -> Result<(), MemoryError> {
+            let end = end.min(len);
+            if end <= start {
+                return Ok(());
+            }
+            if populated {
+                writer
+                    .write_all_volatile(&self.slice.subslice(start, end - start)?)
+                    .map_err(|err| MemoryError::WriteMemory(err.into()))?;
+                counts.written += end - start;
+            } else {
+                let offset =
+                    i64::try_from(end - start).map_err(|_| MemoryError::SlotSizeTooLarge)?;
+                writer
+                    .seek(SeekFrom::Current(offset))
+                    .map_err(MemoryError::SeekError)?;
+                counts.left_as_holes += end - start;
+            }
+            Ok(())
+        };
+
+        let mut run_start = 0;
+        let mut run_populated = None;
+        let mut page_start = 0;
+        pages.for_each_page(base, len.div_ceil(page_size), |populated| {
+            match run_populated {
+                Some(current) if current == populated => {}
+                Some(current) => {
+                    flush(run_start, page_start, current)?;
+                    run_start = page_start;
+                    run_populated = Some(populated);
+                }
+                None => run_populated = Some(populated),
+            }
+            page_start += page_size;
+            Ok(())
+        })?;
+        if let Some(current) = run_populated {
+            flush(run_start, len, current)?;
+        }
         Ok(())
     }
 
@@ -633,8 +798,13 @@ where
     /// Mark memory range as dirty
     fn mark_dirty(&self, addr: GuestAddress, len: usize);
 
-    /// Dumps all contents of GuestMemoryMmap to a writer.
-    fn dump<T: WriteVolatile + std::io::Seek>(&self, writer: &mut T) -> Result<(), MemoryError>;
+    /// Dumps all contents of GuestMemoryMmap to a writer. `absent` says what to do with pages of
+    /// anonymous memory that were never written.
+    fn dump<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        absent: AbsentPages,
+    ) -> Result<(), MemoryError>;
 
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
     fn dump_dirty<T: WriteVolatile + std::io::Seek>(
@@ -723,19 +893,61 @@ impl GuestMemoryExtension for GuestMemoryMmap {
     }
 
     /// Dumps all contents of GuestMemoryMmap to a writer.
-    fn dump<T: WriteVolatile + std::io::Seek>(&self, writer: &mut T) -> Result<(), MemoryError> {
-        self.iter()
-            .flat_map(|region| region.slots())
-            .try_for_each(|(mem_slot, plugged)| {
-                if !plugged {
-                    let ilen = i64::try_from(mem_slot.slice.len()).unwrap();
-                    writer.seek(SeekFrom::Current(ilen)).unwrap();
-                } else {
-                    writer.write_all_volatile(&mem_slot.slice)?;
+    fn dump<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        absent: AbsentPages,
+    ) -> Result<(), MemoryError> {
+        let mut page_entries = match absent {
+            AbsentPages::Read => None,
+            AbsentPages::Skip => match PageEntries::open() {
+                Ok(page_entries) => Some(page_entries),
+                Err(err) => {
+                    warn!(
+                        "Cannot open /proc/self/pagemap ({err}); the Full snapshot reads every \
+                         guest page, which maps never-written ones to the zero page"
+                    );
+                    None
                 }
-                Ok(())
-            })
-            .map_err(MemoryError::WriteMemory)
+            },
+        };
+        let mut counts = DumpCounts::default();
+
+        for region in self.iter() {
+            // A never-written page of a file-backed region reads as the file's data, not zeros.
+            let anonymous = region.file_offset().is_none();
+            for (mem_slot, plugged) in region.slots() {
+                if !plugged {
+                    let ilen = i64::try_from(mem_slot.slice.len())
+                        .map_err(|_| MemoryError::SlotSizeTooLarge)?;
+                    writer
+                        .seek(SeekFrom::Current(ilen))
+                        .map_err(MemoryError::SeekError)?;
+                    continue;
+                }
+                match page_entries.as_mut() {
+                    Some(page_entries) if anonymous => {
+                        mem_slot.dump_populated(writer, page_entries, &mut counts)?
+                    }
+                    _ => {
+                        writer
+                            .write_all_volatile(&mem_slot.slice)
+                            .map_err(|err| MemoryError::WriteMemory(err.into()))?;
+                        counts.written += mem_slot.slice.len();
+                    }
+                }
+            }
+        }
+
+        if page_entries.is_some() {
+            info!(
+                "Full snapshot wrote {} MiB of guest memory and left {} MiB never written as \
+                 holes",
+                counts.written >> 20,
+                counts.left_as_holes >> 20
+            );
+        }
+        Ok(())
     }
 
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
@@ -1173,7 +1385,9 @@ mod tests {
 
         // dump the full memory.
         let mut memory_file = TempFile::new().unwrap().into_file();
-        guest_memory.dump(&mut memory_file).unwrap();
+        guest_memory
+            .dump(&mut memory_file, AbsentPages::Read)
+            .unwrap();
 
         let restored_guest_memory =
             into_region_ext(snapshot_file(memory_file, memory_state.regions(), false).unwrap());
@@ -1189,6 +1403,56 @@ mod tests {
             .read(restored_region.as_mut_slice(), region_2_address)
             .unwrap();
         assert_eq!(second_region, restored_region);
+    }
+
+    #[test]
+    fn test_dump_skipping_absent_pages_reads_file_backed_regions() {
+        // A page of a file-backed region that the VMM never touched reads as the file's data, so
+        // AbsentPages::Skip must not leave it as a hole. The file's pages are dropped from the
+        // page cache first, so neither pagemap nor mincore reports them, and only the region's
+        // file backing keeps the dump from skipping them.
+        let page_size = host_page_size();
+        let region_size = page_size * 4;
+        let mut source = TempFile::new().unwrap().into_file();
+        source.write_all(&vec![0x77u8; region_size]).unwrap();
+        source.sync_all().unwrap();
+        let ret = unsafe {
+            libc::posix_fadvise(
+                std::os::fd::AsRawFd::as_raw_fd(&source),
+                0,
+                0,
+                libc::POSIX_FADV_DONTNEED,
+            )
+        };
+        assert_eq!(ret, 0);
+        let guest_memory = into_region_ext(
+            snapshot_file(source, [(GuestAddress(0), region_size)].into_iter(), false).unwrap(),
+        );
+        let host = guest_memory.get_host_address(GuestAddress(0)).unwrap();
+        let mut resident = vec![0u8; 4];
+        assert_eq!(
+            unsafe { libc::mincore(host.cast(), region_size, resident.as_mut_ptr()) },
+            0
+        );
+        assert!(
+            resident.iter().all(|r| r & 1 == 0),
+            "test setup: the file's pages must not be in the page cache ({resident:?}); is the \
+             temporary directory on tmpfs?"
+        );
+
+        let mut memory_file = TempFile::new().unwrap().into_file();
+        guest_memory
+            .dump(&mut memory_file, AbsentPages::Skip)
+            .unwrap();
+
+        let mut dumped = Vec::new();
+        memory_file.rewind().unwrap();
+        memory_file.read_to_end(&mut dumped).unwrap();
+        assert!(
+            dumped == vec![0x77u8; region_size],
+            "the dump left {} of {region_size} bytes of the file-backed region as holes",
+            region_size - dumped.len().min(region_size)
+        );
     }
 
     #[test]

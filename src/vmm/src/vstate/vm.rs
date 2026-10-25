@@ -34,8 +34,8 @@ use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{
-    GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemoryState,
-    GuestRegionMmap, GuestRegionMmapExt, MemoryError,
+    AbsentPages, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
+    GuestMemoryState, GuestRegionMmap, GuestRegionMmapExt, MemoryError,
 };
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
@@ -588,7 +588,6 @@ impl KvmVm {
         // Determine what size our total memory area is.
         let mem_size_mib = mem_size_mib(self.guest_memory());
         let expected_size = mem_size_mib * 1024 * 1024;
-
         if file_existed {
             let file_size = file
                 .metadata()
@@ -608,6 +607,15 @@ impl KvmVm {
             }
         }
 
+        // Whether the file may hold data under a page the dump does not write. Read from the open
+        // descriptor, not from `file_existed`: a file created at this path after that check is
+        // not truncated above.
+        let file_holds_data = file
+            .metadata()
+            .map_err(|e| MemoryBackingFile("get_metadata", e))?
+            .len()
+            > 0;
+
         // Set the length of the file to the full size of the memory area.
         file.set_len(expected_size)
             .map_err(|e| MemoryBackingFile("set_length", e))?;
@@ -618,7 +626,16 @@ impl KvmVm {
                 self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
             }
             SnapshotType::Full => {
-                self.guest_memory().dump(&mut file)?;
+                // A never-written page of anonymous guest memory is zeros, and reading it would
+                // map the zero page into this VMM and so change how the resumed guest's first
+                // write to it faults. Leave it as a hole when that hole reads as zeros: the file
+                // holds no data, and no userfaultfd handler supplies the memory's missing pages.
+                let absent = if self.common.uffd.is_none() && !file_holds_data {
+                    AbsentPages::Skip
+                } else {
+                    AbsentPages::Read
+                };
+                self.guest_memory().dump(&mut file, absent)?;
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
             }
@@ -767,8 +784,10 @@ fn mincore_bitmap(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
 pub(crate) mod tests {
     use std::sync::atomic::Ordering;
 
+    use vm_memory::Bytes;
     use vm_memory::GuestAddress;
     use vm_memory::mmap::MmapRegionBuilder;
+    use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
     use crate::pci::PciSBDF;
@@ -1144,5 +1163,206 @@ pub(crate) mod tests {
             .allocate(1024, 1024, AllocPolicy::FirstMatch)
             .unwrap();
         assert_eq!(range + 1024, range_new.start());
+    }
+
+    /// Size of the guest memory the Full snapshot tests dump: whole MiBs, and several 2 MiB
+    /// extents, so a transparent huge page that a write in the first extent populates cannot
+    /// reach the pages the tests expect to stay absent.
+    const DUMP_TEST_MEM: usize = 8 << 20;
+
+    /// Whether each page of `[addr, addr + len)` is mapped or swapped out, from
+    /// `/proc/self/pagemap`.
+    fn populated_pages(addr: usize, len: usize) -> Vec<bool> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let page_size = host_page_size();
+        let mut pagemap = std::fs::File::open("/proc/self/pagemap").unwrap();
+        pagemap
+            .seek(SeekFrom::Start((addr / page_size * 8) as u64))
+            .unwrap();
+        let mut bytes = vec![0u8; len / page_size * 8];
+        pagemap.read_exact(&mut bytes).unwrap();
+        bytes
+            .chunks_exact(8)
+            .map(|e| u64::from_ne_bytes(e.try_into().unwrap()) & (0b11 << 62) != 0)
+            .collect()
+    }
+
+    /// Writes two marks into the first 2 MiB of guest memory and returns them with their guest
+    /// addresses.
+    fn write_marks(vm: &KvmVm) -> [(u64, [u8; 16]); 2] {
+        let marks = [(0, [0xab; 16]), (5 * host_page_size() as u64, [0xcd; 16])];
+        for (addr, bytes) in &marks {
+            vm.guest_memory()
+                .write_slice(bytes, GuestAddress(*addr))
+                .unwrap();
+        }
+        marks
+    }
+
+    /// The file must hold the marks, over each page's `filler` byte.
+    fn assert_file_holds_marks_on(
+        path: &Path,
+        marks: &[(u64, [u8; 16])],
+        filler: impl Fn(usize) -> u8,
+    ) {
+        let file = std::fs::read(path).unwrap();
+        assert_eq!(file.len(), DUMP_TEST_MEM);
+        let mut expected: Vec<u8> = (0..DUMP_TEST_MEM)
+            .map(|byte| filler(byte / host_page_size()))
+            .collect();
+        for (addr, bytes) in marks {
+            let addr = usize::try_from(*addr).unwrap();
+            expected[addr..addr + bytes.len()].copy_from_slice(bytes);
+        }
+        // Compare page by page so a failure names the page instead of printing 8 MiB.
+        for (page, (got, want)) in file
+            .chunks(host_page_size())
+            .zip(expected.chunks(host_page_size()))
+            .enumerate()
+        {
+            assert!(
+                got == want,
+                "snapshot page {page} differs from guest memory"
+            );
+        }
+    }
+
+    #[test]
+    fn test_full_snapshot_leaves_never_written_guest_pages_unmapped() {
+        // Reading a never-written anonymous page maps the shared zero page, and the guest's first
+        // write to it after the snapshot is then a copy-on-write whose MMU notifier invalidation
+        // unmaps every shadow stage-2 of a nested guest (fcvm#1264). The dump must leave those
+        // pages as they were: unmapped in the VMM, and holes in the file.
+        let vm = setup_vm_with_memory(DUMP_TEST_MEM);
+        let marks = write_marks(&vm);
+        let host = vm.guest_memory().get_host_address(GuestAddress(0)).unwrap() as usize;
+        let tail = (host + DUMP_TEST_MEM / 2, DUMP_TEST_MEM / 2);
+        assert!(
+            populated_pages(tail.0, tail.1).iter().all(|p| !p),
+            "test setup: the second half of guest memory must start never written"
+        );
+
+        let file = TempFile::new().unwrap();
+        vm.snapshot_memory_to_file(file.as_path(), SnapshotType::Full)
+            .unwrap();
+
+        let mapped = populated_pages(tail.0, tail.1)
+            .iter()
+            .filter(|p| **p)
+            .count();
+        assert_eq!(
+            mapped, 0,
+            "the Full snapshot mapped {mapped} never-written guest pages into the VMM"
+        );
+        assert_file_holds_marks_on(file.as_path(), &marks, |_| 0);
+
+        // The never-written half is a hole in the file, not written zeros.
+        let fd = std::fs::File::open(file.as_path()).unwrap();
+        // SAFETY: lseek on a descriptor this test owns.
+        let data = unsafe {
+            libc::lseek(
+                std::os::fd::AsRawFd::as_raw_fd(&fd),
+                libc::off_t::try_from(DUMP_TEST_MEM / 2).unwrap(),
+                libc::SEEK_DATA,
+            )
+        };
+        assert_eq!(
+            data, -1,
+            "the never-written half of guest memory holds data"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENXIO)
+        );
+    }
+
+    #[test]
+    fn test_full_snapshot_into_a_file_of_the_same_size_writes_every_page() {
+        // A Full snapshot overwrites a memory file of the right size in place, so a page it left
+        // as a hole there would keep the old file's data. Every page must be written.
+        let vm = setup_vm_with_memory(DUMP_TEST_MEM);
+        let marks = write_marks(&vm);
+        let file = TempFile::new().unwrap();
+        std::fs::write(file.as_path(), vec![0xffu8; DUMP_TEST_MEM]).unwrap();
+
+        vm.snapshot_memory_to_file(file.as_path(), SnapshotType::Full)
+            .unwrap();
+
+        assert_file_holds_marks_on(file.as_path(), &marks, |_| 0);
+    }
+
+    #[test]
+    fn test_full_snapshot_of_userfaultfd_memory_reads_every_page() {
+        // A restored VM's missing page holds what its page server will supply, not zeros, so the
+        // dump must read it (and the server fill it) rather than leave a hole.
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::sync::atomic::AtomicBool;
+
+        use userfaultfd::{Event, UffdBuilder};
+
+        const SERVED: u8 = 0x5a;
+        let mut vm = setup_vm_with_memory(DUMP_TEST_MEM);
+        let marks = write_marks(&vm);
+        let host = vm.guest_memory().get_host_address(GuestAddress(0)).unwrap();
+        let uffd = UffdBuilder::new()
+            .close_on_exec(true)
+            .non_blocking(true)
+            .user_mode_only(false)
+            .create()
+            .unwrap();
+        // A page the marks' writes populated (a whole huge page, when transparent huge pages are
+        // always on) holds zeros around the marks; the server fills every other page.
+        let populated = populated_pages(host as usize, DUMP_TEST_MEM);
+        assert!(
+            populated.iter().any(|p| !p),
+            "test setup: no page left to serve"
+        );
+        uffd.register(host.cast(), DUMP_TEST_MEM).unwrap();
+        // SAFETY: dup returns a new descriptor that the server's Uffd owns.
+        let server = unsafe { Uffd::from_raw_fd(libc::dup(uffd.as_raw_fd())) };
+        vm.set_uffd(Some(uffd));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let page_size = host_page_size();
+        let serving = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let page = vec![SERVED; page_size];
+                while !stop.load(Ordering::Relaxed) {
+                    let mut pollfd = libc::pollfd {
+                        fd: server.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // SAFETY: polls one valid pollfd for 50 ms.
+                    if unsafe { libc::poll(&mut pollfd, 1, 50) } <= 0 {
+                        continue;
+                    }
+                    while let Some(event) = server.read_event().unwrap() {
+                        if let Event::Pagefault { addr, .. } = event {
+                            let addr = (addr as usize) & !(page_size - 1);
+                            // SAFETY: copies one page from a live buffer to the faulting
+                            // page of the registered guest memory.
+                            unsafe {
+                                server
+                                    .copy(page.as_ptr().cast(), addr as *mut _, page_size, true)
+                                    .unwrap();
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
+        let file = TempFile::new().unwrap();
+        let result = vm.snapshot_memory_to_file(file.as_path(), SnapshotType::Full);
+        stop.store(true, Ordering::Relaxed);
+        serving.join().unwrap();
+        result.unwrap();
+
+        assert_file_holds_marks_on(file.as_path(), &marks, |page| {
+            if populated[page] { 0 } else { SERVED }
+        });
     }
 }
