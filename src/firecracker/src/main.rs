@@ -628,6 +628,7 @@ enum RunWithoutApiError {
     BuildMicroVMFromJson(BuildFromJsonError),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_without_api(
     seccomp_filters: &BpfThreadMap,
     config_json: Option<String>,

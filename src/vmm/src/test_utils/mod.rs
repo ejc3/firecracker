@@ -3,6 +3,9 @@
 
 #![allow(missing_docs)]
 
+use std::fs::OpenOptions;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::{Arc, Mutex};
 
 use vm_memory::{GuestAddress, GuestRegionCollection};
@@ -20,6 +23,35 @@ use crate::vstate::memory::{self, GuestMemoryMmap, GuestRegionMmap, GuestRegionM
 use crate::{EventManager, Vmm};
 
 pub mod mock_resources;
+
+/// Makes every `ioctl`, `read` and `write` on `fd` fail with `EBADF`, for a test of an error
+/// path, while the number stays allocated to the object that owns it.
+///
+/// A test must not get this by calling `libc::close` on a descriptor an object still owns. That
+/// frees the number, and the unit tests run on parallel threads, so another test's next open can
+/// take it. The closing test then runs its calls against the other test's file, and when its
+/// object is dropped (or a failed assertion unwinds it) it closes the other test's descriptor,
+/// whose own drop then aborts the test binary with "IO Safety violation: owned file descriptor
+/// already closed".
+///
+/// `dup3` replaces the open file behind `fd` with an `O_PATH` descriptor in one step, so the
+/// number is never free. The owner closes it as usual when it is dropped.
+pub fn make_fd_return_ebadf(fd: RawFd) {
+    let path = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH)
+        .open("/")
+        .expect("open / with O_PATH");
+    // SAFETY: `path` is open for the duration of the call, and replacing the file behind `fd`
+    // leaves `fd` open, so its owner still holds a valid descriptor.
+    let ret = unsafe { libc::dup3(path.as_raw_fd(), fd, libc::O_CLOEXEC) };
+    assert_eq!(
+        ret,
+        fd,
+        "dup3 onto fd {fd}: {}",
+        std::io::Error::last_os_error()
+    );
+}
 
 /// Creates a [`GuestMemoryMmap`] with a single region of the given size starting at guest
 /// physical address 0 and without dirty tracking.
@@ -171,4 +203,40 @@ pub fn create_tmp_socket() -> (TempDir, String) {
     }
 
     (tmp_dir, tmp_socket_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::mem::ManuallyDrop;
+
+    use super::*;
+
+    #[test]
+    fn test_make_fd_return_ebadf_keeps_the_number() {
+        // The owner is dropped only after the checks pass: if the number was freed, dropping it
+        // would close whatever another thread opened there.
+        let owner = ManuallyDrop::new(File::open("/dev/null").unwrap());
+        let fd = owner.as_raw_fd();
+
+        make_fd_return_ebadf(fd);
+
+        // SAFETY: F_GETFL only reads the status flags of whatever is open at `fd`.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(
+            flags != -1 && flags & libc::O_PATH != 0,
+            "fd {fd} is no longer this test's: fcntl(F_GETFL) returned {flags} ({})",
+            std::io::Error::last_os_error()
+        );
+        let mut pending: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one c_int into `pending`.
+        let ret = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut pending) };
+        assert_eq!(ret, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+
+        drop(ManuallyDrop::into_inner(owner));
+    }
 }

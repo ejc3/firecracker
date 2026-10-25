@@ -713,14 +713,9 @@ mod tests {
     fn test_create_vcpu() {
         let vm = setup_vm_with_memory(0x1000);
 
-        unsafe { libc::close(vm.fd().as_raw_fd()) };
+        crate::test_utils::make_fd_return_ebadf(vm.fd().as_raw_fd());
 
         let err = KvmVcpu::new(0, &vm);
-
-        // dropping vm would double close the gic fd, so leak it
-        // do the drop before assertion. Otherwise if assert fails,
-        // we get IO runtime error instead of assert error.
-        std::mem::forget(vm);
 
         assert_eq!(
             err.err().unwrap().to_string(),
@@ -750,7 +745,7 @@ mod tests {
         )
         .unwrap();
 
-        unsafe { libc::close(vcpu.fd.as_raw_fd()) };
+        crate::test_utils::make_fd_return_ebadf(vcpu.fd.as_raw_fd());
 
         let err = vcpu.configure(
             vm.guest_memory(),
@@ -761,11 +756,6 @@ mod tests {
             &vcpu_config,
             &optional_capabilities,
         );
-
-        // dropping vcpu would double close the gic fd, so leak it
-        // do the drop before assertion. Otherwise if assert fails,
-        // we get IO runtime error instead of assert error.
-        std::mem::forget(vcpu);
 
         assert_eq!(
             err.unwrap_err(),
@@ -984,17 +974,12 @@ mod tests {
         let res = vcpu.get_mpstate();
         vcpu.set_mpstate(res.unwrap()).unwrap();
 
-        unsafe { libc::close(vcpu.fd.as_raw_fd()) };
+        crate::test_utils::make_fd_return_ebadf(vcpu.fd.as_raw_fd());
 
         let res = vcpu.get_mpstate();
         assert!(matches!(res, Err(VcpuArchError::GetMp(_))), "{:?}", res);
 
         let res = vcpu.set_mpstate(kvm_mp_state::default());
-
-        // dropping vcpu would double close the fd, so leak it
-        // do the drop before assertion. Otherwise if assert fails,
-        // we get IO runtime error instead of assert error.
-        std::mem::forget(vcpu);
 
         assert!(matches!(res, Err(VcpuArchError::SetMp(_))), "{:?}", res);
     }

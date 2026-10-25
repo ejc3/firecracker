@@ -102,7 +102,7 @@ impl KvmVm {
             reserved: u64,
         }
         // _IOW(KVMIO = 0xAE, 0xb5, struct kvm_arm_counter_offset (16 bytes))
-        const KVM_ARM_SET_COUNTER_OFFSET: libc::c_ulong = 0x4010_aeb5;
+        const KVM_ARM_SET_COUNTER_OFFSET: libc::Ioctl = 0x4010_aeb5;
         let arg = KvmArmCounterOffset {
             counter_offset: offset,
             reserved: 0,

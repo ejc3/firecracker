@@ -193,7 +193,7 @@ mod tests {
         let res = set_icc_regs(gic_fd.device_fd(), gicr_typer, &state);
         assert_eq!(format!("{:?}", res.unwrap_err()), "InvalidVgicSysRegState");
 
-        unsafe { libc::close(gic_fd.device_fd().as_raw_fd()) };
+        crate::test_utils::make_fd_return_ebadf(gic_fd.device_fd().as_raw_fd());
 
         let res = set_icc_regs(gic_fd.device_fd(), gicr_typer, &state);
         assert_eq!(
@@ -206,9 +206,6 @@ mod tests {
             format!("{:?}", res.unwrap_err()),
             "DeviceAttribute(Error(9), false, 6)"
         );
-
-        // dropping gic_fd would double close the gic fd, so leak it
-        std::mem::forget(gic_fd);
     }
 
     #[test]
