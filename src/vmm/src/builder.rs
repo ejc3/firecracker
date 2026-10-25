@@ -332,8 +332,9 @@ pub fn build_microvm_for_boot(
             // Kernels without KVM_CAP_COUNTER_OFFSET (< 6.4): keep the legacy
             // host-based counter view; pause/resume will not freeze the clock.
             Err(err) => {
-                log::warn!(
-                    "KVM_ARM_SET_COUNTER_OFFSET unavailable ({err}); guest clock                      will not freeze across pause/resume"
+                warn!(
+                    "KVM_ARM_SET_COUNTER_OFFSET unavailable ({err}); guest clock \
+                     will not freeze across pause/resume"
                 );
                 None
             }
@@ -531,8 +532,9 @@ pub fn build_microvm_from_snapshot(
                 match vm.set_counter_offset(offset) {
                     Ok(()) => Some(offset),
                     Err(err) => {
-                        log::warn!(
-                            "KVM_ARM_SET_COUNTER_OFFSET unavailable ({err}); restored                              guest timers keep the legacy time-jump behavior"
+                        warn!(
+                            "KVM_ARM_SET_COUNTER_OFFSET unavailable ({err}); restored \
+                             guest timers keep the legacy time-jump behavior"
                         );
                         None
                     }
@@ -541,8 +543,9 @@ pub fn build_microvm_from_snapshot(
             // Snapshot without a saved CNTPCT (foreign/ancient producer):
             // restore with legacy semantics rather than failing the restore.
             None => {
-                log::warn!(
-                    "snapshot has no saved CNTPCT_EL0; restored guest timers keep                      the legacy time-jump behavior"
+                warn!(
+                    "snapshot has no saved CNTPCT_EL0; restored guest timers keep \
+                     the legacy time-jump behavior"
                 );
                 None
             }
