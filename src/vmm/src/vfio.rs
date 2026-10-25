@@ -77,6 +77,8 @@ pub enum VfioError {
     SparseMmapAreaOutOfRange(u8, u64, u64, u64),
     /// BAR{0} sparse mmap area at gpa {1:#x} size {2:#x} overlaps MSI-X at gpa {3:#x} size {4:#x}
     SparseMmapAreaOverlapsMsixTable(u8, u64, u64, u64, u64),
+    /// Failed to fault in guest memory [{0:#x}..{1:#x}) before pinning it for DMA: {2}
+    PopulateGuestMemory(u64, u64, std::io::Error),
 }
 
 /// Each used BAR has exactly one emulated area covering the whole BAR.
@@ -1207,12 +1209,43 @@ pub fn vfio_dma_map_guest_memory(
                 iova,
                 iova + size as u64
             );
+            populate_for_dma(hva, size)
+                .map_err(|error| VfioError::PopulateGuestMemory(iova, iova + size as u64, error))?;
             // SAFETY: all arguments are from the existing guest memory region
             // After this operation, virtual memory will have pinned physical pages backing it
             unsafe { container.vfio_dma_map(iova, size, hva) }?;
         }
     }
     Ok(())
+}
+
+/// Fault every page of a guest memory region in, for writing, before the DMA map pins it.
+///
+/// `VFIO_IOMMU_MAP_DMA` pins the region with a long-term `pin_user_pages_remote`, whose page
+/// walk faults without `FAULT_FLAG_ALLOW_RETRY`. A page of memory registered with a
+/// userfaultfd whose handler has not filled it yet then cannot wait for the handler: the fault
+/// returns `VM_FAULT_SIGBUS` and the map fails with `EFAULT` ("Bad address"), which is how
+/// every passthrough restore over the `Uffd` memory backend failed. `MADV_POPULATE_WRITE`
+/// faults each page as a write from user space does, which waits for the handler, so the pin
+/// then finds every page present and writable. For a `File` backend's private mapping it does
+/// the copy-on-write the pin would do, and for anonymous memory the allocation, so it moves
+/// that work earlier without adding any.
+///
+/// A kernel older than 5.14 has no `MADV_POPULATE_WRITE` and answers `EINVAL`; the pin then
+/// faults the pages itself, as before, which works for every backend but `Uffd`.
+fn populate_for_dma(hva: *mut u8, size: usize) -> Result<(), std::io::Error> {
+    // SAFETY: `hva..hva + size` is one guest memory region mapped by this process; populating
+    // it changes no mapping, only which of its pages are resident.
+    let ret = unsafe { libc::madvise(hva.cast(), size, libc::MADV_POPULATE_WRITE) };
+    if ret == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EINVAL) {
+        warn!("MADV_POPULATE_WRITE is not supported; the DMA map faults guest memory itself");
+        return Ok(());
+    }
+    Err(error)
 }
 
 /// Create a VfioContainer wrapper around both KVM VFIO device and VFIO container
@@ -1237,6 +1270,84 @@ pub fn vfio_create_kvm_vfio_device_and_vfio_container(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The DMA map's pin cannot wait for a userfaultfd handler, so memory a handler fills
+    /// must be resident before it. `populate_for_dma` faults the region in the way user space
+    /// does: every page is served by the handler and holds what the handler put there.
+    #[test]
+    fn populate_for_dma_waits_for_a_userfaultfd_handler() {
+        const PAGES: usize = 64;
+        let page = host_page_size();
+        let size = PAGES * page;
+        // SAFETY: a fresh private anonymous mapping, unmapped at the end of the test.
+        let hva = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(hva, libc::MAP_FAILED);
+        // Kernel-mode faults (the populate's) reach the handler only without
+        // UFFD_USER_MODE_ONLY, as Firecracker creates its userfaultfd.
+        let uffd = userfaultfd::UffdBuilder::new()
+            .close_on_exec(true)
+            .non_blocking(false)
+            .user_mode_only(false)
+            .create()
+            .expect("creating a userfaultfd (needs vm.unprivileged_userfaultfd=1)");
+        uffd.register(hva, size).unwrap();
+        let base = hva as usize;
+        let handler = std::thread::spawn(move || {
+            let mut served = 0;
+            let mut source = vec![0u8; page];
+            while served < PAGES {
+                match uffd.read_event().unwrap() {
+                    Some(userfaultfd::Event::Pagefault { addr, .. }) => {
+                        let at = (addr as usize) & !(page - 1);
+                        source.fill(u8::try_from((at - base) / page + 1).unwrap());
+                        // SAFETY: `at` is a page of the registered region, `source` a page.
+                        unsafe {
+                            uffd.copy(source.as_ptr().cast(), at as *mut _, page, true)
+                                .unwrap();
+                        }
+                        served += 1;
+                    }
+                    other => panic!("unexpected userfaultfd event {other:?}"),
+                }
+            }
+            served
+        });
+        populate_for_dma(hva.cast(), size).expect("populating userfaultfd memory");
+        assert_eq!(handler.join().unwrap(), PAGES);
+        // SAFETY: the region is mapped and every page is now resident.
+        let bytes = unsafe { std::slice::from_raw_parts(hva.cast::<u8>(), size) };
+        for (index, chunk) in bytes.chunks(page).enumerate() {
+            let expected = u8::try_from(index + 1).unwrap();
+            assert!(chunk.iter().all(|&b| b == expected), "page {index}");
+        }
+        // SAFETY: unmapping the mapping made above.
+        unsafe { libc::munmap(hva, size) };
+    }
+
+    /// The pin runs only after the region it pins has been populated.
+    #[test]
+    fn the_dma_map_populates_guest_memory_before_it_pins_it() {
+        let code = include_str!("vfio.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let body = &code[code.find("pub fn vfio_dma_map_guest_memory(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let populate = body
+            .find("populate_for_dma(")
+            .expect("no populate before the map");
+        let map = body.find("container.vfio_dma_map(").unwrap();
+        assert!(populate < map);
+    }
     use crate::pci::configuration::BarPrefetchable;
 
     fn dummy_raw_bar_info(bar_value: u32, size: u64) -> VfioBarInfo {
