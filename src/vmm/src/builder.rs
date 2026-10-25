@@ -952,7 +952,7 @@ pub(crate) mod tests {
             vm: Vm::Kvm(Arc::new(vm)),
             device_manager: default_device_manager(),
             #[cfg(target_arch = "aarch64")]
-            counter_offset: 0,
+            counter_offset: None,
             #[cfg(target_arch = "aarch64")]
             paused_at_counter: None,
         }
