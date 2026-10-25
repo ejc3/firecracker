@@ -263,15 +263,12 @@ mod tests {
         let gic = create_gic(&vm, 1, Some(GICVersion::GICV3)).expect("Cannot create gic");
         save_pending_tables(gic.device_fd()).unwrap();
 
-        unsafe { libc::close(gic.device_fd().as_raw_fd()) };
+        crate::test_utils::make_fd_return_ebadf(gic.device_fd().as_raw_fd());
 
         let res = save_pending_tables(gic.device_fd());
         assert_eq!(
             format!("{:?}", res.unwrap_err()),
             "DeviceAttribute(Error(9), true, 4)"
         );
-
-        // dropping gic_fd would double close the gic fd, so leak it
-        std::mem::forget(gic);
     }
 }

@@ -155,15 +155,12 @@ mod tests {
         let res = set_dist_regs(gic_fd.device_fd(), &state);
         res.unwrap();
 
-        unsafe { libc::close(gic_fd.device_fd().as_raw_fd()) };
+        crate::test_utils::make_fd_return_ebadf(gic_fd.device_fd().as_raw_fd());
 
         let res = get_dist_regs(gic_fd.device_fd());
         assert_eq!(
             format!("{:?}", res.unwrap_err()),
             "DeviceAttribute(Error(9), false, 1)"
         );
-
-        // dropping gic_fd would double close the gic fd, so leak it
-        std::mem::forget(gic_fd);
     }
 }

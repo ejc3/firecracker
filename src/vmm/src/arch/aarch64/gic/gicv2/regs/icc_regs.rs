@@ -107,7 +107,7 @@ mod tests {
 
         set_icc_regs(gic_fd.device_fd(), cpu_id, &state).unwrap();
 
-        unsafe { libc::close(gic_fd.device_fd().as_raw_fd()) };
+        crate::test_utils::make_fd_return_ebadf(gic_fd.device_fd().as_raw_fd());
 
         let res = set_icc_regs(gic_fd.device_fd(), cpu_id, &state);
         assert_eq!(
@@ -120,8 +120,5 @@ mod tests {
             format!("{:?}", res.unwrap_err()),
             "DeviceAttribute(Error(9), false, 2)"
         );
-
-        // dropping gic_fd would double close the gic fd, so leak it
-        std::mem::forget(gic_fd);
     }
 }
