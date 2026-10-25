@@ -588,9 +588,6 @@ impl KvmVm {
         // Determine what size our total memory area is.
         let mem_size_mib = mem_size_mib(self.guest_memory());
         let expected_size = mem_size_mib * 1024 * 1024;
-        // Whether the file may hold data under a page the dump does not write.
-        let mut file_holds_data = false;
-
         if file_existed {
             let file_size = file
                 .metadata()
@@ -607,10 +604,17 @@ impl KvmVm {
             if file_size != expected_size {
                 file.set_len(0)
                     .map_err(|err| MemoryBackingFile("truncate", err))?;
-            } else {
-                file_holds_data = file_size > 0;
             }
         }
+
+        // Whether the file may hold data under a page the dump does not write. Read from the open
+        // descriptor, not from `file_existed`: a file created at this path after that check is
+        // not truncated above.
+        let file_holds_data = file
+            .metadata()
+            .map_err(|e| MemoryBackingFile("get_metadata", e))?
+            .len()
+            > 0;
 
         // Set the length of the file to the full size of the memory area.
         file.set_len(expected_size)

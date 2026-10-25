@@ -1408,13 +1408,36 @@ mod tests {
     #[test]
     fn test_dump_skipping_absent_pages_reads_file_backed_regions() {
         // A page of a file-backed region that the VMM never touched reads as the file's data, so
-        // AbsentPages::Skip must not leave it as a hole.
+        // AbsentPages::Skip must not leave it as a hole. The file's pages are dropped from the
+        // page cache first, so neither pagemap nor mincore reports them, and only the region's
+        // file backing keeps the dump from skipping them.
         let page_size = host_page_size();
         let region_size = page_size * 4;
         let mut source = TempFile::new().unwrap().into_file();
         source.write_all(&vec![0x77u8; region_size]).unwrap();
+        source.sync_all().unwrap();
+        let ret = unsafe {
+            libc::posix_fadvise(
+                std::os::fd::AsRawFd::as_raw_fd(&source),
+                0,
+                0,
+                libc::POSIX_FADV_DONTNEED,
+            )
+        };
+        assert_eq!(ret, 0);
         let guest_memory = into_region_ext(
             snapshot_file(source, [(GuestAddress(0), region_size)].into_iter(), false).unwrap(),
+        );
+        let host = guest_memory.get_host_address(GuestAddress(0)).unwrap();
+        let mut resident = vec![0u8; 4];
+        assert_eq!(
+            unsafe { libc::mincore(host.cast(), region_size, resident.as_mut_ptr()) },
+            0
+        );
+        assert!(
+            resident.iter().all(|r| r & 1 == 0),
+            "test setup: the file's pages must not be in the page cache ({resident:?}); is the \
+             temporary directory on tmpfs?"
         );
 
         let mut memory_file = TempFile::new().unwrap().into_file();
@@ -1425,7 +1448,11 @@ mod tests {
         let mut dumped = Vec::new();
         memory_file.rewind().unwrap();
         memory_file.read_to_end(&mut dumped).unwrap();
-        assert_eq!(dumped, vec![0x77u8; region_size]);
+        assert!(
+            dumped == vec![0x77u8; region_size],
+            "the dump left {} of {region_size} bytes of the file-backed region as holes",
+            region_size - dumped.len().min(region_size)
+        );
     }
 
     #[test]
