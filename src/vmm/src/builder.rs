@@ -1125,7 +1125,7 @@ pub(crate) mod tests {
             device_manager: default_device_manager(),
             can_create_diff_snapshots: true,
             #[cfg(target_arch = "aarch64")]
-            counter_offset: 0,
+            counter_offset: None,
             #[cfg(target_arch = "aarch64")]
             paused_at_counter: None,
         }
