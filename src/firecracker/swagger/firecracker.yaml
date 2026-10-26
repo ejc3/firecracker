@@ -376,7 +376,10 @@ paths:
         Detaches the passthrough device with ID specified by id parameter. The guest is
         not notified; it must remove the device itself first (on Linux, by writing 1 to
         /sys/bus/pci/devices/<address>/remove). A VM whose passthrough devices are all
-        detached can be snapshotted.
+        detached can be snapshotted. The device is reset but its VFIO device stays open,
+        so guest memory stays pinned and mapped for DMA and the host device stays held by
+        this Firecracker process; attaching the same device again reuses both. Both are
+        released when the VM exits.
       operationId: deleteGuestDevicePassthroughByID
       parameters:
         - name: id

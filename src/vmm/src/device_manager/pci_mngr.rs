@@ -38,8 +38,8 @@ use crate::pci::bus::PciRootError;
 use crate::resources::VmResources;
 use crate::snapshot::Persist;
 use crate::vfio::{
-    VfioContainer, VfioDevice, VfioError, vfio_create_kvm_vfio_device_and_vfio_container,
-    vfio_dma_map_guest_memory,
+    KeptVfioDevice, VfioContainer, VfioDevice, VfioError,
+    vfio_create_kvm_vfio_device_and_vfio_container, vfio_dma_map_guest_memory,
 };
 use crate::vmm_config::device_passthrough::DevicePassthroughConfig;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
@@ -56,6 +56,10 @@ pub struct PciDevices {
 
     // All VFIO PCI devices
     pub vfio_devices: Vec<Arc<Mutex<VfioDevice>>>,
+    /// Passthrough devices detached from the guest and kept open, so that their groups, and the
+    /// container's DMA mappings of guest memory, stay in place for the next attach of the same
+    /// device (see [`KeptVfioDevice`]).
+    kept_vfio_devices: Vec<KeptVfioDevice>,
     // Rust drops items in declaration order, so make sure the `container` is dropped after all vfio
     // devices
     vfio_container: Option<Arc<VfioContainer>>,
@@ -67,6 +71,7 @@ impl std::fmt::Debug for PciDevices {
             .field("pci_segment", &self.pci_segment)
             .field("virtio_devices", &self.virtio_devices)
             .field("vfio_devices", &self.vfio_devices)
+            .field("kept_vfio_devices", &self.kept_vfio_devices)
             .finish()
     }
 }
@@ -99,6 +104,7 @@ impl PciDevices {
             pci_segment,
             virtio_devices: HashMap::new(),
             vfio_devices: Vec::new(),
+            kept_vfio_devices: Vec::new(),
             vfio_container: None,
         })
     }
@@ -261,11 +267,25 @@ impl PciDevices {
         let pci_device_bdf = self.pci_segment.next_device_sbdf()?;
         debug!("VFIO: Allocating BDF: {pci_device_bdf:?} for device");
 
+        let kept = self
+            .kept_vfio_devices
+            .iter()
+            .position(|kept| kept.host_sbdf == config.sbdf)
+            .map(|index| self.kept_vfio_devices.swap_remove(index));
         let device = if let Some(container) = &self.vfio_container {
-            VfioDevice::new(container, vm, config, pci_device_bdf)?
+            // The container already maps guest memory: it holds the group of an attached or a
+            // kept device.
+            let device = VfioDevice::new(container, vm, config, pci_device_bdf, kept);
+            if device.is_err() {
+                // A failed attach closed the kept device it was given, which may have taken the
+                // container's last group, and with it the container's mappings.
+                self.release_unused_container();
+            }
+            device?
         } else {
+            assert!(kept.is_none());
             let container = vfio_create_kvm_vfio_device_and_vfio_container(vm.as_ref())?;
-            let device = VfioDevice::new(&container, vm, config, pci_device_bdf)?;
+            let device = VfioDevice::new(&container, vm, config, pci_device_bdf, None)?;
             vfio_dma_map_guest_memory(&container, vm.guest_memory())?;
             self.vfio_container = Some(container);
             device
@@ -302,10 +322,11 @@ impl PciDevices {
     ///
     /// The guest is not told: it must have removed the device itself (for Linux,
     /// `echo 1 > /sys/bus/pci/devices/<addr>/remove`) and must not touch its BARs again.
-    /// The device is reset, its BAR mappings and MSI-X routes are removed, its group leaves
-    /// the container and the KVM VFIO device, and its PCI slot is freed. When it was the last
-    /// one, the container is dropped too, which unpins guest memory; a later attach creates a
-    /// new container and maps guest memory again.
+    /// The device's MSI-X is disabled and it is reset, its BAR mappings and MSI-X routes are
+    /// removed, and its PCI slot is freed. Its VFIO device stays open (see [`KeptVfioDevice`]),
+    /// so its group stays in the container and the KVM VFIO device, and guest memory stays
+    /// pinned and mapped for DMA. A later attach of the same device reuses both; they are
+    /// released when the VM exits.
     pub fn detach_vfio_device(&mut self, vm: &KvmVm, id: &str) -> Result<bool, PciManagerError> {
         let Some(index) = self
             .vfio_devices
@@ -331,14 +352,26 @@ impl PciDevices {
         }
 
         // The buses held the only other references; dropping this one runs the teardown
-        // (VfioDevice::drop, then the vfio-ioctls device and group drops).
+        // (VfioDevice::drop). The kept handle holds the vfio-ioctls device open.
         assert_eq!(Arc::strong_count(&device), 1);
+        let kept = device.lock().expect("Poisoned lock").keep_open();
         drop(device);
+        self.kept_vfio_devices.push(kept);
+        Ok(true)
+    }
 
-        if self.vfio_devices.is_empty() {
+    /// Whether the VFIO container exists, so guest memory is pinned and mapped for DMA. It
+    /// stays while any passthrough device is attached or kept open after a detach.
+    pub fn has_vfio_dma_mappings(&self) -> bool {
+        self.vfio_container.is_some()
+    }
+
+    /// Drop the container once no attached or kept device holds a group in it: from then on
+    /// it maps nothing, and the next attach must create one and map guest memory again.
+    fn release_unused_container(&mut self) {
+        if self.vfio_devices.is_empty() && self.kept_vfio_devices.is_empty() {
             self.vfio_container = None;
         }
-        Ok(true)
     }
 
     fn restore_pci_device<T: 'static + VirtioDevice + MutEventSubscriber + Debug>(
