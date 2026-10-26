@@ -27,6 +27,7 @@ use crate::cpu_config::x86_64::cpuid::CpuidTrait;
 #[cfg(target_arch = "x86_64")]
 use crate::cpu_config::x86_64::cpuid::common::get_vendor_id_from_host;
 use crate::device_manager::{DevicePersistError, DevicesState};
+use crate::devices::virtio::block::persist::BlockState;
 // Re-exported so external crates inspecting a `MicrovmState` snapshot can match on the
 // serialised virtio transport variant.
 pub use crate::device_manager::VirtioDevicesState;
@@ -38,7 +39,9 @@ use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, DriveOverride, LoadSnapshotParams, MemBackendType,
+};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
     self, BackingFileSystem, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
@@ -452,6 +455,11 @@ pub fn restore_from_snapshot(
             .ok_or(SnapshotStateFromFileError::UnknownNetworkDevice)?;
     }
 
+    apply_drive_overrides(
+        &mut microvm_state.device_states.virtio_state,
+        &params.drive_overrides,
+    )?;
+
     if let Some(vsock_override) = &params.vsock_override {
         // There should only ever be at most one vsock device, therefore this
         // should correctly find it and modify the path if such a device exists.
@@ -548,6 +556,38 @@ pub fn restore_from_snapshot(
     .map_err(RestoreFromSnapshotError::Build)
 }
 
+/// Point each overridden virtio block device at its override's host file, so the
+/// restore opens that file instead of the one the snapshot names.
+fn apply_drive_overrides(
+    virtio_state: &mut VirtioDevicesState,
+    overrides: &[DriveOverride],
+) -> Result<(), SnapshotStateFromFileError> {
+    for entry in overrides {
+        let mut states: Box<dyn Iterator<Item = &mut BlockState>> = match virtio_state {
+            VirtioDevicesState::Mmio(mmio_state) => Box::new(
+                mmio_state
+                    .block_devices
+                    .iter_mut()
+                    .map(|device| &mut device.device_state),
+            ),
+            VirtioDevicesState::Pci(pci_state) => Box::new(
+                pci_state
+                    .block_devices
+                    .iter_mut()
+                    .map(|device| &mut device.device_state),
+            ),
+        };
+        let state = states
+            .find_map(|state| match state {
+                BlockState::Virtio(state) if state.id() == entry.drive_id => Some(state),
+                _ => None,
+            })
+            .ok_or(SnapshotStateFromFileError::UnknownBlockDevice)?;
+        state.set_disk_path(&entry.path_on_host);
+    }
+    Ok(())
+}
+
 /// Error type for [`snapshot_state_from_file`]
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum SnapshotStateFromFileError {
@@ -559,6 +599,8 @@ pub enum SnapshotStateFromFileError {
     UnknownNetworkDevice,
     /// Unknown Vsock Device.
     UnknownVsockDevice,
+    /// Unknown Block Device.
+    UnknownBlockDevice,
 }
 
 fn snapshot_state_from_file(
@@ -1147,6 +1189,58 @@ mod tests {
         insert_vmclock_device(&mut vmm);
 
         vmm
+    }
+
+    #[test]
+    fn test_drive_overrides_retarget_only_the_named_drive() {
+        let mut event_manager = EventManager::new().expect("Cannot create EventManager");
+        let mut vmm = default_vmm();
+        let mut cmdline = default_kernel_cmdline();
+        let block_configs = vec![CustomBlockConfig::new(
+            String::from("root"),
+            true,
+            None,
+            true,
+            CacheType::Unsafe,
+        )];
+        insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
+        let mut virtio_state = vmm.device_manager.save().virtio_state;
+        let disk_path = |state: &VirtioDevicesState| {
+            let VirtioDevicesState::Mmio(mmio_state) = state else {
+                panic!("expected MMIO virtio device state");
+            };
+            match &mmio_state.block_devices[0].device_state {
+                BlockState::Virtio(state) => state.disk_path().to_owned(),
+                BlockState::VhostUser(_) => panic!("expected a virtio block device"),
+            }
+        };
+        let saved = disk_path(&virtio_state);
+
+        apply_drive_overrides(&mut virtio_state, &[]).unwrap();
+        assert_eq!(disk_path(&virtio_state), saved);
+
+        let unknown = apply_drive_overrides(
+            &mut virtio_state,
+            &[DriveOverride {
+                drive_id: String::from("data"),
+                path_on_host: String::from("/clone/data.raw"),
+            }],
+        );
+        assert!(matches!(
+            unknown,
+            Err(SnapshotStateFromFileError::UnknownBlockDevice)
+        ));
+        assert_eq!(disk_path(&virtio_state), saved);
+
+        apply_drive_overrides(
+            &mut virtio_state,
+            &[DriveOverride {
+                drive_id: String::from("root"),
+                path_on_host: String::from("/clone/rootfs.raw"),
+            }],
+        )
+        .unwrap();
+        assert_eq!(disk_path(&virtio_state), "/clone/rootfs.raw");
     }
 
     #[test]

@@ -110,6 +110,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
             || snapshot_config.track_dirty_pages,
         resume_vm: snapshot_config.resume_vm,
         network_overrides: snapshot_config.network_overrides,
+        drive_overrides: snapshot_config.drive_overrides,
         vsock_override: snapshot_config.vsock_override,
         clock_realtime: snapshot_config.clock_realtime,
         huge_pages: snapshot_config.huge_pages,
@@ -129,7 +130,8 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
 #[cfg(test)]
 mod tests {
     use vmm::vmm_config::snapshot::{
-        MemBackendConfig, MemBackendType, NetworkOverride, SnapshotLoadHugePageConfig,
+        DriveOverride, MemBackendConfig, MemBackendType, NetworkOverride,
+        SnapshotLoadHugePageConfig,
     };
 
     use super::*;
@@ -212,6 +214,7 @@ mod tests {
             track_dirty_pages: false,
             resume_vm: false,
             network_overrides: vec![],
+            drive_overrides: vec![],
             vsock_override: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Hugetlbfs2M,
@@ -245,6 +248,7 @@ mod tests {
             track_dirty_pages: false,
             resume_vm: true,
             network_overrides: vec![],
+            drive_overrides: vec![],
             vsock_override: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
@@ -278,6 +282,7 @@ mod tests {
             track_dirty_pages: true,
             resume_vm: false,
             network_overrides: vec![],
+            drive_overrides: vec![],
             vsock_override: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
@@ -312,6 +317,7 @@ mod tests {
             track_dirty_pages: false,
             resume_vm: true,
             network_overrides: vec![],
+            drive_overrides: vec![],
             vsock_override: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
@@ -354,6 +360,7 @@ mod tests {
                 iface_id: String::from("eth0"),
                 host_dev_name: String::from("vmtap2"),
             }],
+            drive_overrides: vec![],
             vsock_override: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
@@ -372,6 +379,58 @@ mod tests {
 
         let body = r#"{
             "snapshot_path": "foo",
+            "mem_backend": {
+                "backend_path": "bar",
+                "backend_type": "File"
+            },
+            "drive_overrides": [
+                {
+                    "drive_id": "rootfs",
+                    "path_on_host": "/clone/rootfs.raw"
+                }
+            ]
+        }"#;
+        let expected_config = LoadSnapshotParams {
+            snapshot_path: PathBuf::from("foo"),
+            mem_backend: MemBackendConfig {
+                backend_path: PathBuf::from("bar"),
+                backend_type: MemBackendType::File,
+            },
+            track_dirty_pages: false,
+            resume_vm: false,
+            network_overrides: vec![],
+            drive_overrides: vec![DriveOverride {
+                drive_id: String::from("rootfs"),
+                path_on_host: String::from("/clone/rootfs.raw"),
+            }],
+            vsock_override: None,
+            clock_realtime: false,
+            huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+        };
+        let parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+        assert_eq!(
+            vmm_action_from_request(parsed_request),
+            VmmAction::LoadSnapshot(expected_config)
+        );
+
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_backend": {
+                "backend_path": "bar",
+                "backend_type": "File"
+            },
+            "drive_overrides": [
+                {
+                    "drive_id": "rootfs",
+                    "path_on_host": "/clone/rootfs.raw",
+                    "is_read_only": true
+                }
+            ]
+        }"#;
+        parse_put_snapshot(&Body::new(body), Some("load")).unwrap_err();
+
+        let body = r#"{
+            "snapshot_path": "foo",
             "mem_file_path": "bar",
             "resume_vm": true
         }"#;
@@ -384,6 +443,7 @@ mod tests {
             track_dirty_pages: false,
             resume_vm: true,
             network_overrides: vec![],
+            drive_overrides: vec![],
             vsock_override: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,

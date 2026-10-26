@@ -1713,6 +1713,25 @@ definitions:
         type: string
         description:
           The new host device of the interface
+  DriveOverride:
+    type: object
+    description:
+      Allows for changing the host file of a block device during snapshot
+      restore.
+    required:
+      - drive_id
+      - path_on_host
+    properties:
+      drive_id:
+        type: string
+        description:
+          The id of the drive to modify
+      path_on_host:
+        type: string
+        description:
+          The host file the drive is opened from instead of the one the
+          snapshot names
+
   VsockOverride:
     type: object
     description:
@@ -1766,6 +1785,14 @@ definitions:
         description: Network host device names to override
         items:
           $ref: "#/definitions/NetworkOverride"
+      drive_overrides:
+        type: array
+        description:
+          Host files to open block devices from instead of the ones the snapshot
+          names. The load opens each drive at its override, so the file the
+          snapshot names need not exist.
+        items:
+          $ref: "#/definitions/DriveOverride"
       vsock_override:
         $ref: "#/definitions/VsockOverride"
         description:

@@ -66,6 +66,23 @@ pub struct VirtioBlockState {
     discard_sector_alignment: u32,
 }
 
+impl VirtioBlockState {
+    /// The drive id the device was configured with.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The host file the device was saved with.
+    pub fn disk_path(&self) -> &str {
+        &self.disk_path
+    }
+
+    /// Restore the device from `path` instead of the host file it was saved with.
+    pub fn set_disk_path(&mut self, path: &str) {
+        path.clone_into(&mut self.disk_path);
+    }
+}
+
 impl Persist<'_> for VirtioBlock {
     type State = VirtioBlockState;
     type ConstructorArgs = BlockConstructorArgs;
