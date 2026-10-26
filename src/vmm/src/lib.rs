@@ -155,6 +155,7 @@ use crate::rpc_interface::VmmActionError;
 use crate::vmm_config::HotplugDeviceConfig;
 use crate::vmm_config::balloon::BalloonDeviceConfig;
 use crate::vmm_config::boot_source::BootSourceConfig;
+use crate::vmm_config::device_passthrough::DevicePassthroughConfig;
 use crate::vmm_config::entropy::EntropyDeviceConfig;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfig;
@@ -735,6 +736,35 @@ impl Vmm {
             .clone();
         self.device_manager
             .hotplug_device(kvm_vm, config, event_manager)
+    }
+
+    /// Attaches a passthrough device to the running (or paused) VM. The guest is not told;
+    /// it finds the device when it rescans its PCI bus.
+    pub fn hotplug_passthrough_device(
+        &mut self,
+        config: DevicePassthroughConfig,
+    ) -> Result<(), VmmActionError> {
+        log_dev_preview_warning("PCI passthrough device hotplug", None);
+        let kvm_vm = self
+            .vm
+            .as_kvm()
+            .ok_or_else(|| VmmActionError::NotSupported("Operation requires KVM".to_string()))?
+            .clone();
+        self.device_manager
+            .attach_passthrough_device(&kvm_vm, config)
+            .map_err(VmmActionError::PassthroughAttach)
+    }
+
+    /// Detaches a passthrough device from the running (or paused) VM. The guest must have
+    /// removed the device first: nothing tells it the device went away.
+    pub fn hot_unplug_passthrough_device(&mut self, id: &str) -> Result<(), VmmActionError> {
+        log_dev_preview_warning("PCI passthrough device hot-unplug", None);
+        let kvm_vm = self
+            .vm
+            .as_kvm()
+            .ok_or_else(|| VmmActionError::NotSupported("Operation requires KVM".to_string()))?
+            .clone();
+        self.device_manager.detach_passthrough_device(&kvm_vm, id)
     }
 
     /// Detaches a device after VM start
