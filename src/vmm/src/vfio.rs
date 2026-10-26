@@ -169,7 +169,9 @@ pub struct VfioDevice {
     pub config: DevicePassthroughConfig,
     /// SBDF of the device in the configuration space
     pub sbdf: PciSBDF,
-    device: InternalVfioDevice,
+    /// The open VFIO device. Shared only with a [`KeptVfioDevice`] taken by
+    /// [`VfioDevice::keep_open`], which keeps it open after this is dropped.
+    device: Arc<InternalVfioDevice>,
     bars: VfioBars,
     bar_mappings: Vec<VfioBarMapping>,
     /// Areas of the BARs which are emulated instead of being mapped into the guest.
@@ -188,15 +190,51 @@ impl std::fmt::Debug for VfioDevice {
     }
 }
 
+/// A passthrough device detached from the guest whose VFIO device stays open.
+///
+/// While it is open its IOMMU group stays in the VFIO container, so the container keeps its
+/// DMA mappings of guest memory. Without it, the last group leaving the container unmaps and
+/// unpins all of guest memory, and an SMMUv3 without range invalidation (Graviton2) invalidates
+/// its IOTLB one 4 KiB page per command: 9.5 s for a 6 GiB guest, measured with bpftrace on a
+/// g5g.metal (`vfio_unmap_unpin`, 24,738 command lists). A later attach then had to fault in and
+/// pin all of guest memory again.
+pub struct KeptVfioDevice {
+    /// The host address of the device.
+    pub host_sbdf: PciSBDF,
+    device: Arc<InternalVfioDevice>,
+}
+
+impl std::fmt::Debug for KeptVfioDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeptVfioDevice")
+            .field("host_sbdf", &self.host_sbdf)
+            .finish()
+    }
+}
+
 impl VfioDevice {
-    /// Create new VfioDevice
+    /// Create new VfioDevice. With `kept`, the device it names is reused, already open,
+    /// instead of being opened again; it must be the device `config.sbdf` names.
     pub fn new(
         container: &Arc<VfioContainer>,
         vm: &Arc<KvmVm>,
         config: DevicePassthroughConfig,
         sbdf: PciSBDF,
+        kept: Option<KeptVfioDevice>,
     ) -> Result<VfioDevice, VfioError> {
-        vfio_init_device(container, vm, config, sbdf)
+        if let Some(kept) = &kept {
+            assert_eq!(kept.host_sbdf, config.sbdf);
+        }
+        vfio_init_device(container, vm, config, sbdf, kept.map(|kept| kept.device))
+    }
+
+    /// A handle that keeps this device's VFIO device open after this is dropped, which
+    /// leaves its group, and the container's DMA mappings, in place (see [`KeptVfioDevice`]).
+    pub fn keep_open(&self) -> KeptVfioDevice {
+        KeptVfioDevice {
+            host_sbdf: self.config.sbdf,
+            device: self.device.clone(),
+        }
     }
 }
 
@@ -1072,6 +1110,7 @@ fn vfio_init_device(
     vm: &Arc<KvmVm>,
     config: DevicePassthroughConfig,
     sbdf: PciSBDF,
+    kept: Option<Arc<InternalVfioDevice>>,
 ) -> Result<VfioDevice, VfioError> {
     let sysfs_path = format!(
         "/sys/bus/pci/devices/{:04x}:{:02x}:{:02x}.{:x}",
@@ -1080,12 +1119,19 @@ fn vfio_init_device(
         config.sbdf.device(),
         config.sbdf.function()
     );
-    debug!("Opening device at path: {}", sysfs_path);
-
-    let device = InternalVfioDevice::new(
-        Path::new(&sysfs_path),
-        container.clone() as Arc<dyn vfio_ioctls::VfioOps>,
-    )?;
+    let device = match kept {
+        Some(device) => {
+            debug!("Reusing the open device at path: {}", sysfs_path);
+            device
+        }
+        None => {
+            debug!("Opening device at path: {}", sysfs_path);
+            Arc::new(InternalVfioDevice::new(
+                Path::new(&sysfs_path),
+                container.clone() as Arc<dyn vfio_ioctls::VfioOps>,
+            )?)
+        }
+    };
     device.reset();
 
     let Some(msix_irq_info) = device.get_irq_info(VFIO_PCI_MSIX_IRQ_INDEX) else {
@@ -1182,8 +1228,33 @@ fn vfio_init_device(
     Ok(vfio_device)
 }
 
+/// Offset of the Command register in PCI configuration space.
+const PCI_COMMAND_OFFSET: u64 = 0x04;
+/// Bus Master Enable in the Command register: the device may issue DMA.
+const PCI_COMMAND_BUS_MASTER: u16 = 1 << 2;
+
 /// Performs device teardown.
 fn vfio_deinit_device(device: &VfioDevice) {
+    // A VFIO device kept open after a detach is not disabled by the kernel, which closing it
+    // would do (vfio_pci_core_disable clears bus mastering). The reset does not cover that:
+    // vfio-ioctls skips it for a device without a reset method and ignores its failure. So
+    // stop the device's DMA here, whatever the reset does.
+    let mut command = [0u8; 2];
+    device.device.region_read(
+        VFIO_PCI_CONFIG_REGION_INDEX,
+        &mut command,
+        PCI_COMMAND_OFFSET,
+    );
+    let command = u16::from_le_bytes(command) & !PCI_COMMAND_BUS_MASTER;
+    device.device.region_write(
+        VFIO_PCI_CONFIG_REGION_INDEX,
+        &command.to_le_bytes(),
+        PCI_COMMAND_OFFSET,
+    );
+    // The MSI-X vectors go with this device; a VFIO device kept open must not signal them.
+    if let Err(err) = device.device.disable_msix() {
+        error!("Error on disabling MSI-X of a VFIO device: {err:?}");
+    }
     device.device.reset();
 
     for mapping in device.bar_mappings.iter() {

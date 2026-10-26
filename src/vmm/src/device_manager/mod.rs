@@ -562,7 +562,7 @@ impl DeviceManager {
         };
         if let Some(err) = passthrough_err
             && let Some(pci_devices) = self.pci_devices()
-            && !pci_devices.vfio_devices.is_empty()
+            && pci_devices.has_vfio_dma_mappings()
         {
             return Err(VmmActionError::IncompatibleDeviceConfiguration(err));
         }
