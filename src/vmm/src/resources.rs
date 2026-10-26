@@ -21,6 +21,9 @@ use crate::vmm_config::balloon::*;
 use crate::vmm_config::boot_source::{
     BootConfig, BootSource, BootSourceConfig, BootSourceConfigError,
 };
+use crate::vmm_config::device_passthrough::{
+    DevicePassthroughConfig, DevicePassthroughConfigError, DevicePassthroughConfigs,
+};
 use crate::vmm_config::drive::*;
 use crate::vmm_config::entropy::*;
 use crate::vmm_config::instance_info::InstanceInfo;
@@ -68,6 +71,16 @@ pub enum ResourcesError {
     PmemConfig(#[from] PmemConfigError),
     /// Memory hotplug config error: {0}
     MemoryHotplugConfig(#[from] MemoryHotplugConfigError),
+    /// Device passthrough config error: {0}
+    DevicePassthroughConfig(#[from] DevicePassthroughConfigError),
+    /// Passthrough devices attached, but PCI disabled
+    DevicePassthroughWithoutPci,
+    /// Passthrough devices are not compatible with memory hot-plugging device
+    DevicePassthroughWithMemHotplug,
+    /// Passthrough devices are not compatible with memory balloon device
+    DevicePassthroughWithBalloon,
+    /// Passthrough devices are not compatible with pmem device
+    DevicePassthroughWithPmem,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
@@ -100,6 +113,8 @@ pub struct VmmConfig {
     #[serde(skip)]
     pub serial_config: Option<SerialConfig>,
     pub memory_hotplug: Option<MemoryHotplugConfig>,
+    #[serde(default)]
+    pub device_passthrough: Vec<DevicePassthroughConfig>,
 }
 
 /// A data structure that encapsulates the device configurations
@@ -138,6 +153,8 @@ pub struct VmResources {
     pub serial_out_path: Option<PathBuf>,
     /// Optional rate limiter config for serial output.
     pub serial_rate_limiter_cfg: Option<TokenBucketConfig>,
+    /// Device passthrough configuration.
+    pub device_passthrough: DevicePassthroughConfigs,
 }
 
 impl VmResources {
@@ -239,7 +256,60 @@ impl VmResources {
             resources.set_memory_hotplug_config(memory_hotplug_config)?;
         }
 
+        for config in vmm_config.device_passthrough {
+            resources.device_passthrough.add(config)?;
+        }
+
         Ok(resources)
+    }
+
+    /// Validate the VM configuration for incompatibilities
+    pub fn validate(&self) -> Result<(), ResourcesError> {
+        if !self.device_passthrough.configs.is_empty() {
+            self.compatible_with_passthrough_device()?;
+        }
+        Ok(())
+    }
+
+    /// Check if current config is compatible with adding a balloon device
+    pub fn compatible_with_balloon(&self) -> Result<(), ResourcesError> {
+        if !self.device_passthrough.configs.is_empty() {
+            return Err(ResourcesError::DevicePassthroughWithBalloon);
+        }
+        Ok(())
+    }
+
+    /// Check if current config is compatible with adding a memory hotplug device
+    pub fn compatible_with_memory_hotplug(&self) -> Result<(), ResourcesError> {
+        if !self.device_passthrough.configs.is_empty() {
+            return Err(ResourcesError::DevicePassthroughWithMemHotplug);
+        }
+        Ok(())
+    }
+
+    /// Check if current config is compatible with adding a pmem device
+    pub fn compatible_with_pmem(&self) -> Result<(), ResourcesError> {
+        if !self.device_passthrough.configs.is_empty() {
+            return Err(ResourcesError::DevicePassthroughWithPmem);
+        }
+        Ok(())
+    }
+
+    /// Check if current config is compatible with adding a passthrough device
+    pub fn compatible_with_passthrough_device(&self) -> Result<(), ResourcesError> {
+        if !self.pci_enabled {
+            return Err(ResourcesError::DevicePassthroughWithoutPci);
+        }
+        if self.memory_hotplug.is_some() {
+            return Err(ResourcesError::DevicePassthroughWithMemHotplug);
+        }
+        if self.balloon.get().is_some() {
+            return Err(ResourcesError::DevicePassthroughWithBalloon);
+        }
+        if !self.pmem.configs.is_empty() {
+            return Err(ResourcesError::DevicePassthroughWithPmem);
+        }
+        Ok(())
     }
 
     /// If not initialised, create the mmds data store with the default config.
@@ -533,6 +603,14 @@ impl VmResources {
             .pop()
             .unwrap())
     }
+
+    /// Adds a passthrough device configuration.
+    pub fn set_passthrough_device(
+        &mut self,
+        config: DevicePassthroughConfig,
+    ) -> Result<(), DevicePassthroughConfigError> {
+        self.device_passthrough.add(config)
+    }
 }
 
 impl From<&VmResources> for VmmConfig {
@@ -553,6 +631,7 @@ impl From<&VmResources> for VmmConfig {
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots.
             serial_config: None,
             memory_hotplug: resources.memory_hotplug.clone(),
+            device_passthrough: resources.device_passthrough.configs.clone(),
         }
     }
 }
@@ -669,6 +748,7 @@ mod tests {
             serial_out_path: None,
             serial_rate_limiter_cfg: None,
             memory_hotplug: Default::default(),
+            device_passthrough: Default::default(),
         }
     }
 

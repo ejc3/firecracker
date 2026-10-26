@@ -30,8 +30,9 @@ use crate::device_manager::{DevicePersistError, DevicesState};
 use crate::devices::virtio::block::persist::BlockState;
 // Re-exported so external crates inspecting a `MicrovmState` snapshot can match on the
 // serialised virtio transport variant.
+pub use crate::device_manager::PassthroughAttachError;
 pub use crate::device_manager::VirtioDevicesState;
-use crate::logger::{info, warn};
+use crate::logger::{info, log_dev_preview_warning, warn};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Snapshot;
@@ -414,6 +415,10 @@ pub enum RestoreFromSnapshotError {
     GuestMemory(#[from] RestoreFromSnapshotGuestMemoryError),
     /// Failed to build microVM from snapshot: {0}
     Build(#[from] BuildMicrovmFromSnapshotError),
+    /// Device passthrough on restore requires a KVM VM
+    DevicePassthroughRequiresKvm,
+    /// Failed to attach a passthrough device on restore: {0}
+    DevicePassthrough(#[from] PassthroughAttachError),
 }
 /// Sub-Error type for [`restore_from_snapshot`] to contain either [`GuestMemoryFromFileError`] or
 /// [`GuestMemoryFromUffdError`] within [`RestoreFromSnapshotError`].
@@ -543,7 +548,7 @@ pub fn restore_from_snapshot(
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
     };
-    builder::build_microvm_from_snapshot(
+    let vmm = builder::build_microvm_from_snapshot(
         instance_info,
         event_manager,
         microvm_state,
@@ -553,7 +558,25 @@ pub fn restore_from_snapshot(
         vm_resources,
         params.clock_realtime,
     )
-    .map_err(RestoreFromSnapshotError::Build)
+    .map_err(RestoreFromSnapshotError::Build)?;
+    // Passthrough devices join here, while the VM is paused and before the caller installs the
+    // VMM thread's seccomp filter: VFIO setup (group and container fds, KVM_CREATE_DEVICE,
+    // pinning guest memory for DMA, BAR mappings) uses syscalls that filter does not allow.
+    if !params.device_passthrough.is_empty() {
+        log_dev_preview_warning("device passthrough on snapshot restore", None);
+        let mut locked = vmm.lock().expect("Poisoned lock");
+        let kvm_vm = locked
+            .vm
+            .as_kvm()
+            .ok_or(RestoreFromSnapshotError::DevicePassthroughRequiresKvm)?
+            .clone();
+        for config in &params.device_passthrough {
+            locked
+                .device_manager
+                .attach_passthrough_device(&kvm_vm, config.clone())?;
+        }
+    }
+    Ok(vmm)
 }
 
 /// Point each overridden virtio block device at its override's host file, so the

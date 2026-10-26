@@ -11,10 +11,11 @@ use std::time::Duration;
 use vmm::builder::build_and_boot_microvm;
 use vmm::devices::virtio::block::CacheType;
 use vmm::persist::{
-    GuestMemoryFromFileError, MicrovmState, MicrovmStateError, RestoreFromSnapshotError,
-    RestoreFromSnapshotGuestMemoryError, VirtioDevicesState, VmInfo, snapshot_state_sanity_check,
+    GuestMemoryFromFileError, MicrovmState, MicrovmStateError, PassthroughAttachError,
+    RestoreFromSnapshotError, RestoreFromSnapshotGuestMemoryError, VirtioDevicesState, VmInfo,
+    snapshot_state_sanity_check,
 };
-use vmm::resources::VmResources;
+use vmm::resources::{ResourcesError, VmResources};
 use vmm::rpc_interface::{
     LoadSnapshotError, PrebootApiController, RuntimeApiController, VmmAction, VmmActionError,
 };
@@ -320,6 +321,7 @@ fn verify_load_snapshot(
             vsock_override: None,
             clock_realtime: false,
             huge_pages,
+            device_passthrough: vec![],
         }))
         .unwrap();
 
@@ -393,6 +395,7 @@ fn test_load_snapshot_rejects_hugetlbfs_with_file_backend() {
             vsock_override: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Hugetlbfs2M,
+            device_passthrough: vec![],
         }))
         .unwrap_err();
 
@@ -404,6 +407,69 @@ fn test_load_snapshot_rejects_hugetlbfs_with_file_backend() {
             ))
         ))
     ));
+}
+
+fn load_with_passthrough(pci_enabled: bool) -> VmmActionError {
+    let (snapshot_file, memory_file) = verify_create_snapshot(false, pci_enabled, false);
+    let mut event_manager = EventManager::new().unwrap();
+    let empty_seccomp_filters = get_empty_filters();
+    let mut vm_resources = VmResources::default();
+    let mut preboot_api_controller = PrebootApiController::new(
+        &empty_seccomp_filters,
+        InstanceInfo::default(),
+        &mut vm_resources,
+        &mut event_manager,
+    );
+    // No host device exists at this address, so a load that reaches VFIO setup fails there.
+    let passthrough = serde_json::from_str(r#"{"id": "gpu0", "sbdf": "0000:ff:1f.7"}"#).unwrap();
+    preboot_api_controller
+        .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
+            snapshot_path: snapshot_file.as_path().to_path_buf(),
+            mem_backend: MemBackendConfig {
+                backend_path: memory_file.as_path().to_path_buf(),
+                backend_type: MemBackendType::File,
+            },
+            track_dirty_pages: false,
+            resume_vm: false,
+            network_overrides: vec![],
+            drive_overrides: vec![],
+            vsock_override: None,
+            clock_realtime: false,
+            huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+            device_passthrough: vec![passthrough],
+        }))
+        .unwrap_err()
+}
+
+#[test]
+fn test_load_snapshot_with_passthrough_requires_pci() {
+    let error = load_with_passthrough(false);
+    assert!(
+        matches!(
+            error,
+            VmmActionError::LoadSnapshot(LoadSnapshotError::RestoreFromSnapshot(
+                RestoreFromSnapshotError::DevicePassthrough(PassthroughAttachError::Incompatible(
+                    ResourcesError::DevicePassthroughWithoutPci
+                ))
+            ))
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn test_load_snapshot_attaches_passthrough_devices() {
+    // A PCI snapshot taken without the device: the load goes on to VFIO setup for it.
+    let error = load_with_passthrough(true);
+    assert!(
+        matches!(
+            error,
+            VmmActionError::LoadSnapshot(LoadSnapshotError::RestoreFromSnapshot(
+                RestoreFromSnapshotError::DevicePassthrough(PassthroughAttachError::Attach(_))
+            ))
+        ),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -467,6 +533,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         vsock_override: None,
         clock_realtime: false,
         huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+        device_passthrough: vec![],
     });
     let err = preboot_api_controller.handle_preboot_request(req);
     assert!(
