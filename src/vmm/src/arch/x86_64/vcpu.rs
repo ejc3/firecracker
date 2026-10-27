@@ -1145,6 +1145,16 @@ mod tests {
             "this test needs an Intel host with nested virtualization (kvm_intel nested=1)"
         );
         vcpu.fd.set_cpuid2(&vm.kvm().supported_cpuid).unwrap();
+        // What a guest's firmware or kernel leaves in IA32_FEATURE_CONTROL before VMXON: locked,
+        // VMX outside SMX allowed. KVM leaves VMX operation when the host writes it as 0.
+        const FEAT_CTL_LOCKED_VMX: u64 = 0x5;
+        let feat_ctl = Msrs::from_entries(&[kvm_bindings::kvm_msr_entry {
+            index: MSR_IA32_FEAT_CTL,
+            data: FEAT_CTL_LOCKED_VMX,
+            ..Default::default()
+        }])
+        .unwrap();
+        assert_eq!(vcpu.fd.set_msrs(&feat_ctl).unwrap(), 1);
         const VMXON_PA: u64 = 0x1000;
         let mut header = KvmNestedStateBuffer::empty();
         header.format = kvm_bindings::KVM_STATE_NESTED_FORMAT_VMX as u16;
