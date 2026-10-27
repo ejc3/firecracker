@@ -437,7 +437,7 @@ mod tests {
     fn test_the_layout_was_chosen_for_this_snapshot_version() {
         assert_eq!(
             (SNAPSHOT_VERSION, FCVM_SNAPSHOT_LAYOUT),
-            (Version::new(13, 0, 0), 1)
+            (Version::new(13, 0, 0), 2)
         );
     }
 
