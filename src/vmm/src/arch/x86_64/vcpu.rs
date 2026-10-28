@@ -13,12 +13,14 @@ use kvm_bindings::{
     CpuId, KVM_MAX_CPUID_ENTRIES, KVM_MAX_MSR_ENTRIES, Msrs, Xsave, kvm_debugregs, kvm_lapic_state,
     kvm_mp_state, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave, kvm_xsave2,
 };
-use kvm_ioctls::{VcpuExit, VcpuFd};
+use kvm_ioctls::{KvmNestedStateBuffer, VcpuExit, VcpuFd};
 use serde::{Deserialize, Serialize};
 use vmm_sys_util::fam::{self, FamStruct};
 
 use crate::arch::EntryPoint;
-use crate::arch::x86_64::generated::msr_index::{MSR_IA32_TSC, MSR_IA32_TSC_DEADLINE};
+use crate::arch::x86_64::generated::msr_index::{
+    MSR_IA32_FEAT_CTL, MSR_IA32_TSC, MSR_IA32_TSC_DEADLINE,
+};
 use crate::arch::x86_64::interrupts;
 use crate::arch::x86_64::msr::{MsrError, create_boot_msr_entries};
 use crate::arch::x86_64::regs::{SetupFpuError, SetupRegistersError, SetupSpecialRegistersError};
@@ -57,6 +59,12 @@ pub enum KvmVcpuError {
     GetMsrsToDump(#[from] crate::arch::x86_64::msr::MsrError),
     /// Cannot open the VCPU file descriptor: {0}
     VcpuFd(kvm_ioctls::Error),
+    /// Failed to get KVM vcpu nested state: {0}
+    VcpuGetNestedState(kvm_ioctls::Error),
+    /// Failed to set KVM vcpu nested state: {0}
+    VcpuSetNestedState(kvm_ioctls::Error),
+    /// Saved nested state is {0} bytes, more than KVM's {1}-byte buffer
+    NestedStateTooLarge(usize, usize),
     /// Failed to get KVM vcpu debug regs: {0}
     VcpuGetDebugRegs(kvm_ioctls::Error),
     /// Failed to get KVM vcpu lapic: {0}
@@ -626,6 +634,7 @@ impl KvmVcpu {
         });
         let cpuid = self.get_cpuid()?;
         let saved_msrs = self.get_msr_chunks(self.msrs_to_save.iter().copied())?;
+        let nested_state = self.get_nested_state()?;
         let vcpu_events = self
             .fd
             .get_vcpu_events()
@@ -643,7 +652,63 @@ impl KvmVcpu {
             xcrs,
             xsave,
             tsc_khz,
+            nested_state,
         })
+    }
+
+    /// The vCPU's nested virtualization state (`KVM_GET_NESTED_STATE`): the bytes KVM wrote,
+    /// header included, `size` bytes long.
+    ///
+    /// The header alone is kept too. kvm-ioctls reports a header-only state as "no nested
+    /// state", but the header is where VMX records `vmxon_pa`: a guest that has executed VMXON
+    /// and has no VMCS loaded (a Linux guest with kvm_intel loaded and no VM running) has
+    /// exactly that state, and a restore that drops it leaves the guest believing it is in VMX
+    /// operation while KVM does not, so its next VMX instruction faults.
+    fn get_nested_state(&self) -> Result<Vec<u8>, KvmVcpuError> {
+        use zerocopy::IntoBytes;
+        let mut buffer = KvmNestedStateBuffer::empty();
+        self.fd
+            .nested_state(&mut buffer)
+            .map_err(KvmVcpuError::VcpuGetNestedState)?;
+        let size = buffer.size as usize;
+        let bytes = buffer.as_bytes();
+        if size > bytes.len() {
+            return Err(KvmVcpuError::NestedStateTooLarge(size, bytes.len()));
+        }
+        Ok(bytes[..size].to_vec())
+    }
+
+    /// Sets the saved `IA32_FEATURE_CONTROL` alone, ahead of the other MSRs: KVM refuses a
+    /// nested state that is in VMX operation unless the MSR allows VMXON.
+    fn restore_feature_control(&self, state: &VcpuState) -> Result<(), KvmVcpuError> {
+        let saved = state.saved_msrs.iter().find_map(|msrs| {
+            msrs.as_slice()
+                .iter()
+                .find(|entry| entry.index == MSR_IA32_FEAT_CTL)
+                .copied()
+        });
+        if let Some(entry) = saved {
+            let msrs = Msrs::from_entries(&[entry])?;
+            let nmsrs = self.fd.set_msrs(&msrs).map_err(KvmVcpuError::VcpuSetMsrs)?;
+            if nmsrs != 1 {
+                return Err(KvmVcpuError::VcpuSetMsrsIncomplete);
+            }
+        }
+        Ok(())
+    }
+
+    /// Loads a state saved by [`Self::get_nested_state`] with `KVM_SET_NESTED_STATE`.
+    fn set_nested_state(&self, saved: &[u8]) -> Result<(), KvmVcpuError> {
+        use zerocopy::IntoBytes;
+        let mut buffer = KvmNestedStateBuffer::empty();
+        let bytes = buffer.as_mut_bytes();
+        if saved.len() > bytes.len() {
+            return Err(KvmVcpuError::NestedStateTooLarge(saved.len(), bytes.len()));
+        }
+        bytes[..saved.len()].copy_from_slice(saved);
+        self.fd
+            .set_nested_state(&buffer)
+            .map_err(KvmVcpuError::VcpuSetNestedState)
     }
 
     /// Dumps CPU configuration (CPUID and MSRs).
@@ -709,12 +774,21 @@ impl KvmVcpu {
         self.fd
             .set_mp_state(state.mp_state)
             .map_err(KvmVcpuError::VcpuSetMpState)?;
-        self.fd
-            .set_regs(&state.regs)
-            .map_err(KvmVcpuError::VcpuSetRegs)?;
+        // SET_NESTED_STATE comes after SET_SREGS, which restores CR4.VMXE and EFER (SVME)
+        // that VMX and SVM operation need, and before SET_REGS: a vCPU saved while running a
+        // nested guest enters guest mode here, loading that guest's registers from the
+        // VMCS12, and SET_REGS then restores the exact values (QEMU's order). The FEAT_CTL
+        // MSR, which VMXON needs locked and enabled, is set first for the same reason.
         self.fd
             .set_sregs(&state.sregs)
             .map_err(KvmVcpuError::VcpuSetSregs)?;
+        if !state.nested_state.is_empty() {
+            self.restore_feature_control(state)?;
+            self.set_nested_state(&state.nested_state)?;
+        }
+        self.fd
+            .set_regs(&state.regs)
+            .map_err(KvmVcpuError::VcpuSetRegs)?;
         // SAFETY: Safe unless the snapshot is corrupted.
         unsafe {
             // kvm-ioctl's `set_xsave2()` can be called even on kernel versions not supporting
@@ -814,6 +888,8 @@ pub struct VcpuState {
     pub xsave: Xsave,
     /// Tsc khz.
     pub tsc_khz: Option<u32>,
+    /// Nested virtualization state from `KVM_GET_NESTED_STATE`, header included.
+    pub nested_state: Vec<u8>,
 }
 
 impl Debug for VcpuState {
@@ -835,6 +911,7 @@ impl Debug for VcpuState {
             .field("xcrs", &self.xcrs)
             .field("xsave", &self.xsave)
             .field("tsc_khz", &self.tsc_khz)
+            .field("nested_state_len", &self.nested_state.len())
             .finish()
     }
 }
@@ -873,6 +950,7 @@ mod tests {
                 xcrs: Default::default(),
                 xsave: Xsave::new(0).unwrap(),
                 tsc_khz: Some(0),
+                nested_state: Vec::new(),
             }
         }
     }
@@ -1038,6 +1116,74 @@ mod tests {
             })
             .unwrap();
         assert!(leaf3.result.eax == 0x1234_5678);
+    }
+
+    /// The `vmxon_pa` a vCPU's nested state carries after `KVM_GET_NESTED_STATE`.
+    fn vmxon_pa(fd: &VcpuFd) -> u64 {
+        let mut buffer = KvmNestedStateBuffer::empty();
+        fd.nested_state(&mut buffer).unwrap();
+        // SAFETY: the header is the VMX one on an Intel host (format checked by the caller).
+        unsafe { buffer.hdr.vmx.vmxon_pa }
+    }
+
+    #[test]
+    fn test_vmx_operation_survives_save_and_restore() {
+        // A guest that has executed VMXON and has no VMCS loaded (Linux with kvm_intel
+        // loaded and no VM running) has a nested state of the header alone, with vmxon_pa
+        // set. A restore that loses it leaves the guest in VMX operation as far as the guest
+        // knows and outside it as far as KVM knows, and the guest's next VMX instruction
+        // faults. Put a vCPU in that state directly, save it, restore it into a new vCPU and
+        // read the state back.
+        let (vm, vcpu) = setup_vcpu(0x10000);
+        let cpuid = Cpuid::try_from(vm.kvm().supported_cpuid.clone()).unwrap();
+        let vmx = cpuid
+            .inner()
+            .get(&CpuidKey {
+                leaf: 0x1,
+                subleaf: 0x0,
+            })
+            .is_some_and(|leaf| leaf.result.ecx & (1 << 5) != 0);
+        if !vmx {
+            // An AMD host, or kvm_intel without nested=1: KVM offers the guest no VMX, so
+            // there is no VMX operation to carry across a snapshot.
+            eprintln!("KVM offers no VMX to a guest on this host; nothing to check");
+            return;
+        }
+        vcpu.fd.set_cpuid2(&vm.kvm().supported_cpuid).unwrap();
+        // What a guest's firmware or kernel leaves in IA32_FEATURE_CONTROL before VMXON: locked,
+        // VMX outside SMX allowed. KVM leaves VMX operation when the host writes it as 0.
+        const FEAT_CTL_LOCKED_VMX: u64 = 0x5;
+        let feat_ctl = Msrs::from_entries(&[kvm_bindings::kvm_msr_entry {
+            index: MSR_IA32_FEAT_CTL,
+            data: FEAT_CTL_LOCKED_VMX,
+            ..Default::default()
+        }])
+        .unwrap();
+        assert_eq!(vcpu.fd.set_msrs(&feat_ctl).unwrap(), 1);
+        const VMXON_PA: u64 = 0x1000;
+        let mut header = KvmNestedStateBuffer::empty();
+        header.format = u16::try_from(kvm_bindings::KVM_STATE_NESTED_FORMAT_VMX).unwrap();
+        header.size = u32::try_from(std::mem::size_of::<kvm_bindings::kvm_nested_state>()).unwrap();
+        header.hdr.vmx.vmxon_pa = VMXON_PA;
+        header.hdr.vmx.vmcs12_pa = u64::MAX;
+        vcpu.fd.set_nested_state(&header).unwrap();
+        assert_eq!(vmxon_pa(&vcpu.fd), VMXON_PA);
+
+        let state = vcpu.save_state().unwrap();
+        drop(vcpu);
+        let (vm, vcpu) = setup_vcpu(0x10000);
+        vcpu.fd.set_cpuid2(&vm.kvm().supported_cpuid).unwrap();
+        assert_eq!(
+            vmxon_pa(&vcpu.fd),
+            u64::MAX,
+            "a new vCPU is not in VMX operation"
+        );
+        vcpu.restore_state(&state).unwrap();
+        assert_eq!(
+            vmxon_pa(&vcpu.fd),
+            VMXON_PA,
+            "the restored vCPU must still be in VMX operation"
+        );
     }
 
     #[test]
