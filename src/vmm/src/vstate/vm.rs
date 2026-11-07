@@ -81,6 +81,10 @@ pub struct VmCommon {
     pub vcpus_handles: Mutex<Vec<VcpuHandle>>,
     /// Event fd written to by vCPUs on exit.
     pub vcpus_exit_evt: EventFd,
+    /// Set when a dirty log reset failed part way: some slots' logs may have been emptied
+    /// after a snapshot that is reported failed, so a Diff could miss their pages. Only a
+    /// Full snapshot clears it.
+    dirty_log_incomplete: std::sync::atomic::AtomicBool,
 }
 
 /// Errors associated with the wrappers over KVM ioctls.
@@ -92,6 +96,8 @@ pub enum VmError {
     SetUserMemoryRegion(kvm_ioctls::Error),
     /// Failed to create VM: {0}
     CreateVm(kvm_ioctls::Error),
+    /// A dirty log reset failed part way, so a Diff snapshot could miss pages; take a Full one
+    DirtyLogIncomplete,
     /// Failed to get KVM's dirty log: {0}
     GetDirtyLog(kvm_ioctls::Error),
     /// {0}
@@ -185,13 +191,14 @@ impl KvmVm {
         };
         // _IOW(KVMIO = 0xAE, 0xa3, struct kvm_enable_cap (104 bytes)); kvm-ioctls offers
         // `VmFd::enable_cap` on x86_64 only.
-        const KVM_ENABLE_CAP: libc::c_ulong = 0x4068_aea3;
+        const KVM_ENABLE_CAP: u32 = 0x4068_aea3;
         const _: () = assert!(std::mem::size_of::<kvm_enable_cap>() == 0x68);
         // SAFETY: `fd` is a valid KVM VM fd and `manual_protect` lives across the call.
         let ret = unsafe {
             libc::ioctl(
                 std::os::fd::AsRawFd::as_raw_fd(&fd),
-                KVM_ENABLE_CAP,
+                // The request is `c_ulong` on glibc and `c_int` on musl.
+                KVM_ENABLE_CAP as _,
                 &manual_protect,
             )
         };
@@ -216,6 +223,7 @@ impl KvmVm {
             uffd: None,
             vcpus_handles: Mutex::new(Vec::new()),
             vcpus_exit_evt,
+            dirty_log_incomplete: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -569,6 +577,14 @@ impl KvmVm {
     /// over its whole range (`kvm_arch_mmu_enable_log_dirty_pt_masked`): with the guest at EL2
     /// (NV2) that took most of a Full snapshot.
     pub fn reset_dirty_bitmap(&self) -> Result<(), VmError> {
+        let reset = self.reset_dirty_logs();
+        self.common
+            .dirty_log_incomplete
+            .store(reset.is_err(), Ordering::SeqCst);
+        reset
+    }
+
+    fn reset_dirty_logs(&self) -> Result<(), VmError> {
         for mem_slot in self
             .guest_memory()
             .iter()
@@ -668,6 +684,9 @@ impl KvmVm {
         let started = std::time::Instant::now();
         match snapshot_type {
             SnapshotType::Diff => {
+                if self.common.dirty_log_incomplete.load(Ordering::SeqCst) {
+                    return Err(VmError::DirtyLogIncomplete.into());
+                }
                 let dirty_bitmap = self.get_dirty_bitmap()?;
                 self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
             }
@@ -1318,6 +1337,37 @@ pub(crate) mod tests {
         }
 
         let file = TempFile::new().unwrap();
+        vm.snapshot_memory_to_file(file.as_path(), SnapshotType::Full)
+            .unwrap();
+        vm.snapshot_memory_to_file(file.as_path(), SnapshotType::Diff)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_a_failed_dirty_log_reset_refuses_diffs_until_a_full_snapshot() {
+        // A reset that failed part way may have emptied some slots' logs after a snapshot
+        // reported failed; a Diff taken then would miss those pages.
+        let mut vm = setup_vm();
+        let regions = memory::anonymous(
+            [(GuestAddress(0), DUMP_TEST_MEM)].into_iter(),
+            true,
+            crate::vmm_config::machine_config::HugePageConfig::None,
+        )
+        .unwrap();
+        vm.register_dram_memory_regions(regions).unwrap();
+        vm.common.dirty_log_incomplete.store(true, Ordering::SeqCst);
+
+        let file = TempFile::new().unwrap();
+        let refused = vm.snapshot_memory_to_file(file.as_path(), SnapshotType::Diff);
+        assert!(
+            matches!(
+                refused,
+                Err(CreateSnapshotError::DirtyBitmap(
+                    VmError::DirtyLogIncomplete
+                ))
+            ),
+            "a Diff after a failed reset was taken: {refused:?}"
+        );
         vm.snapshot_memory_to_file(file.as_path(), SnapshotType::Full)
             .unwrap();
         vm.snapshot_memory_to_file(file.as_path(), SnapshotType::Diff)
