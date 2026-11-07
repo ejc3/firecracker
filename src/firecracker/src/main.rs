@@ -52,17 +52,19 @@ const DEFAULT_API_SOCK_PATH: &str = "/run/firecracker.socket";
 // The `fcvm.drive-overrides` build metadata says this build's snapshot load takes
 // `drive_overrides`, which upstream releases of the same version reject,
 // `numa-window` that it takes `--numa-balancing-after-secs`, `write-set` that a File
-// backend load takes `mem_backend.write_set_path`, and `tap-fd` that a net device takes
-// `host_dev_fd`. fcvm reads them from `--version` before it uses them.
+// backend load takes `mem_backend.write_set_path`, `tap-fd` that a net device takes
+// `host_dev_fd`, and `pagemap-dirty` that a Diff snapshot of a VM that maps its memory
+// file privately without dirty tracking takes the written pages from /proc/self/pagemap.
+// fcvm reads them from `--version` before it uses them.
 const FIRECRACKER_VERSION: &str = if cfg!(feature = "fuzzing") {
     concat!(
         env!("CARGO_PKG_VERSION"),
-        "+fcvm.drive-overrides.numa-window.write-set.tap-fd.fuzzing"
+        "+fcvm.drive-overrides.numa-window.write-set.tap-fd.pagemap-dirty.fuzzing"
     )
 } else {
     concat!(
         env!("CARGO_PKG_VERSION"),
-        "+fcvm.drive-overrides.numa-window.write-set.tap-fd"
+        "+fcvm.drive-overrides.numa-window.write-set.tap-fd.pagemap-dirty"
     )
 };
 const MMDS_CONTENT_ARG: &str = "metadata";
