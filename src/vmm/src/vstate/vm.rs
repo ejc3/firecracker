@@ -112,6 +112,8 @@ pub enum VmError {
     InsertRegion(#[from] vm_memory::GuestRegionCollectionError),
     /// Error calling mincore: {0}
     Mincore(vmm_sys_util::errno::Error),
+    /// Error reading /proc/self/pagemap: {0}
+    Pagemap(std::io::Error),
     /// ResourceAllocator error: {0}
     ResourceAllocator(#[from] vm_allocator::Error),
     /// MemoryError error: {0}
@@ -574,13 +576,20 @@ impl KvmVm {
     pub fn get_dirty_bitmap(&self) -> Result<DirtyBitmap, VmError> {
         self.guest_memory()
             .iter()
-            .flat_map(|region| region.plugged_slots())
-            .map(|mem_slot| {
+            .flat_map(|region| {
+                let private_file = region.maps_file_privately();
+                region.plugged_slots().map(move |slot| (private_file, slot))
+            })
+            .map(|(private_file, mem_slot)| {
                 let bitmap = match mem_slot.slice.bitmap() {
                     Some(_) => self
                         .fd()
                         .get_dirty_log(mem_slot.slot, mem_slot.slice.len())
                         .map_err(VmError::GetDirtyLog)?,
+                    None if private_file => written_private_pages(
+                        mem_slot.slice.ptr_guard_mut().as_ptr(),
+                        mem_slot.slice.len(),
+                    )?,
                     None => mincore_bitmap(
                         mem_slot.slice.ptr_guard_mut().as_ptr(),
                         mem_slot.slice.len(),
@@ -778,6 +787,52 @@ impl KvmVm {
     }
 }
 
+/// The bits of a /proc/self/pagemap entry for a page in memory (63) and a page swapped out (62).
+const PAGEMAP_PRESENT: u64 = 1 << 63;
+const PAGEMAP_SWAPPED: u64 = 1 << 62;
+/// Bit 61: the page is a file page or shared anonymous memory.
+const PAGEMAP_FILE: u64 = 1 << 61;
+
+/// Whether a pagemap entry of a private file mapping is for a page the process wrote: a private
+/// anonymous copy, in memory or swapped out. A page it only read maps the file's page cache
+/// page (bit 61), and a page it never touched has no entry.
+fn pagemap_written(entry: u64) -> bool {
+    entry & PAGEMAP_SWAPPED != 0 || (entry & PAGEMAP_PRESENT != 0 && entry & PAGEMAP_FILE == 0)
+}
+
+/// The dirty bitmap of a memslot that maps a snapshot file privately with dirty tracking off:
+/// the pages the guest wrote since the restore, from /proc/self/pagemap. A write to such a
+/// mapping copies the page, so the written pages are exactly the private anonymous ones; KVM's
+/// dirty log is not needed, nor the write protection that keeps it. The pages written before an
+/// earlier snapshot of this VM are included too, which a diff against that snapshot writes
+/// again with the bytes it already holds. Discards are recorded apart (`discarded`).
+///
+/// pagemap is read with lseek(2) and read(2), which Firecracker's seccomp filters allow.
+fn written_private_pages(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let page_size = host_page_size();
+    let pages = len / page_size;
+    let mut bitmap = vec![0u64; pages.div_ceil(64)];
+    let mut file = std::fs::File::open("/proc/self/pagemap").map_err(VmError::Pagemap)?;
+    file.seek(SeekFrom::Start((addr as usize / page_size * 8) as u64))
+        .map_err(VmError::Pagemap)?;
+    // 64 KiB of entries, 32 MiB of guest memory with 4 KiB pages, per read
+    let mut entries = vec![0u8; 8192 * 8];
+    let mut page = 0;
+    while page < pages {
+        let count = (pages - page).min(8192);
+        let bytes = &mut entries[..count * 8];
+        file.read_exact(bytes).map_err(VmError::Pagemap)?;
+        for (i, entry) in bytes.chunks_exact(8).enumerate() {
+            if pagemap_written(u64::from_ne_bytes(entry.try_into().unwrap())) {
+                bitmap[(page + i) / 64] |= 1 << ((page + i) % 64);
+            }
+        }
+        page += count;
+    }
+    Ok(bitmap)
+}
+
 /// Use `mincore(2)` to overapproximate the dirty bitmap for the given memslot. To be used
 /// if a diff snapshot is requested, but dirty page tracking wasn't enabled.
 fn mincore_bitmap(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
@@ -834,6 +889,52 @@ pub(crate) mod tests {
     use crate::vstate::kvm::Kvm;
     use crate::vstate::memory::test_utils::data_runs;
     use crate::vstate::memory::{Bytes, GuestRegionType, HOLE_GRANULE, anonymous};
+
+    #[test]
+    fn test_written_private_pages_are_the_written_ones() {
+        // A private mapping of a 16-page file: page 1 read, pages 3 and 7 written, page 9 read
+        // and then written. Only the written pages are reported, the read ones are not.
+        let page = host_page_size();
+        let file = TempFile::new().unwrap();
+        file.as_file().set_len((16 * page) as u64).unwrap();
+        std::io::Write::write_all(&mut file.as_file(), &vec![1u8; 16 * page]).unwrap();
+        // SAFETY: a private mapping of a file of this length, unmapped below.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                16 * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                std::os::fd::AsRawFd::as_raw_fd(file.as_file()),
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+        let mem = addr.cast::<u8>();
+        // SAFETY: every offset below is inside the mapping.
+        unsafe {
+            assert_eq!(std::ptr::read_volatile(mem.add(page)), 1);
+            std::ptr::write_volatile(mem.add(3 * page), 2);
+            std::ptr::write_volatile(mem.add(7 * page + 5), 2);
+            assert_eq!(std::ptr::read_volatile(mem.add(9 * page)), 1);
+            std::ptr::write_volatile(mem.add(9 * page), 2);
+        }
+        let bitmap = written_private_pages(mem, 16 * page).unwrap();
+        // SAFETY: the mapping made above.
+        unsafe { libc::munmap(addr, 16 * page) };
+        assert_eq!(bitmap, vec![(1 << 3) | (1 << 7) | (1 << 9)]);
+    }
+
+    #[test]
+    fn test_pagemap_written_reads_the_entry_bits() {
+        assert!(!pagemap_written(0), "an untouched page");
+        assert!(
+            !pagemap_written(PAGEMAP_PRESENT | PAGEMAP_FILE),
+            "a page only read maps the page cache"
+        );
+        assert!(pagemap_written(PAGEMAP_PRESENT), "a private copy");
+        assert!(pagemap_written(PAGEMAP_SWAPPED), "a private copy swapped out");
+    }
 
     // Auxiliary function being used throughout the tests.
     pub(crate) fn setup_vm() -> KvmVm {

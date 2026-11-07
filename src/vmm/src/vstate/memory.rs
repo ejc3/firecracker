@@ -784,9 +784,10 @@ pub struct GuestRegionMmapExt {
 
 /// The bitmap of a region's discarded pages, present only when the region tracks dirty pages.
 fn discard_bitmap(region: &GuestRegionMmap) -> Option<AtomicBitmap> {
-    region
-        .bitmap()
-        .is_some()
+    // A private file mapping without dirty tracking has its written pages read from
+    // /proc/self/pagemap, which cannot see a discard either.
+    let private_file = region.file_offset().is_some() && region.flags() & libc::MAP_PRIVATE != 0;
+    (region.bitmap().is_some() || private_file)
         .then(|| AtomicBitmap::with_len(u64_to_usize(region.len())))
 }
 
@@ -1003,6 +1004,19 @@ impl<'a> GuestMemorySlot<'a> {
 }
 
 impl GuestRegionMmapExt {
+    /// Whether the region maps a file privately on a filesystem other than hugetlbfs, as a
+    /// restore from a snapshot file does. A page the guest writes in it becomes a private
+    /// anonymous copy, which /proc/self/pagemap tells from one it only read.
+    pub(crate) fn maps_file_privately(&self) -> bool {
+        match self.inner.file_offset() {
+            Some(file_offset) if self.inner.flags() & libc::MAP_PRIVATE != 0 => {
+                BackingFileSystem::of(file_offset.file())
+                    .is_ok_and(|fs| fs.hugetlbfs_page_size().is_none())
+            }
+            _ => false,
+        }
+    }
+
     /// Adds a DRAM region which only contains a single plugged slot
     pub(crate) fn dram_from_mmap_region(region: GuestRegionMmap, slot: u32) -> Self {
         let slot_size = u64_to_usize(region.len());
