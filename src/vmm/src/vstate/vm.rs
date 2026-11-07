@@ -15,8 +15,9 @@ use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_IRQCHIP_IOAPIC;
 use kvm_bindings::{
-    KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_MSI_VALID_DEVID, KvmIrqRouting,
-    kvm_irq_routing_entry, kvm_userspace_memory_region,
+    KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2, KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE,
+    KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_MEM_LOG_DIRTY_PAGES, KVM_MSI_VALID_DEVID,
+    KvmIrqRouting, kvm_enable_cap, kvm_irq_routing_entry, kvm_userspace_memory_region,
 };
 use kvm_ioctls::VmFd;
 use serde::{Deserialize, Serialize};
@@ -173,6 +174,33 @@ impl KvmVm {
 
             attempt += 1;
         };
+
+        // KVM_GET_DIRTY_LOG then copies the log and leaves it and the write protection alone;
+        // `reset_dirty_bitmap` clears both for a whole slot at once. Without the capability,
+        // KVM_GET_DIRTY_LOG clears the log itself, and `reset_dirty_bitmap` is still correct.
+        let manual_protect = kvm_enable_cap {
+            cap: KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2,
+            args: [u64::from(KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE), 0, 0, 0],
+            ..Default::default()
+        };
+        // _IOW(KVMIO = 0xAE, 0xa3, struct kvm_enable_cap (104 bytes)); kvm-ioctls offers
+        // `VmFd::enable_cap` on x86_64 only.
+        const KVM_ENABLE_CAP: libc::c_ulong = 0x4068_aea3;
+        const _: () = assert!(std::mem::size_of::<kvm_enable_cap>() == 0x68);
+        // SAFETY: `fd` is a valid KVM VM fd and `manual_protect` lives across the call.
+        let ret = unsafe {
+            libc::ioctl(
+                std::os::fd::AsRawFd::as_raw_fd(&fd),
+                KVM_ENABLE_CAP,
+                &manual_protect,
+            )
+        };
+        if ret < 0 {
+            debug!(
+                "KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 not enabled: {}",
+                std::io::Error::last_os_error()
+            );
+        }
 
         let vcpus_exit_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(VmError::EventFd)?;
 
@@ -531,14 +559,31 @@ impl KvmVm {
             .expect("Poisoned lock")
     }
 
-    /// Resets the KVM dirty bitmap for each of the guest's memory regions.
-    pub fn reset_dirty_bitmap(&self) {
-        self.guest_memory()
+    /// Empties the KVM dirty log of each of the guest's memory slots that log, and write-protects
+    /// the slot again so the next write to each page is logged.
+    ///
+    /// It turns logging off and on for the slot: KVM frees the log, allocates an empty one and
+    /// write-protects the slot in one pass. Clearing the log through KVM_GET_DIRTY_LOG (or
+    /// KVM_CLEAR_DIRTY_LOG) write-protects each 64 pages that hold a dirty one in a call of its
+    /// own, and on arm64 each such call also write-protects every nested stage-2 MMU of the VM
+    /// over its whole range (`kvm_arch_mmu_enable_log_dirty_pt_masked`): with the guest at EL2
+    /// (NV2) that took most of a Full snapshot.
+    pub fn reset_dirty_bitmap(&self) -> Result<(), VmError> {
+        for mem_slot in self
+            .guest_memory()
             .iter()
             .flat_map(|region| region.plugged_slots())
-            .for_each(|mem_slot| {
-                let _ = self.fd().get_dirty_log(mem_slot.slot, mem_slot.slice.len());
-            });
+        {
+            if mem_slot.slice.bitmap().is_none() {
+                continue;
+            }
+            let mut region = kvm_userspace_memory_region::from(&mem_slot);
+            region.flags &= !KVM_MEM_LOG_DIRTY_PAGES;
+            self.set_user_memory_region(region)?;
+            region.flags |= KVM_MEM_LOG_DIRTY_PAGES;
+            self.set_user_memory_region(region)?;
+        }
+        Ok(())
     }
 
     /// Retrieves the KVM dirty bitmap for each of the guest's memory regions.
@@ -620,6 +665,7 @@ impl KvmVm {
         file.set_len(expected_size)
             .map_err(|e| MemoryBackingFile("set_length", e))?;
 
+        let started = std::time::Instant::now();
         match snapshot_type {
             SnapshotType::Diff => {
                 let dirty_bitmap = self.get_dirty_bitmap()?;
@@ -636,15 +682,26 @@ impl KvmVm {
                     AbsentPages::Read
                 };
                 self.guest_memory().dump(&mut file, absent)?;
-                self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
             }
         };
+        let dumped = std::time::Instant::now();
+        // With KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 a Diff's KVM_GET_DIRTY_LOG left the log as it
+        // was, so both kinds start the next Diff's log here.
+        self.reset_dirty_bitmap()?;
+        let reset = std::time::Instant::now();
 
         file.flush()
             .map_err(|err| MemoryBackingFile("flush", err))?;
         file.sync_all()
-            .map_err(|err| MemoryBackingFile("sync_all", err))
+            .map_err(|err| MemoryBackingFile("sync_all", err))?;
+        info!(
+            "Memory snapshot: dump {} us, dirty log reset {} us, sync {} us",
+            dumped.duration_since(started).as_micros(),
+            reset.duration_since(dumped).as_micros(),
+            reset.elapsed().as_micros()
+        );
+        Ok(())
     }
 
     /// Register a device IRQ
@@ -795,6 +852,7 @@ pub(crate) mod tests {
     use crate::test_utils::single_region_mem_raw;
     use crate::utils::mib_to_bytes;
     use crate::vstate::kvm::Kvm;
+    use crate::vstate::memory;
     use crate::vstate::memory::GuestRegionMmap;
 
     // Auxiliary function being used throughout the tests.
@@ -1226,6 +1284,44 @@ pub(crate) mod tests {
                 "snapshot page {page} differs from guest memory"
             );
         }
+    }
+
+    #[test]
+    fn test_reset_dirty_bitmap_keeps_each_slot_logging_with_an_empty_log() {
+        // The reset turns logging off and on again. A slot left with logging off has no log, so
+        // the next Diff snapshot's KVM_GET_DIRTY_LOG fails with ENOENT for it.
+        let mut vm = setup_vm();
+        let regions = memory::anonymous(
+            [(GuestAddress(0), DUMP_TEST_MEM)].into_iter(),
+            true,
+            crate::vmm_config::machine_config::HugePageConfig::None,
+        )
+        .unwrap();
+        vm.register_dram_memory_regions(regions).unwrap();
+        let slots: Vec<(u32, usize)> = vm
+            .guest_memory()
+            .iter()
+            .flat_map(|region| region.plugged_slots())
+            .map(|slot| (slot.slot, slot.slice.len()))
+            .collect();
+        assert!(!slots.is_empty());
+
+        for _ in 0..2 {
+            vm.reset_dirty_bitmap().unwrap();
+            for (slot, len) in &slots {
+                let log = vm
+                    .fd()
+                    .get_dirty_log(*slot, *len)
+                    .expect("the reset left the slot without a dirty log");
+                assert!(log.iter().all(|word| *word == 0));
+            }
+        }
+
+        let file = TempFile::new().unwrap();
+        vm.snapshot_memory_to_file(file.as_path(), SnapshotType::Full)
+            .unwrap();
+        vm.snapshot_memory_to_file(file.as_path(), SnapshotType::Diff)
+            .unwrap();
     }
 
     #[test]
