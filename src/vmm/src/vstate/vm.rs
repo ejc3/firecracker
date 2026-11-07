@@ -81,9 +81,10 @@ pub struct VmCommon {
     pub vcpus_handles: Mutex<Vec<VcpuHandle>>,
     /// Event fd written to by vCPUs on exit.
     pub vcpus_exit_evt: EventFd,
-    /// Set when a dirty log reset failed part way: some slots' logs may have been emptied
-    /// after a snapshot that is reported failed, so a Diff could miss their pages. Only a
-    /// Full snapshot clears it.
+    /// Set while a memory snapshot runs and left set when it fails: it may have emptied
+    /// dirty logs (the reset, or KVM_GET_DIRTY_LOG without manual protect) for a snapshot
+    /// that is reported failed, so a Diff could miss their pages. Only a Full snapshot that
+    /// succeeds clears it.
     dirty_log_incomplete: std::sync::atomic::AtomicBool,
 }
 
@@ -96,7 +97,7 @@ pub enum VmError {
     SetUserMemoryRegion(kvm_ioctls::Error),
     /// Failed to create VM: {0}
     CreateVm(kvm_ioctls::Error),
-    /// A dirty log reset failed part way, so a Diff snapshot could miss pages; take a Full one
+    /// A memory snapshot failed after it may have emptied the dirty log, so a Diff could miss pages; take a Full one
     DirtyLogIncomplete,
     /// Failed to get KVM's dirty log: {0}
     GetDirtyLog(kvm_ioctls::Error),
@@ -577,14 +578,6 @@ impl KvmVm {
     /// over its whole range (`kvm_arch_mmu_enable_log_dirty_pt_masked`): with the guest at EL2
     /// (NV2) that took most of a Full snapshot.
     pub fn reset_dirty_bitmap(&self) -> Result<(), VmError> {
-        let reset = self.reset_dirty_logs();
-        self.common
-            .dirty_log_incomplete
-            .store(reset.is_err(), Ordering::SeqCst);
-        reset
-    }
-
-    fn reset_dirty_logs(&self) -> Result<(), VmError> {
         for mem_slot in self
             .guest_memory()
             .iter()
@@ -687,10 +680,16 @@ impl KvmVm {
                 if self.common.dirty_log_incomplete.load(Ordering::SeqCst) {
                     return Err(VmError::DirtyLogIncomplete.into());
                 }
+                self.common
+                    .dirty_log_incomplete
+                    .store(true, Ordering::SeqCst);
                 let dirty_bitmap = self.get_dirty_bitmap()?;
                 self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
             }
             SnapshotType::Full => {
+                self.common
+                    .dirty_log_incomplete
+                    .store(true, Ordering::SeqCst);
                 // A never-written page of anonymous guest memory is zeros, and reading it would
                 // map the zero page into this VMM and so change how the resumed guest's first
                 // write to it faults. Leave it as a hole when that hole reads as zeros: the file
@@ -714,6 +713,9 @@ impl KvmVm {
             .map_err(|err| MemoryBackingFile("flush", err))?;
         file.sync_all()
             .map_err(|err| MemoryBackingFile("sync_all", err))?;
+        self.common
+            .dirty_log_incomplete
+            .store(false, Ordering::SeqCst);
         info!(
             "Memory snapshot: dump {} us, dirty log reset {} us, sync {} us",
             dumped.duration_since(started).as_micros(),
@@ -1345,8 +1347,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_a_failed_dirty_log_reset_refuses_diffs_until_a_full_snapshot() {
-        // A reset that failed part way may have emptied some slots' logs after a snapshot
-        // reported failed; a Diff taken then would miss those pages.
+        // A snapshot that failed after emptying some slots' logs (a reset failing part way, a
+        // failed sync) leaves the flag set; a Diff taken then would miss those pages.
         let mut vm = setup_vm();
         let regions = memory::anonymous(
             [(GuestAddress(0), DUMP_TEST_MEM)].into_iter(),
