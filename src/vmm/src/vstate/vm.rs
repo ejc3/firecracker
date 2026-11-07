@@ -1346,6 +1346,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_diffs_are_allowed_again_only_after_the_sync() {
+        // A failing fsync cannot be injected here, so this pins the order in the source: the
+        // flag that refuses Diffs is cleared after the memory file's sync, and nowhere else.
+        let source = include_str!("vm.rs");
+        let body = &source[source.find("fn snapshot_memory_to_file(").unwrap()..];
+        let body = &body[..body.find("\n    }\n").unwrap()];
+        let sync = body.find("\"sync_all\"").expect("no sync");
+        let clear = body
+            .find(".store(false, Ordering::SeqCst)")
+            .expect("the flag is never cleared");
+        assert!(sync < clear, "Diffs are allowed again before the sync");
+        let code = &source[..source.find("#[cfg(test)]\npub(crate) mod tests").unwrap()];
+        assert_eq!(code.matches(".store(false, Ordering::SeqCst)").count(), 1);
+    }
+
+    #[test]
     fn test_a_failed_dirty_log_reset_refuses_diffs_until_a_full_snapshot() {
         // A snapshot that failed after emptying some slots' logs (a reset failing part way, a
         // failed sync) leaves the flag set; a Diff taken then would miss those pages.
