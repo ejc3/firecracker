@@ -410,8 +410,8 @@ where
         // so for Vsock we don't support connection persistence through snapshot.
         // Any in-flight packets or events are simply lost.
         // Vsock is restored 'empty'.
-        // The only reason we still `kick` it is to make guest process
-        // `TRANSPORT_RESET_EVENT` event we sent during snapshot creation.
+        // We `kick` it to make guest process `TRANSPORT_RESET_EVENT` event we sent
+        // during snapshot creation, and to walk the TX queue once.
         if self.is_activated() {
             self.pending_event_ack = true;
 
@@ -421,6 +421,31 @@ where
                 self.id()
             );
             self.signal_used_queue(EVQ_INDEX).unwrap();
+
+            // Replay the TX queue notification, like the default `VirtioDevice::kick`
+            // does for its data queues, so the device processes any TX descriptor the
+            // driver published and notified just before the pause. The descriptor is in
+            // the snapshot; its notification, an ioeventfd write to the VMM that took
+            // the snapshot, is not. Under VIRTIO_RING_F_EVENT_IDX the driver notifies
+            // again only once the device consumes past `avail_event`, which it already
+            // crossed, so without the replay the device never walks the TX queue and
+            // every later guest packet stays in it. The event queue is not notified:
+            // that would run the guest's reset-ack path and clear `pending_event_ack`.
+            // RX needs no replay: `pending_event_ack` gates it until the guest acks the
+            // reset, which drains RX and re-arms `avail_event`.
+            info!(
+                "[{:?}:{}] notifying tx queue",
+                self.device_type(),
+                self.id()
+            );
+            if let Err(err) = self.queue_events[TXQ_INDEX].write(1) {
+                error!(
+                    "[{:?}:{}] error notifying tx queue: {}",
+                    self.device_type(),
+                    self.id(),
+                    err
+                );
+            }
         }
     }
 
@@ -616,6 +641,36 @@ mod tests {
         let progressed = ctx.device.process_rx().unwrap();
         assert!(!progressed);
         assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);
+    }
+
+    #[test]
+    fn test_kick_walks_tx_the_snapshot_left_unconsumed() {
+        // The snapshot holds a TX descriptor the driver published and notified before the
+        // pause; the restored device never sees that notification. The restore kick must
+        // still get the descriptor processed, without standing in for the evq ack.
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+        publish_evq_descriptor(&mut ctx);
+        ctx.device.backend.set_pending_rx(false);
+
+        ctx.device.kick();
+        // What the event loop does with the queue eventfds `kick` notified.
+        ctx.device.handle_txq_event(EventSet::IN);
+
+        assert_eq!(
+            ctx.guest_txvq.used.idx.get(),
+            1,
+            "the TX descriptor left in the snapshot must be processed after the restore kick"
+        );
+        assert!(
+            ctx.device.pending_event_ack,
+            "the restore kick must not stand in for the guest's evq ack"
+        );
+        assert!(
+            ctx.device.queue_events[EVQ_INDEX].read().is_err(),
+            "the restore kick must not notify the event queue"
+        );
     }
 
     #[test]
