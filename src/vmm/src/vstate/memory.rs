@@ -1232,14 +1232,45 @@ impl GuestRegionMmapExt {
                 }
                 Ok(())
             }
-            // A shared file mapping keeps its pages in the file's page cache: MADV_DONTNEED drops
-            // only the page table entries, and the guest reads the same data afterwards. Nothing
-            // changed, so nothing is recorded.
-            // TODO: madvise(MADV_DONTNEED) doesn't actually work with memfd
-            // (or in general MAP_SHARED of a fd). In those cases we should use
-            // fallocate64(FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE).
-            // We keep falling to the madvise branch to keep the previous behaviour.
-            (Some(_), flags) if flags & libc::MAP_SHARED != 0 => self.madvise_dontneed(caddr, len),
+            // A shared file mapping keeps its pages in the file: MADV_DONTNEED would drop only
+            // the page table entries, and the guest would read the same data afterwards with the
+            // memory still held. Punching a hole frees the pages and makes the range read as
+            // zeros in every mapping of the file. A hugetlbfs file is punched in whole huge
+            // pages, so the huge pages the range covers whole are discarded, as for a private
+            // hugetlbfs mapping above, and a range that covers none discards nothing.
+            (Some(file_offset), flags) if flags & libc::MAP_SHARED != 0 => {
+                let hugetlbfs_page_size = BackingFileSystem::of(file_offset.file())
+                    .map_err(GuestMemoryError::IOError)?
+                    .hugetlbfs_page_size();
+                let (caddr, len) = match hugetlbfs_page_size {
+                    Some(huge_page_size) => {
+                        match self.whole_huge_pages(caddr, len, huge_page_size)? {
+                            Some(range) => range,
+                            None => return Ok(()),
+                        }
+                    }
+                    None => (caddr, len),
+                };
+                let at = file_offset
+                    .start()
+                    .checked_add(caddr.raw_value())
+                    .ok_or(GuestMemoryError::GuestAddressOverflow)?;
+                // SAFETY: fallocate on the region's own file, inside the range it maps.
+                let ret = unsafe {
+                    libc::fallocate(
+                        file_offset.file().as_raw_fd(),
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        i64::try_from(at).map_err(|_| GuestMemoryError::GuestAddressOverflow)?,
+                        i64::try_from(len).map_err(|_| GuestMemoryError::GuestAddressOverflow)?,
+                    )
+                };
+                if ret != 0 {
+                    return Err(GuestMemoryError::IOError(std::io::Error::last_os_error()));
+                }
+                self.discarded
+                    .mark_dirty(u64_to_usize(caddr.raw_value()), len);
+                Ok(())
+            }
             // An anonymous private mapping, where a dropped page reads as zeros.
             _ => {
                 // madvise(2) cannot drop part of a huge page, and keeps one the range covers only
@@ -2971,6 +3002,49 @@ mod tests {
     }
 
     #[test]
+    fn test_discard_range_on_a_shared_file_frees_its_pages() {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        let page_size: usize = 0x1000;
+        let backing = test_utils::test_memfd(4 * page_size, false, 0x5a);
+        let reader = backing.try_clone().unwrap();
+        let mem = into_region_ext(
+            create(
+                std::iter::once((GuestAddress(0), 4 * page_size)),
+                libc::MAP_SHARED,
+                Some(backing),
+                false,
+                libc::MADV_NORMAL,
+            )
+            .unwrap(),
+        );
+        let blocks = || reader.metadata().unwrap().blocks();
+        let before = blocks();
+        mem.discard_range(GuestAddress(page_size as u64), 2 * page_size)
+            .unwrap();
+        let mut page = vec![0xffu8; page_size];
+        mem.read(page.as_mut_slice(), GuestAddress(page_size as u64))
+            .unwrap();
+        assert!(
+            page.iter().all(|&b| b == 0),
+            "a discarded page kept its data"
+        );
+        reader.read_exact_at(&mut page, page_size as u64).unwrap();
+        assert!(
+            page.iter().all(|&b| b == 0),
+            "the backing file kept the data"
+        );
+        mem.read(page.as_mut_slice(), GuestAddress(0)).unwrap();
+        assert!(
+            page.iter().all(|&b| b == 0x5a),
+            "a page outside the range changed"
+        );
+        assert!(
+            blocks() < before,
+            "the discard freed none of the backing file's memory"
+        );
+    }
+
+    #[test]
     fn test_discard_range_on_file() {
         let page_size: usize = 0x1000;
         let mut memory_file = TempFile::new().unwrap().into_file();
@@ -3367,9 +3441,9 @@ mod tests {
 
     #[test]
     fn test_diff_after_a_discard_of_shared_memory() {
-        // MADV_DONTNEED on a shared mapping drops the page table entries and leaves the pages in
-        // the file's page cache, so the guest still reads its data and the Diff has nothing to
-        // write. On hugetlbfs mincore(2) then reports the pages as not resident.
+        // A discard of a shared mapping punches a hole in its file: the guest reads zeros, the
+        // memory is freed, and the Diff writes the range as zeros, since KVM's dirty log never
+        // sees a discard.
         let check = |kind: &str, len: usize, huge_pages: HugePageConfig| {
             let mem =
                 into_region_ext(memfd_backed(&[(GuestAddress(0), len)], true, huge_pages).unwrap());
@@ -3379,15 +3453,15 @@ mod tests {
 
             let diff = merge_diff_with_clean_kvm_log(&mem, &vec![0xcd; len]);
             assert_eq!(
-                first_difference(&diff, &vec![0xcd; len]),
+                first_difference(&diff, &vec![0; len]),
                 None,
                 "{kind}: the Diff"
             );
-            let mut live = vec![0u8; len];
+            let mut live = vec![0xffu8; len];
             mem.read(&mut live, GuestAddress(0)).unwrap();
             assert!(
-                live.iter().all(|&byte| byte == 0xab),
-                "{kind}: the guest still reads its data"
+                live.iter().all(|&byte| byte == 0),
+                "{kind}: the guest reads zeros"
             );
         };
         check("shmem", 2 * host_page_size(), HugePageConfig::None);

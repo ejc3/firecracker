@@ -56,6 +56,10 @@
                 ]
             },
             {
+                "syscall": "fstatfs",
+                "comment": "Used by guest memory discards (balloon, virtio-mem) to find whether a file backing guest memory is on hugetlbfs, which is punched in whole huge pages"
+            },
+            {
                 "syscall": "close"
             },
             {
