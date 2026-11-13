@@ -22,7 +22,7 @@ use vmm_sys_util::eventfd::EventFd;
 use zerocopy::IntoBytes;
 
 use crate::arch::host_page_size;
-use crate::logger::{debug, error, warn};
+use crate::logger::{debug, error, info, warn};
 use crate::pci::configuration::{BAR0_REG_IDX, Bars, NUM_BAR_REGS, ROM_BAR_REG};
 use crate::pci::msix::{MsixCap, MsixConfig};
 use crate::pci::{PciCapabilityId, PciDevice, PciExpressCapabilityId, PciSBDF};
@@ -1280,11 +1280,23 @@ pub fn vfio_dma_map_guest_memory(
                 iova,
                 iova + size as u64
             );
-            populate_for_dma(hva, size)
+            let started = std::time::Instant::now();
+            let threads = populate_threads(size);
+            populate_for_dma(hva, size, threads)
                 .map_err(|error| VfioError::PopulateGuestMemory(iova, iova + size as u64, error))?;
+            let populated = started.elapsed();
             // SAFETY: all arguments are from the existing guest memory region
             // After this operation, virtual memory will have pinned physical pages backing it
             unsafe { container.vfio_dma_map(iova, size, hva) }?;
+            info!(
+                "DMA mapped guest memory [{:#x}..{:#x}]: populate_ms={:.1} threads={} \
+                 pin_ms={:.1}",
+                iova,
+                iova + size as u64,
+                populated.as_secs_f64() * 1000.0,
+                threads,
+                (started.elapsed() - populated).as_secs_f64() * 1000.0
+            );
         }
     }
     Ok(())
@@ -1304,10 +1316,71 @@ pub fn vfio_dma_map_guest_memory(
 ///
 /// A kernel older than 5.14 has no `MADV_POPULATE_WRITE` and answers `EINVAL`; the pin then
 /// faults the pages itself, as before, which works for every backend but `Uffd`.
-fn populate_for_dma(hva: *mut u8, size: usize) -> Result<(), std::io::Error> {
-    // SAFETY: `hva..hva + size` is one guest memory region mapped by this process; populating
-    // it changes no mapping, only which of its pages are resident.
-    let ret = unsafe { libc::madvise(hva.cast(), size, libc::MADV_POPULATE_WRITE) };
+fn populate_for_dma(hva: *mut u8, size: usize, threads: usize) -> Result<(), std::io::Error> {
+    let chunks = populate_chunks(size, threads);
+    if chunks.len() <= 1 {
+        return populate_range(hva as usize, size);
+    }
+    let base = hva as usize;
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = chunks
+            .iter()
+            .map(|&(offset, len)| {
+                std::thread::Builder::new()
+                    .name("fc_dma_populate".into())
+                    .spawn_scoped(scope, move || populate_range(base + offset, len))
+            })
+            .collect();
+        let mut result = Ok(());
+        for worker in workers {
+            let outcome = match worker {
+                // A thread that cannot start leaves its chunk to the pin, which faults it.
+                Err(error) => Err(error),
+                Ok(handle) => handle
+                    .join()
+                    .unwrap_or_else(|_| Err(std::io::Error::other("a populate thread panicked"))),
+            };
+            if result.is_ok() {
+                result = outcome;
+            }
+        }
+        result
+    })
+}
+
+/// Populate threads for a region of `size` bytes: one per 256 MiB, at most
+/// [`MAX_POPULATE_THREADS`] and the host's parallelism. Faulting 4 KiB pages costs about
+/// 0.65 s per GiB on one thread, and a hugetlbfs region served by a userfaultfd handler waits
+/// one round trip per 2 MiB page, so splitting the region keeps several faults in flight.
+fn populate_threads(size: usize) -> usize {
+    let host = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let wanted = size.div_ceil(256 << 20);
+    wanted.clamp(1, MAX_POPULATE_THREADS.min(host))
+}
+
+/// At most this many threads fault one region in.
+const MAX_POPULATE_THREADS: usize = 8;
+
+/// `(offset, len)` pieces of a `size`-byte region for `threads` threads, each a multiple of
+/// 2 MiB (the largest page a guest region is mapped with) except the last.
+fn populate_chunks(size: usize, threads: usize) -> Vec<(usize, usize)> {
+    const ALIGN: usize = 2 << 20;
+    let threads = threads.max(1);
+    let per = size.div_ceil(threads).div_ceil(ALIGN) * ALIGN;
+    let mut chunks = Vec::new();
+    let mut offset = 0;
+    while offset < size {
+        let len = per.min(size - offset);
+        chunks.push((offset, len));
+        offset += len;
+    }
+    chunks
+}
+
+fn populate_range(addr: usize, size: usize) -> Result<(), std::io::Error> {
+    // SAFETY: `addr..addr + size` is part of one guest memory region mapped by this process;
+    // populating it changes no mapping, only which of its pages are resident.
+    let ret = unsafe { libc::madvise(addr as *mut libc::c_void, size, libc::MADV_POPULATE_WRITE) };
     if ret == 0 {
         return Ok(());
     }
@@ -1341,6 +1414,102 @@ pub fn vfio_create_kvm_vfio_device_and_vfio_container(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The populate's pieces cover the region exactly, in order, each a multiple of 2 MiB but
+    /// the last, and never number more than the threads asked for.
+    #[test]
+    fn populate_chunks_cover_the_region() {
+        const MIB: usize = 1 << 20;
+        for (size, threads) in [
+            (6144 * MIB, 8),
+            (6 * MIB, 8),
+            (MIB, 8),
+            (8193 * MIB, 3),
+            (4096, 1),
+        ] {
+            let chunks = populate_chunks(size, threads);
+            assert!(chunks.len() <= threads, "{size} {threads}: {chunks:?}");
+            let mut next = 0;
+            for (i, &(offset, len)) in chunks.iter().enumerate() {
+                assert_eq!(offset, next);
+                assert!(len > 0);
+                if i + 1 < chunks.len() {
+                    assert_eq!(len % (2 * MIB), 0, "{size} {threads}: {chunks:?}");
+                }
+                next += len;
+            }
+            assert_eq!(next, size);
+        }
+        assert_eq!(populate_chunks(6144 * MIB, 8).len(), 8);
+        assert_eq!(
+            populate_threads(6144 * MIB).min(8),
+            populate_threads(6144 * MIB)
+        );
+        assert_eq!(populate_threads(64 * MIB), 1);
+    }
+
+    /// Several populate threads over one userfaultfd region: every page is still served once
+    /// and holds what the handler put there.
+    #[test]
+    fn a_parallel_populate_waits_for_a_userfaultfd_handler() {
+        let page = host_page_size();
+        // Four 2 MiB pieces.
+        let size = 8 << 20;
+        let pages = size / page;
+        // SAFETY: a fresh private anonymous mapping, unmapped at the end of the test.
+        let hva = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(hva, libc::MAP_FAILED);
+        let uffd = userfaultfd::UffdBuilder::new()
+            .close_on_exec(true)
+            .non_blocking(false)
+            .user_mode_only(false)
+            .create()
+            .expect("creating a userfaultfd (needs vm.unprivileged_userfaultfd=1)");
+        uffd.register(hva, size).unwrap();
+        let base = hva as usize;
+        let handler = std::thread::spawn(move || {
+            let mut served = 0;
+            let mut source = vec![0u8; page];
+            while served < pages {
+                match uffd.read_event().unwrap() {
+                    Some(userfaultfd::Event::Pagefault { addr, .. }) => {
+                        let at = (addr as usize) & !(page - 1);
+                        source.fill(u8::try_from((at - base) / page % 251 + 1).unwrap());
+                        // SAFETY: `at` is a page of the registered region, `source` a page.
+                        match unsafe { uffd.copy(source.as_ptr().cast(), at as *mut _, page, true) }
+                        {
+                            Ok(_) => served += 1,
+                            // Another thread's fault on the same page was already served.
+                            Err(userfaultfd::Error::CopyFailed(errno))
+                                if errno as i32 == libc::EEXIST => {}
+                            Err(error) => panic!("{error}"),
+                        }
+                    }
+                    other => panic!("unexpected userfaultfd event {other:?}"),
+                }
+            }
+            served
+        });
+        populate_for_dma(hva.cast(), size, 4).expect("populating userfaultfd memory");
+        assert_eq!(handler.join().unwrap(), pages);
+        // SAFETY: the region is mapped and every page is now resident.
+        let bytes = unsafe { std::slice::from_raw_parts(hva.cast::<u8>(), size) };
+        for (index, chunk) in bytes.chunks(page).enumerate() {
+            let expected = u8::try_from(index % 251 + 1).unwrap();
+            assert!(chunk.iter().all(|&b| b == expected), "page {index}");
+        }
+        // SAFETY: unmapping the mapping made above.
+        unsafe { libc::munmap(hva, size) };
+    }
 
     /// The DMA map's pin cannot wait for a userfaultfd handler, so memory a handler fills
     /// must be resident before it. `populate_for_dma` faults the region in the way user space
@@ -1392,7 +1561,7 @@ mod tests {
             }
             served
         });
-        populate_for_dma(hva.cast(), size).expect("populating userfaultfd memory");
+        populate_for_dma(hva.cast(), size, 1).expect("populating userfaultfd memory");
         assert_eq!(handler.join().unwrap(), PAGES);
         // SAFETY: the region is mapped and every page is now resident.
         let bytes = unsafe { std::slice::from_raw_parts(hva.cast::<u8>(), size) };

@@ -52,6 +52,8 @@ use crate::{EventManager, Vmm, vstate};
 // handshake must use a new magic rather than accepting ambiguous payloads on this stream.
 const UFFD_MINOR_BACKING_HELLO_V1: &[u8] = b"FCVM_UFFD_MINOR_BACKING";
 const UFFD_MINOR_BACKING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The greeting a caller sends with the descriptor of a [`MemBackendType::Prefilled`] backing.
+const PREFILLED_BACKING_HELLO_V1: &[u8] = b"FCVM_PREFILLED_MEMORY";
 // `userfaultfd` 0.9 exposes MINOR registration but not these Linux UAPI capability-probe bits.
 // Keep the values pinned to include/uapi/linux/userfaultfd.h in Linux v7.0.
 const UFFD_FEATURE_MINOR_HUGETLBFS: u64 = 1 << 9;
@@ -425,6 +427,8 @@ pub enum RestoreFromSnapshotGuestMemoryError {
     File(#[from] GuestMemoryFromFileError),
     /// Error creating guest memory from uffd: {0}
     Uffd(#[from] GuestMemoryFromUffdError),
+    /// Error mapping the prefilled guest memory backing: {0}
+    Prefilled(GuestMemoryFromUffdError),
 }
 
 /// Loads a Microvm snapshot producing a 'paused' Microvm.
@@ -532,6 +536,16 @@ pub fn restore_from_snapshot(
             vm_resources.machine_config.huge_pages,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
+        MemBackendType::Prefilled => (
+            guest_memory_from_prefilled(
+                mem_backend_path,
+                mem_state,
+                track_dirty_pages,
+                vm_resources.machine_config.huge_pages,
+            )
+            .map_err(RestoreFromSnapshotGuestMemoryError::Prefilled)?,
+            None,
+        ),
         MemBackendType::UffdMinor => guest_memory_from_uffd_minor(
             mem_backend_path,
             mem_state,
@@ -734,12 +748,83 @@ fn guest_memory_from_uffd_minor(
     Ok((guest_memory, Some(uffd)))
 }
 
-fn receive_uffd_minor_backing(socket: &UnixStream) -> Result<File, GuestMemoryFromUffdError> {
-    receive_uffd_minor_backing_with_timeout(socket, UFFD_MINOR_BACKING_HANDSHAKE_TIMEOUT)
+/// Maps guest memory over a backing file that already holds the guest's memory.
+///
+/// Firecracker connects once to `mem_uds_path` and the caller sends the backing file's
+/// descriptor with [`PREFILLED_BACKING_HELLO_V1`]. Every region is mapped `MAP_SHARED` at its
+/// offset in that file, and no userfaultfd is registered: the caller wrote the snapshot's
+/// memory into the file before the load, so every page is present. A hugetlbfs file with its
+/// pages allocated lets the DMA map of a passthrough device pin guest memory without faulting
+/// or copying a page. The backing must be on hugetlbfs with the page size `huge_pages` selects,
+/// or on shmem for 4 KiB pages, and must be at least as large as guest memory. Guest writes go
+/// to that file, so the caller must give each VM a file of its own.
+fn guest_memory_from_prefilled(
+    mem_uds_path: &Path,
+    mem_state: &GuestMemoryState,
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromUffdError> {
+    let socket = UnixStream::connect(mem_uds_path)?;
+    map_prefilled_backing(&socket, mem_state, track_dirty_pages, huge_pages)
 }
 
+/// The prefilled backing received on `socket`, mapped as guest memory.
+fn map_prefilled_backing(
+    socket: &UnixStream,
+    mem_state: &GuestMemoryState,
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromUffdError> {
+    let backing = receive_backing_with_timeout(
+        socket,
+        PREFILLED_BACKING_HELLO_V1,
+        UFFD_MINOR_BACKING_HANDSHAKE_TIMEOUT,
+    )?;
+    check_uffd_minor_backing(&backing, huge_pages)?;
+    let memory_size = mem_state
+        .regions()
+        .try_fold(0u64, |acc, (_, size)| acc.checked_add(size as u64))
+        .ok_or(GuestMemoryFromUffdError::Restore(
+            MemoryError::OffsetTooLarge,
+        ))?;
+    let file_size = backing
+        .metadata()
+        .map_err(GuestMemoryFromUffdError::BackingFileStat)?
+        .len();
+    if file_size < memory_size {
+        return Err(GuestMemoryFromUffdError::Restore(
+            MemoryError::OffsetTooLarge,
+        ));
+    }
+    Ok(memory::create(
+        mem_state.regions(),
+        libc::MAP_SHARED,
+        Some(backing),
+        track_dirty_pages,
+        huge_pages.madvise_flags(),
+    )?)
+}
+
+fn receive_uffd_minor_backing(socket: &UnixStream) -> Result<File, GuestMemoryFromUffdError> {
+    receive_backing_with_timeout(
+        socket,
+        UFFD_MINOR_BACKING_HELLO_V1,
+        UFFD_MINOR_BACKING_HANDSHAKE_TIMEOUT,
+    )
+}
+
+#[cfg(test)]
 fn receive_uffd_minor_backing_with_timeout(
     socket: &UnixStream,
+    timeout: Duration,
+) -> Result<File, GuestMemoryFromUffdError> {
+    receive_backing_with_timeout(socket, UFFD_MINOR_BACKING_HELLO_V1, timeout)
+}
+
+/// Receives one backing file descriptor sent with the greeting `hello` on `socket`.
+fn receive_backing_with_timeout(
+    socket: &UnixStream,
+    hello_v1: &[u8],
     timeout: Duration,
 ) -> Result<File, GuestMemoryFromUffdError> {
     let previous_timeout = socket.read_timeout()?;
@@ -751,7 +836,7 @@ fn receive_uffd_minor_backing_with_timeout(
         // One extra byte makes an overlong greeting fail closed instead of accepting a valid
         // prefix. UnixStream does not preserve sendmsg boundaries, so accumulate fragments while
         // retaining the descriptor delivered with any one of them.
-        let mut hello = [0u8; UFFD_MINOR_BACKING_HELLO_V1.len() + 1];
+        let mut hello = vec![0u8; hello_v1.len() + 1];
         let mut hello_len = 0;
         let mut backing = None;
 
@@ -784,18 +869,16 @@ fn receive_uffd_minor_backing_with_timeout(
             }
 
             hello_len += fragment_len;
-            if hello_len > UFFD_MINOR_BACKING_HELLO_V1.len()
-                || hello[..hello_len] != UFFD_MINOR_BACKING_HELLO_V1[..hello_len]
-            {
+            if hello_len > hello_v1.len() || hello[..hello_len] != hello_v1[..hello_len] {
                 return Err(GuestMemoryFromUffdError::InvalidBackingHandshake);
             }
-            if fragment_len == 0 || hello_len == UFFD_MINOR_BACKING_HELLO_V1.len() {
+            if fragment_len == 0 || hello_len == hello_v1.len() {
                 break;
             }
         }
 
         let backing = backing.ok_or(GuestMemoryFromUffdError::NoBackingFile)?;
-        if hello_len != UFFD_MINOR_BACKING_HELLO_V1.len() {
+        if hello_len != hello_v1.len() {
             return Err(GuestMemoryFromUffdError::InvalidBackingHandshake);
         }
         Ok(backing)
@@ -1669,6 +1752,85 @@ mod tests {
             let backing = memory::test_utils::test_memfd(HUGE_PAGE, hugetlbfs_backing, 0x5a);
             map_uffd_minor_backing(backing, &mem_state, false, huge_pages).unwrap();
         }
+    }
+
+    fn one_region(size: usize) -> GuestMemoryState {
+        GuestMemoryState {
+            regions: vec![GuestMemoryRegionState {
+                base_address: 0,
+                size,
+                region_type: GuestRegionType::Dram,
+                plugged: vec![true],
+            }],
+        }
+    }
+
+    /// A prefilled backing is guest memory itself: the guest reads what the caller wrote, and
+    /// a guest write lands in the caller's file, with no userfaultfd anywhere.
+    #[test]
+    fn test_prefilled_backing_is_mapped_shared() {
+        use std::os::unix::fs::FileExt;
+        let (firecracker, caller) = UnixStream::pair().unwrap();
+        let mem_size = 0x20_000usize;
+        let backing = memory::test_utils::test_memfd(mem_size, false, 0x5a);
+        caller
+            .send_with_fd(PREFILLED_BACKING_HELLO_V1, backing.as_raw_fd())
+            .unwrap();
+        let guest_memory = map_prefilled_backing(
+            &firecracker,
+            &one_region(mem_size),
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap();
+        let mut restored = vec![0; mem_size];
+        guest_memory[0]
+            .read(&mut restored, MemoryRegionAddress(0))
+            .unwrap();
+        assert!(restored.iter().all(|byte| *byte == 0x5a));
+        guest_memory[0]
+            .write(&[0xa5; 16], MemoryRegionAddress(0x1000))
+            .unwrap();
+        let mut seen = [0u8; 16];
+        backing.read_exact_at(&mut seen, 0x1000).unwrap();
+        assert_eq!(
+            seen, [0xa5; 16],
+            "a guest write did not reach the backing file"
+        );
+    }
+
+    #[test]
+    fn test_prefilled_backing_rejects_the_minor_greeting_and_a_short_file() {
+        let (firecracker, caller) = UnixStream::pair().unwrap();
+        let backing = memory::test_utils::test_memfd(0x2000, false, 0);
+        caller
+            .send_with_fd(UFFD_MINOR_BACKING_HELLO_V1, backing.as_raw_fd())
+            .unwrap();
+        assert!(matches!(
+            map_prefilled_backing(
+                &firecracker,
+                &one_region(0x2000),
+                false,
+                HugePageConfig::None
+            ),
+            Err(GuestMemoryFromUffdError::InvalidBackingHandshake)
+        ));
+        let (firecracker, caller) = UnixStream::pair().unwrap();
+        let short = memory::test_utils::test_memfd(0x1000, false, 0);
+        caller
+            .send_with_fd(PREFILLED_BACKING_HELLO_V1, short.as_raw_fd())
+            .unwrap();
+        assert!(matches!(
+            map_prefilled_backing(
+                &firecracker,
+                &one_region(0x2000),
+                false,
+                HugePageConfig::None
+            ),
+            Err(GuestMemoryFromUffdError::Restore(
+                MemoryError::OffsetTooLarge
+            ))
+        ));
     }
 
     #[test]

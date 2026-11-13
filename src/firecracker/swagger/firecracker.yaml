@@ -1582,6 +1582,7 @@ definitions:
           - File
           - Uffd
           - UffdMinor
+          - Prefilled
       backend_path:
         type: string
         description: Based on 'backend_type' it is either
@@ -1589,7 +1590,10 @@ definitions:
           2) Path to the UDS where a process is listening for a UFFD initialization
           control payload and open file descriptor that it can use to serve this
           process's guest memory page faults. For UffdMinor, the handler first
-          supplies the private backing-file descriptor over this UDS.
+          supplies the private backing-file descriptor over this UDS. For
+          Prefilled, the caller sends the descriptor of a file that already holds
+          guest memory over this UDS, and Firecracker maps it shared with no
+          userfaultfd.
 
   Metrics:
     type: object

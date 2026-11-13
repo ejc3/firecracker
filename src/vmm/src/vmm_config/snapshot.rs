@@ -41,6 +41,9 @@ pub enum MemBackendType {
     /// handler resolves faults with `UFFDIO_CONTINUE`. Clean pages are shared through the
     /// page cache and guest writes use ordinary copy-on-write memory.
     UffdMinor,
+    /// Guest memory is mapped `MAP_SHARED` over a backing file received from the caller over
+    /// the UDS, which already holds the guest's memory. No userfaultfd is registered.
+    Prefilled,
 }
 
 /// Stores the configuration that will be used for creating a snapshot.
@@ -219,5 +222,14 @@ mod tests {
         .unwrap();
         assert_eq!(config.backend_type, MemBackendType::UffdMinor);
         assert_eq!(config.backend_path, PathBuf::from("/run/fcvm/uffd.sock"));
+    }
+
+    #[test]
+    fn test_prefilled_backend_deserializes() {
+        let config: MemBackendConfig = serde_json::from_str(
+            r#"{"backend_path":"/run/fcvm/memory.sock","backend_type":"Prefilled"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.backend_type, MemBackendType::Prefilled);
     }
 }
