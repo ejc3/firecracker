@@ -84,6 +84,8 @@ enum MainError {
     MetricsInitialization(MetricsConfigError),
     /// Seccomp error: {0}
     SeccompFilter(FilterError),
+    /// Failed to install the seccomp filter the whole process shares: {0}
+    SharedSeccompFilter(vmm::seccomp::InstallationError),
     /// Failed to resize fd table: {0}
     ResizeFdtable(ResizeFdTableError),
     /// RunWithApiError error: {0}
@@ -395,12 +397,27 @@ fn main_exec() -> Result<(), MainError> {
         init_metrics(metrics_config).map_err(MainError::MetricsInitialization)?;
     }
 
-    let mut seccomp_filters: BpfThreadMap = SeccompConfig::from_args(
+    let seccomp_config = SeccompConfig::from_args(
         arguments.flag_present("no-seccomp"),
         arguments.single_value("seccomp-filter"),
     )
-    .and_then(seccomp::get_filters)
     .map_err(MainError::SeccompFilter)?;
+    let default_policy = matches!(seccomp_config, SeccompConfig::Advanced);
+    let mut seccomp_filters: BpfThreadMap =
+        seccomp::get_filters(seccomp_config).map_err(MainError::SeccompFilter)?;
+    // The default policy of a target without one of its own (`unimplemented.json`: every
+    // target but the musl ones) is the same program for every thread category. Install it
+    // here, while this is the only thread, and every thread inherits it: one kernel
+    // program for the process, where each thread installing its copy made one per thread.
+    // The categories are left empty, so no thread installs another. The policies that
+    // differ per category, and custom filters, are installed per thread as before.
+    if default_policy {
+        if let Some(shared) = vmm::seccomp::shared_filter(&seccomp_filters) {
+            vmm::seccomp::apply_filter_to_process(&shared)
+                .map_err(MainError::SharedSeccompFilter)?;
+            seccomp_filters = vmm::seccomp::get_empty_filters();
+        }
+    }
 
     let vmm_config_json = arguments
         .single_value("config-file")
