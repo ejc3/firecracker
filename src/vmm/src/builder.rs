@@ -230,6 +230,13 @@ pub fn build_microvm_for_boot(
     };
 
     let kvm_vm = Arc::new(vm);
+    crate::vstate::memory::defer_numa_balancing(
+        kvm_vm.guest_memory(),
+        seccomp_filters
+            .get("vmm")
+            .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
+            .clone(),
+    );
     let vm = Vm::Kvm(kvm_vm.clone());
 
     let pmem_devices = vm_resources
@@ -596,6 +603,13 @@ pub fn build_microvm_from_snapshot(
     // Restore the boot source config paths.
     vm_resources.boot_source.config = microvm_state.vm_info.boot_source;
 
+    crate::vstate::memory::defer_numa_balancing(
+        kvm_vm.guest_memory(),
+        seccomp_filters
+            .get("vmm")
+            .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
+            .clone(),
+    );
     let vm = Vm::Kvm(kvm_vm.clone());
 
     // Restore devices states.
