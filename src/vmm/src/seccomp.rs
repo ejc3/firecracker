@@ -76,6 +76,42 @@ pub enum InstallationError {
     FilterTooLarge,
     /// prctl` syscall failed with error code: {0}
     Prctl(std::io::Error),
+    /// Cannot count the threads of this process: {0}
+    ThreadCount(std::io::Error),
+    /// The process has {0} threads; a filter for the whole process is installed while it has one
+    NotSingleThreaded(usize),
+}
+
+/// The program every thread category of `filters` holds, when all of them hold the same
+/// one and it is not empty.
+///
+/// A thread's seccomp filter is inherited by the threads it creates, which then share the
+/// one kernel program. A filter each thread installs for itself is a program of its own:
+/// the kernel compiles it at the install and frees it when the thread exits, and both take
+/// the BPF JIT's host-wide `pack_mutex`. A process whose categories all hold the same
+/// program therefore needs it once.
+pub fn shared_filter(filters: &BpfThreadMap) -> Option<Arc<BpfProgram>> {
+    let mut programs = filters.values();
+    let first = programs.next()?;
+    if first.is_empty() || programs.any(|program| program != first) {
+        return None;
+    }
+    Some(Arc::clone(first))
+}
+
+/// Install `bpf_filter` for the whole process: on the calling thread, which must be the
+/// only one, so that every thread created afterwards inherits it.
+///
+/// A process that already has a second thread is refused: that thread would run without
+/// the filter.
+pub fn apply_filter_to_process(bpf_filter: BpfProgramRef) -> Result<(), InstallationError> {
+    let threads = std::fs::read_dir("/proc/self/task")
+        .map_err(InstallationError::ThreadCount)?
+        .count();
+    if threads != 1 {
+        return Err(InstallationError::NotSingleThreaded(threads));
+    }
+    apply_filter(bpf_filter)
 }
 
 /// The maximum seccomp-BPF program length allowed by the linux kernel.
@@ -167,6 +203,82 @@ mod tests {
         // Create a large buffer that when serialized will exceed DESERIALIZATION_BYTES_LIMIT
         let large_data = vec![0u8; DESERIALIZATION_BYTES_LIMIT + 1000];
         deserialize_binary(&large_data[..]).unwrap_err();
+    }
+
+    fn thread_map(vmm: &[u64], api: &[u64], vcpu: &[u64]) -> BpfThreadMap {
+        let mut map = BpfThreadMap::new();
+        map.insert("vmm".to_string(), Arc::new(vmm.to_vec()));
+        map.insert("api".to_string(), Arc::new(api.to_vec()));
+        map.insert("vcpu".to_string(), Arc::new(vcpu.to_vec()));
+        map
+    }
+
+    #[test]
+    fn test_shared_filter() {
+        let program = [1u64, 2, 3];
+        assert_eq!(
+            shared_filter(&thread_map(&program, &program, &program)).as_deref(),
+            Some(&program.to_vec())
+        );
+        // Categories that differ keep a program each.
+        assert_eq!(shared_filter(&thread_map(&program, &program, &[1, 2])), None);
+        assert_eq!(shared_filter(&thread_map(&[9, 2, 3], &program, &program)), None);
+        // --no-seccomp: nothing to install.
+        assert_eq!(shared_filter(&get_empty_filters()), None);
+        assert_eq!(shared_filter(&BpfThreadMap::new()), None);
+    }
+
+    /// The `Seccomp_filters` line of the calling thread's status: the number of filters
+    /// attached to it, inherited ones included.
+    fn seccomp_filters_of_this_thread() -> usize {
+        std::fs::read_to_string("/proc/thread-self/status")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("Seccomp_filters:"))
+            .expect("the kernel reports Seccomp_filters")
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// A thread created after the install runs under the installer's filter and adds none
+    /// of its own when its category's program is empty, which is what every category's
+    /// becomes once the shared one is installed.
+    #[test]
+    fn test_threads_inherit_the_installed_filter() {
+        // BPF_RET | BPF_K, SECCOMP_RET_ALLOW: a one-instruction program that allows everything.
+        let allow_all: BpfProgram = vec![0x7fff_0000_0000_0006];
+        thread::spawn(move || {
+            assert_eq!(seccomp_filters_of_this_thread(), 0);
+            apply_filter(&allow_all).unwrap();
+            assert_eq!(seccomp_filters_of_this_thread(), 1);
+            thread::spawn(|| {
+                assert_eq!(unsafe { libc::prctl(libc::PR_GET_SECCOMP) }, 2);
+                assert_eq!(seccomp_filters_of_this_thread(), 1);
+                apply_filter(&get_empty_filters()["vcpu"]).unwrap();
+                assert_eq!(seccomp_filters_of_this_thread(), 1);
+            })
+            .join()
+            .unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// The test harness runs this on a thread beside its main one, so the process has
+    /// more than one thread and the install is refused before anything is installed.
+    #[test]
+    fn test_apply_filter_to_process_refuses_a_second_thread() {
+        thread::spawn(|| {
+            let allow_all: BpfProgram = vec![0x7fff_0000_0000_0006];
+            assert!(matches!(
+                apply_filter_to_process(&allow_all).unwrap_err(),
+                InstallationError::NotSingleThreaded(threads) if threads > 1
+            ));
+            assert_eq!(unsafe { libc::prctl(libc::PR_GET_SECCOMP) }, 0);
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
