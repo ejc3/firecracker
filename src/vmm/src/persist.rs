@@ -517,16 +517,17 @@ pub fn restore_from_snapshot(
                 )
                 .into());
             }
-            (
-                guest_memory_from_file(
-                    mem_backend_path,
-                    mem_state,
-                    track_dirty_pages,
-                    vm_resources.machine_config.huge_pages,
-                )
-                .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
-                None,
+            let guest_memory = guest_memory_from_file(
+                mem_backend_path,
+                mem_state,
+                track_dirty_pages,
+                vm_resources.machine_config.huge_pages,
             )
+            .map_err(RestoreFromSnapshotGuestMemoryError::File)?;
+            if let Some(path) = &params.mem_backend.write_set_path {
+                populate_write_set(&guest_memory, path);
+            }
+            (guest_memory, None)
         }
         MemBackendType::Uffd => guest_memory_from_uffd(
             mem_backend_path,
@@ -638,6 +639,48 @@ fn guest_memory_from_file(
         false,
     )?;
     Ok(guest_mem)
+}
+
+/// Reads a write-set file: `<offset> <length>` lines, decimal bytes of the memory file.
+fn read_write_set(path: &Path) -> std::io::Result<Vec<(u64, u64)>> {
+    let text = std::fs::read_to_string(path)?;
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut words = line.split_whitespace();
+            let mut number = || -> std::io::Result<u64> {
+                words.next().and_then(|w| w.parse().ok()).ok_or_else(|| {
+                    std::io::Error::other(format!("not '<offset> <length>': {line}"))
+                })
+            };
+            Ok((number()?, number()?))
+        })
+        .collect()
+}
+
+/// Populates the write set at `path` into `guest_memory` before the VM runs. The set is a hint:
+/// a file that cannot be read or a populate the kernel refuses is logged and the restore goes on,
+/// with the guest taking those pages' copy-on-write faults itself.
+fn populate_write_set(guest_memory: &[GuestRegionMmap], path: &Path) {
+    let started = std::time::Instant::now();
+    let outcome = read_write_set(path)
+        .map_err(|err| err.to_string())
+        .and_then(|ranges| {
+            crate::vstate::memory::populate_write_file_ranges(guest_memory, &ranges)
+                .map(|bytes| (ranges.len(), bytes))
+                .map_err(|err| err.to_string())
+        });
+    match outcome {
+        Ok((ranges, bytes)) => info!(
+            "populated the write set: {ranges} ranges, {} KiB, in {} us",
+            bytes / 1024,
+            started.elapsed().as_micros()
+        ),
+        Err(err) => warn!(
+            "did not populate the write set at {}: {err}",
+            path.display()
+        ),
+    }
 }
 
 /// Error type for [`guest_memory_from_uffd`]

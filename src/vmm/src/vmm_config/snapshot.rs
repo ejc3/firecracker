@@ -195,6 +195,13 @@ pub struct MemBackendConfig {
     pub backend_path: PathBuf,
     /// Specifies the guest memory backend type.
     pub backend_type: MemBackendType,
+    /// File backend only: a file of `<offset> <length>` lines, in bytes of the memory file,
+    /// naming the pages the guest is expected to write soon after the restore. Each range is
+    /// populated writable (MADV_POPULATE_WRITE) before the VM runs, so the guest's first write
+    /// to such a page does not take a copy-on-write fault, and the two TLB invalidations it
+    /// brings, while the vCPU waits. Ranges outside the memory file's regions are ignored.
+    #[serde(default)]
+    pub write_set_path: Option<PathBuf>,
 }
 
 /// The microVM state options.
