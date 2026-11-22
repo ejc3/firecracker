@@ -199,6 +199,13 @@ pub fn build_microvm_for_boot(
     };
 
     let kvm_vm = Arc::new(vm);
+    crate::vstate::memory::defer_numa_balancing(
+        kvm_vm.guest_memory(),
+        seccomp_filters
+            .get("vmm")
+            .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
+            .clone(),
+    );
     let vm = Vm::Kvm(kvm_vm.clone());
 
     let mut device_manager = DeviceManager::new(
@@ -492,6 +499,13 @@ pub fn build_microvm_from_snapshot(
     vm.set_uffd(uffd);
 
     let kvm_vm = Arc::new(vm);
+    crate::vstate::memory::defer_numa_balancing(
+        kvm_vm.guest_memory(),
+        seccomp_filters
+            .get("vmm")
+            .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
+            .clone(),
+    );
     let vm = Vm::Kvm(kvm_vm.clone());
 
     // Restore devices states.
