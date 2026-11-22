@@ -1879,6 +1879,13 @@ definitions:
           control payload and open file descriptor that it can use to serve this
           process's guest memory page faults. For UffdMinor, the handler first
           supplies the private backing-file descriptor over this UDS.
+      write_set_path:
+        type: string
+        description: File backend only. A file of `<offset> <length>` lines, in bytes
+          of the memory file, naming the pages the guest is expected to write soon after
+          the restore. Each range is populated writable before the VM runs, so the
+          guest's first write does not take a copy-on-write fault. A file that cannot be
+          read is logged and ignored.
 
   Metrics:
     type: object

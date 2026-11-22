@@ -1234,6 +1234,78 @@ pub fn uffd_minor_backing(
     )
 }
 
+/// The bytes of guest memory in `regions` that the file byte ranges `ranges` map, each range
+/// clamped to the regions.
+pub fn file_ranges_len(regions: &[GuestRegionMmap], ranges: &[(u64, u64)]) -> u64 {
+    let bounds: Vec<(u64, u64)> = regions
+        .iter()
+        .filter_map(|region| {
+            let start = region.file_offset()?.start();
+            Some((start, start + region.len()))
+        })
+        .collect();
+    clamped_len(&bounds, ranges)
+}
+
+/// The summed length of `ranges` clamped to each of `bounds` (file offset start and end).
+/// It saturates: overlapping ranges must not wrap past `u64::MAX` to a small number, which
+/// would pass a bound on the total.
+fn clamped_len(bounds: &[(u64, u64)], ranges: &[(u64, u64)]) -> u64 {
+    let mut total = 0u64;
+    for &(start, end) in bounds {
+        for &(offset, length) in ranges {
+            let from = offset.max(start);
+            let to = offset.saturating_add(length).min(end);
+            total = total.saturating_add(to.saturating_sub(from));
+        }
+    }
+    total
+}
+
+/// Populates writable, with MADV_POPULATE_WRITE, the guest memory that maps the byte ranges
+/// `ranges` (offset, length) of the file backing `regions`: on a private file mapping each page
+/// is copied from the page cache into this process now, rather than on the guest's first write
+/// under a stage-2 fault. The parts of a range outside every region are skipped. Returns the
+/// bytes populated.
+pub fn populate_write_file_ranges(
+    regions: &[GuestRegionMmap],
+    ranges: &[(u64, u64)],
+) -> Result<u64, MemoryError> {
+    let mut populated = 0u64;
+    for region in regions {
+        let Some(file_offset) = region.file_offset() else {
+            continue;
+        };
+        let start = file_offset.start();
+        let end = start + region.len();
+        for &(offset, length) in ranges {
+            let from = offset.max(start);
+            let to = offset.saturating_add(length).min(end);
+            if from >= to {
+                continue;
+            }
+            // SAFETY: [from, to) lies inside this region's mapping, which `regions` keeps mapped.
+            let ret = unsafe {
+                libc::madvise(
+                    region
+                        .as_ptr()
+                        .add(usize::try_from(from - start).unwrap())
+                        .cast(),
+                    usize::try_from(to - from).unwrap(),
+                    libc::MADV_POPULATE_WRITE,
+                )
+            };
+            if ret != 0 {
+                return Err(MemoryError::WriteMemory(GuestMemoryError::IOError(
+                    io::Error::last_os_error(),
+                )));
+            }
+            populated += to - from;
+        }
+    }
+    Ok(populated)
+}
+
 /// Marks as dirty the `len` bytes of guest memory mapped at host address `ptr`.
 ///
 /// `[ptr, ptr + len)` must lie within a single region of `mem`, as ranges resolved with
@@ -1853,6 +1925,59 @@ mod tests {
                 assert_eq!(region.bitmap().is_some(), dirty_page_tracking);
             });
         }
+    }
+
+    /// Overlapping ranges whose clamped lengths add up past `u64::MAX` saturate there rather
+    /// than wrap to a small total that a bound would pass.
+    #[test]
+    fn overlapping_write_set_ranges_saturate() {
+        let bounds = [(0, u64::MAX)];
+        let ranges = [(0, u64::MAX), (0, u64::MAX), (1, u64::MAX)];
+        assert_eq!(clamped_len(&bounds, &ranges), u64::MAX);
+        assert_eq!(clamped_len(&[(0, 8192)], &[(0, 4096), (4096, 8192)]), 8192);
+    }
+
+    /// Populating a write set gives exactly its pages a private copy in this process, before
+    /// anything writes them; the rest of the private file mapping stays unfaulted.
+    #[test]
+    fn populating_a_write_set_copies_exactly_its_pages() {
+        let page = 0x1000usize;
+        let mut file = TempFile::new().unwrap().into_file();
+        file.write_all(&vec![0x5au8; 16 * page]).unwrap();
+        let regions = snapshot_file(
+            file,
+            &[(GuestAddress(0), 16 * page)],
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap();
+        let ranges = [
+            (4 * page as u64, 2 * page as u64),
+            (100 * page as u64, page as u64),
+        ];
+        assert_eq!(
+            populate_write_file_ranges(&regions, &ranges).unwrap(),
+            2 * page as u64
+        );
+        let base = regions[0].as_ptr() as u64;
+        let mut pagemap = File::open("/proc/self/pagemap").unwrap();
+        for index in 0..16u64 {
+            let mut entry = [0u8; 8];
+            pagemap
+                .seek(SeekFrom::Start((base / page as u64 + index) * 8))
+                .unwrap();
+            pagemap.read_exact(&mut entry).unwrap();
+            let entry = u64::from_ne_bytes(entry);
+            let private_copy = entry >> 63 & 1 == 1 && entry >> 61 & 1 == 0;
+            assert_eq!(
+                private_copy,
+                (4..6).contains(&index),
+                "page {index}: {entry:#x}"
+            );
+        }
+        // The copy holds the file's bytes.
+        // SAFETY: the page lies inside the region, which `regions` keeps mapped.
+        assert_eq!(unsafe { *regions[0].as_ptr().add(4 * page) }, 0x5a);
     }
 
     #[test]
