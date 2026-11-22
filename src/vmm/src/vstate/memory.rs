@@ -28,7 +28,7 @@ use vm_memory::{
 };
 
 use crate::arch::host_page_size;
-use crate::logger::error;
+use crate::logger::{error, warn};
 use crate::utils::{mib_to_bytes, u64_to_usize};
 use crate::vmm_config::machine_config::HugePageConfig;
 use crate::vstate::vm::{KvmVm, VmError};
@@ -1673,6 +1673,131 @@ pub mod test_utils {
              available; raise vm.nr_hugepages to provide them"
         );
         None
+    }
+}
+
+/// Seconds a new guest's memory stays out of automatic NUMA balancing; 0 leaves it in from the
+/// start. Set once from `--numa-balancing-after-secs` before any guest memory exists.
+pub static NUMA_BALANCING_AFTER_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `mbind(2)` one guest memory range to `mode` with no node mask.
+fn mbind_range(addr: usize, len: usize, mode: libc::c_int) -> io::Result<()> {
+    // SAFETY: mbind changes only the memory policy of the range, which this process maps for
+    // the guest's lifetime; a null node mask is valid for MPOL_LOCAL and MPOL_DEFAULT.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_mbind,
+            addr,
+            len,
+            mode,
+            std::ptr::null::<libc::c_ulong>(),
+            0 as libc::c_ulong,
+            0 as libc::c_uint,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Keep `memory` out of automatic NUMA balancing for [`NUMA_BALANCING_AFTER_SECS`], then let
+/// it in.
+///
+/// A balancing scan unmaps the memory it walks from stage 2, and the guest faults back every
+/// page it touches next; a restored clone's anonymous pages are also hinted and migrated. In
+/// the seconds a clone takes to start, that is most of its cost on a two-node host. A guest
+/// that lives on gains from balancing, so the exclusion ends: the range is bound MPOL_LOCAL
+/// (which allocates where the default policy does, but has no MPOL_F_MOF, so
+/// `task_numa_work` skips the VMA), and a thread of its own returns it to MPOL_DEFAULT when
+/// the time is up. The thread runs under `filter` (the VMM thread's) and waits on a futex.
+/// Best effort: a kernel without NUMA (ENOSYS) or a failed call leaves the memory under the
+/// default policy, which is what it had without this. Only anonymous memory and private
+/// mappings of an ordinary file are bound (see [`numa_policy_is_private`]); guest memory that
+/// maps a memfd keeps the policy it has.
+pub fn defer_numa_balancing(memory: &GuestMemoryMmap, filter: Arc<crate::seccomp::BpfProgram>) {
+    defer_numa_balancing_for(
+        memory,
+        NUMA_BALANCING_AFTER_SECS.load(std::sync::atomic::Ordering::Relaxed),
+        filter,
+    )
+}
+
+/// Whether `mbind(2)` on `region` changes the policy of this process's mapping alone.
+///
+/// A mapping of a memfd does not qualify, private or shared. A shmem mapping keeps its policy
+/// in the file (`shmem_set_policy`), and every process that maps the file reads it from
+/// there: the clones of one UFFD minor-fault handler map one memfd, so a clone binding its
+/// mapping would bind all of them, and its timer would return all of them to the default
+/// policy. Nothing is lost by leaving such a mapping alone: `task_numa_work` skips a shmem
+/// mapping whose file has no policy (`vma_policy_mof`), and it skips every hugetlb mapping.
+/// A backing file whose filesystem cannot be read is treated the same way.
+fn numa_policy_is_private(region: &GuestRegionMmapExt) -> bool {
+    match region.inner.file_offset() {
+        None => true,
+        Some(file_offset) => BackingFileSystem::of(file_offset.file())
+            .is_ok_and(|fs| !fs.is_shmem() && fs.hugetlbfs_page_size().is_none()),
+    }
+}
+
+fn defer_numa_balancing_for(
+    memory: &GuestMemoryMmap,
+    secs: u64,
+    filter: Arc<crate::seccomp::BpfProgram>,
+) {
+    if secs == 0 {
+        return;
+    }
+    let ranges: Vec<(usize, usize)> = memory
+        .iter()
+        .filter(|region| numa_policy_is_private(region))
+        .map(|region| (region.as_ptr() as usize, u64_to_usize(region.len())))
+        .collect();
+    if ranges.is_empty() {
+        return;
+    }
+    for (bound, &(addr, len)) in ranges.iter().enumerate() {
+        if let Err(err) = mbind_range(addr, len, libc::MPOL_LOCAL) {
+            if err.raw_os_error() != Some(libc::ENOSYS) {
+                warn!("guest memory stays in NUMA balancing: mbind(MPOL_LOCAL) failed: {err}");
+            }
+            for &(addr, len) in &ranges[..bound] {
+                let _ = mbind_range(addr, len, libc::MPOL_DEFAULT);
+            }
+            return;
+        }
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let revert = ranges.clone();
+    let spawned = std::thread::Builder::new()
+        .name("fc_numa_window".into())
+        .spawn(move || {
+            if let Err(err) = crate::seccomp::apply_filter(&filter) {
+                // Without its filter the thread must not go on; the memory stays out of
+                // balancing, as it would be with the exclusion never ending.
+                error!("NUMA balancing window: cannot apply the seccomp filter: {err}");
+                return;
+            }
+            // park_timeout waits on a futex, which the VMM's filter allows; it can wake early.
+            while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
+                if left.is_zero() {
+                    break;
+                }
+                std::thread::park_timeout(left);
+            }
+            for (addr, len) in ranges {
+                if let Err(err) = mbind_range(addr, len, libc::MPOL_DEFAULT) {
+                    warn!("guest memory stays out of NUMA balancing: mbind(MPOL_DEFAULT) failed: {err}");
+                }
+            }
+        });
+    if let Err(err) = spawned {
+        warn!("guest memory stays in NUMA balancing: cannot start its timer: {err}");
+        for (addr, len) in revert {
+            let _ = mbind_range(addr, len, libc::MPOL_DEFAULT);
+        }
     }
 }
 
@@ -3480,6 +3605,142 @@ mod tests {
             find_vma_containing(addr).is_none(),
             "Memory was not reclaimed after drop"
         );
+    }
+
+    /// The policy `/proc/self/numa_maps` reports for the mapping that holds `addr`.
+    fn numa_policy_at(addr: usize) -> String {
+        // The kernel merges adjacent anonymous mappings with one policy, so find the VMA that
+        // holds `addr` in maps, then its line in numa_maps.
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let start = maps
+            .lines()
+            .filter_map(|line| {
+                let (lo, rest) = line.split_once('-')?;
+                let hi = rest.split_whitespace().next()?;
+                let lo = usize::from_str_radix(lo, 16).ok()?;
+                let hi = usize::from_str_radix(hi, 16).ok()?;
+                (lo <= addr && addr < hi).then_some(lo)
+            })
+            .next()
+            .unwrap_or_else(|| panic!("no mapping holds {addr:x}"));
+        let numa_maps = std::fs::read_to_string("/proc/self/numa_maps").unwrap();
+        let prefix = format!("{start:x} ");
+        numa_maps
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or_else(|| panic!("no mapping at {start:x} in numa_maps"))
+            .to_string()
+    }
+
+    /// Guest memory is bound MPOL_LOCAL (out of NUMA balancing) for the window, then returned
+    /// to the default policy.
+    #[test]
+    fn guest_memory_leaves_numa_balancing_for_the_window_then_rejoins() {
+        if !std::path::Path::new("/proc/self/numa_maps").exists() {
+            // A kernel without NUMA has no balancing to stay out of.
+            return;
+        }
+        let memory = anonymous(
+            &[(GuestAddress(0), 4 << 20), (GuestAddress(8 << 20), 4 << 20)],
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap();
+        let memory = GuestMemoryMmap::from_regions(
+            memory
+                .into_iter()
+                .map(|region| GuestRegionMmapExt::dram_from_mmap_region(region, 0))
+                .collect(),
+        )
+        .unwrap();
+        let addrs: Vec<usize> = memory.iter().map(|r| r.as_ptr() as usize).collect();
+        for &addr in &addrs {
+            assert_eq!(numa_policy_at(addr), "default");
+        }
+        defer_numa_balancing_for(&memory, 1, Arc::new(vec![]));
+        for &addr in &addrs {
+            assert_eq!(numa_policy_at(addr), "local", "the window did not start");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        for &addr in &addrs {
+            assert_eq!(numa_policy_at(addr), "default", "the window did not end");
+        }
+        // 0 leaves the memory under the default policy.
+        defer_numa_balancing_for(&memory, 0, Arc::new(vec![]));
+        assert_eq!(numa_policy_at(addrs[0]), "default");
+    }
+
+    /// `len` bytes of `backing` mapped as a restore maps a snapshot's memory: one region,
+    /// `MAP_PRIVATE`.
+    fn restored_from(backing: &File, len: usize) -> GuestMemoryMmap {
+        let regions = snapshot_file(
+            backing.try_clone().unwrap(),
+            &[(GuestAddress(0), len)],
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap();
+        GuestMemoryMmap::from_regions(
+            regions
+                .into_iter()
+                .map(|region| GuestRegionMmapExt::dram_from_mmap_region(region, 0))
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    /// The clones of one UFFD minor-fault handler map one memfd, and a shmem mapping keeps its
+    /// NUMA policy in the file, where every mapping of it reads it. One clone's window must
+    /// not change another clone's policy, when it starts or when it ends, so memory that maps
+    /// a memfd is not bound.
+    #[test]
+    fn one_clone_s_numa_window_leaves_another_mapping_of_the_memfd_alone() {
+        if !std::path::Path::new("/proc/self/numa_maps").exists() {
+            return;
+        }
+        let len = 4 << 20;
+        let backing = test_utils::test_memfd(len, false, 0x5a);
+        let first = restored_from(&backing, len);
+        let second = restored_from(&backing, len);
+        let addr = |memory: &GuestMemoryMmap| memory.iter().next().unwrap().as_ptr() as usize;
+        assert_eq!(numa_policy_at(addr(&first)), "default");
+        assert_eq!(numa_policy_at(addr(&second)), "default");
+        defer_numa_balancing_for(&first, 1, Arc::new(vec![]));
+        assert_eq!(
+            numa_policy_at(addr(&second)),
+            "default",
+            "one clone's window changed the policy of another clone's guest memory"
+        );
+        assert_eq!(numa_policy_at(addr(&first)), "default");
+        // Past the end of the window the first clone asked for.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert_eq!(numa_policy_at(addr(&second)), "default");
+        assert_eq!(numa_policy_at(addr(&first)), "default");
+    }
+
+    /// A private mapping of an ordinary file, which is what a restore from the snapshot's memory
+    /// file is, has a policy of its own and is bound for the window.
+    #[test]
+    fn a_private_mapping_of_an_ordinary_file_is_bound_for_the_window() {
+        if !std::path::Path::new("/proc/self/numa_maps").exists() {
+            return;
+        }
+        let len = 4 << 20;
+        let backing = TempFile::new().unwrap().into_file();
+        backing.set_len(len as u64).unwrap();
+        // Where the temporary directory is a tmpfs the file is shmem, and is left alone.
+        let private = !BackingFileSystem::of(&backing).unwrap().is_shmem();
+        let memory = restored_from(&backing, len);
+        let addr = memory.iter().next().unwrap().as_ptr() as usize;
+        assert_eq!(numa_policy_at(addr), "default");
+        defer_numa_balancing_for(&memory, 1, Arc::new(vec![]));
+        assert_eq!(
+            numa_policy_at(addr),
+            if private { "local" } else { "default" }
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert_eq!(numa_policy_at(addr), "default");
     }
 }
 

@@ -51,11 +51,18 @@ use crate::seccomp::SeccompConfig;
 const DEFAULT_API_SOCK_PATH: &str = "/run/firecracker.socket";
 // The `fcvm` build metadata names what this build takes that another build of the same
 // version may not, so a caller can read it from `--version` before it uses one:
-// `drive-overrides` says a snapshot load takes `drive_overrides`.
+// `drive-overrides` says a snapshot load takes `drive_overrides`, and `numa-window` that
+// the process takes `--numa-balancing-after-secs`.
 const FIRECRACKER_VERSION: &str = if cfg!(feature = "fuzzing") {
-    concat!(env!("CARGO_PKG_VERSION"), "+fcvm.drive-overrides.fuzzing")
+    concat!(
+        env!("CARGO_PKG_VERSION"),
+        "+fcvm.drive-overrides.numa-window.fuzzing"
+    )
 } else {
-    concat!(env!("CARGO_PKG_VERSION"), "+fcvm.drive-overrides")
+    concat!(
+        env!("CARGO_PKG_VERSION"),
+        "+fcvm.drive-overrides.numa-window"
+    )
 };
 const MMDS_CONTENT_ARG: &str = "metadata";
 
@@ -283,6 +290,14 @@ fn main_exec() -> Result<(), MainError> {
                 Argument::new("enable-pci")
                     .takes_value(false)
                     .help("Enables PCIe support."),
+            )
+            .arg(
+                Argument::new("numa-balancing-after-secs")
+                    .takes_value(true)
+                    .help(
+                        "Keep guest memory out of automatic NUMA balancing for this many \
+                         seconds after it is created or restored (0: never excluded).",
+                    ),
             );
 
     arg_parser.parse_from_cmdline()?;
@@ -429,6 +444,14 @@ fn main_exec() -> Result<(), MainError> {
 
     // If the mmds size limit is not explicitly configured, default to using the
     // `http-api-max-payload-size` value.
+    if let Some(secs) = arguments.single_value("numa-balancing-after-secs") {
+        let secs = secs
+            .parse::<u64>()
+            .expect("'numa-balancing-after-secs' parameter expected to be of 'u64' type.");
+        vmm::vstate::memory::NUMA_BALANCING_AFTER_SECS
+            .store(secs, std::sync::atomic::Ordering::Relaxed);
+    }
+
     let mmds_size_limit = arg_parser
         .arguments()
         .single_value("mmds-size-limit")
