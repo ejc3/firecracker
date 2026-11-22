@@ -2036,13 +2036,32 @@ fn mbind_range(addr: usize, len: usize, mode: libc::c_int) -> io::Result<()> {
 /// `task_numa_work` skips the VMA), and a thread of its own returns it to MPOL_DEFAULT when
 /// the time is up. The thread runs under `filter` (the VMM thread's) and waits on a futex.
 /// Best effort: a kernel without NUMA (ENOSYS) or a failed call leaves the memory under the
-/// default policy, which is what it had without this.
+/// default policy, which is what it had without this. Only anonymous memory and private
+/// mappings of an ordinary file are bound (see [`numa_policy_is_private`]); guest memory that
+/// maps a memfd keeps the policy it has.
 pub fn defer_numa_balancing(memory: &GuestMemoryMmap, filter: Arc<crate::seccomp::BpfProgram>) {
     defer_numa_balancing_for(
         memory,
         NUMA_BALANCING_AFTER_SECS.load(std::sync::atomic::Ordering::Relaxed),
         filter,
     )
+}
+
+/// Whether `mbind(2)` on `region` changes the policy of this process's mapping alone.
+///
+/// A mapping of a memfd does not qualify, private or shared. A shmem mapping keeps its policy
+/// in the file (`shmem_set_policy`), and every process that maps the file reads it from
+/// there: the clones of one UFFD minor-fault handler map one memfd, so a clone binding its
+/// mapping would bind all of them, and its timer would return all of them to the default
+/// policy. Nothing is lost by leaving such a mapping alone: `task_numa_work` skips a shmem
+/// mapping whose file has no policy (`vma_policy_mof`), and it skips every hugetlb mapping.
+/// A backing file whose filesystem cannot be read is treated the same way.
+fn numa_policy_is_private(region: &GuestRegionMmapExt) -> bool {
+    match region.inner.file_offset() {
+        None => true,
+        Some(file_offset) => BackingFileSystem::of(file_offset.file())
+            .is_ok_and(|fs| !fs.is_shmem() && fs.hugetlbfs_page_size().is_none()),
+    }
 }
 
 fn defer_numa_balancing_for(
@@ -2055,8 +2074,12 @@ fn defer_numa_balancing_for(
     }
     let ranges: Vec<(usize, usize)> = memory
         .iter()
+        .filter(|region| numa_policy_is_private(region))
         .map(|region| (region.as_ptr() as usize, u64_to_usize(region.len())))
         .collect();
+    if ranges.is_empty() {
+        return;
+    }
     for (bound, &(addr, len)) in ranges.iter().enumerate() {
         if let Err(err) = mbind_range(addr, len, libc::MPOL_LOCAL) {
             if err.raw_os_error() != Some(libc::ENOSYS) {
@@ -4271,5 +4294,78 @@ mod tests {
         // 0 leaves the memory under the default policy.
         defer_numa_balancing_for(&memory, 0, Arc::new(vec![]));
         assert_eq!(numa_policy_at(addrs[0]), "default");
+    }
+
+    /// `len` bytes of `backing` mapped as a restore maps a snapshot's memory: one region,
+    /// `MAP_PRIVATE`.
+    fn restored_from(backing: &File, len: usize) -> GuestMemoryMmap {
+        let regions = snapshot_file(
+            backing.try_clone().unwrap(),
+            [(GuestAddress(0), len)].into_iter(),
+            false,
+            HugePageConfig::None,
+            false,
+        )
+        .unwrap();
+        GuestMemoryMmap::from_regions(
+            regions
+                .into_iter()
+                .map(|region| GuestRegionMmapExt::dram_from_mmap_region(region, 0))
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    /// The clones of one UFFD minor-fault handler map one memfd, and a shmem mapping keeps its
+    /// NUMA policy in the file, where every mapping of it reads it. One clone's window must
+    /// not change another clone's policy, when it starts or when it ends, so memory that maps
+    /// a memfd is not bound.
+    #[test]
+    fn one_clone_s_numa_window_leaves_another_mapping_of_the_memfd_alone() {
+        if !std::path::Path::new("/proc/self/numa_maps").exists() {
+            return;
+        }
+        let len = 4 << 20;
+        let backing = test_utils::test_memfd(len, false, 0x5a);
+        let first = restored_from(&backing, len);
+        let second = restored_from(&backing, len);
+        let addr = |memory: &GuestMemoryMmap| memory.iter().next().unwrap().as_ptr() as usize;
+        assert_eq!(numa_policy_at(addr(&first)), "default");
+        assert_eq!(numa_policy_at(addr(&second)), "default");
+        defer_numa_balancing_for(&first, 1, Arc::new(vec![]));
+        assert_eq!(
+            numa_policy_at(addr(&second)),
+            "default",
+            "one clone's window changed the policy of another clone's guest memory"
+        );
+        assert_eq!(numa_policy_at(addr(&first)), "default");
+        // Past the end of the window the first clone asked for.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert_eq!(numa_policy_at(addr(&second)), "default");
+        assert_eq!(numa_policy_at(addr(&first)), "default");
+    }
+
+    /// A private mapping of an ordinary file, which is what a restore from the snapshot's memory
+    /// file is, has a policy of its own and is bound for the window.
+    #[test]
+    fn a_private_mapping_of_an_ordinary_file_is_bound_for_the_window() {
+        if !std::path::Path::new("/proc/self/numa_maps").exists() {
+            return;
+        }
+        let len = 4 << 20;
+        let backing = TempFile::new().unwrap().into_file();
+        backing.set_len(len as u64).unwrap();
+        // Where the temporary directory is a tmpfs the file is shmem, and is left alone.
+        let private = !BackingFileSystem::of(&backing).unwrap().is_shmem();
+        let memory = restored_from(&backing, len);
+        let addr = memory.iter().next().unwrap().as_ptr() as usize;
+        assert_eq!(numa_policy_at(addr), "default");
+        defer_numa_balancing_for(&memory, 1, Arc::new(vec![]));
+        assert_eq!(
+            numa_policy_at(addr),
+            if private { "local" } else { "default" }
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert_eq!(numa_policy_at(addr), "default");
     }
 }
