@@ -279,7 +279,10 @@ mod tests {
         let net = builder.build(first).unwrap();
         assert_eq!(net.lock().unwrap().tap.as_raw_fd(), fd);
 
-        for (id, mac) in [("second", "01:23:45:67:89:0b"), ("first", "01:23:45:67:89:0a")] {
+        for (id, mac) in [
+            ("second", "01:23:45:67:89:0b"),
+            ("first", "01:23:45:67:89:0a"),
+        ] {
             let mut again = create_netif(id, "inheritonce", mac);
             again.host_dev_fd = Some(fd);
             match builder.build(again) {
