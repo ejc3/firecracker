@@ -987,17 +987,32 @@ mod tests {
     }
 
     /// A drive's backing file is read without host readahead: a 4 KiB read of a cold file
-    /// brings in that page and not the ones after it.
+    /// brings in that page and not the ones after it. The file is written where the crate is
+    /// (tmpfs, often /tmp, reads ahead nothing, so the test could not fail there) and holds
+    /// bytes that do not compress (on a compressing btrfs a read loads its whole compressed
+    /// extent, readahead or not).
     #[test]
     fn test_disk_backing_file_has_no_readahead() {
         use std::io::Write;
         use std::os::unix::fs::FileExt;
-        // On the crate's own filesystem: tmpfs, often /tmp, does no readahead at all.
-        let dir = std::env::current_dir().unwrap();
-        let path = dir.join(format!("readahead-test-{}.img", std::process::id()));
+        let dir = vmm_sys_util::tempdir::TempDir::new_with_prefix(
+            std::env::current_dir().unwrap().join("readahead-test-"),
+        )
+        .unwrap();
+        let path = dir.as_path().join("disk.img");
         let len = 8 << 20;
+        // xorshift64: bytes no compressor can shrink.
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let bytes: Vec<u8> = (0..len / 8)
+            .flat_map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x.to_le_bytes()
+            })
+            .collect();
         let mut f = File::create(&path).unwrap();
-        f.write_all(&vec![0x5a; len]).unwrap();
+        f.write_all(&bytes).unwrap();
         f.sync_all().unwrap();
         // SAFETY: an open descriptor; drops the file's clean pages from the page cache.
         unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
@@ -1020,10 +1035,10 @@ mod tests {
         assert_ne!(map, libc::MAP_FAILED);
         let mut resident = vec![0u8; len / 4096];
         // SAFETY: `map` is `len` bytes and `resident` has one byte per page of it.
-        assert_eq!(unsafe { libc::mincore(map, len, resident.as_mut_ptr()) }, 0);
+        let ret = unsafe { libc::mincore(map, len, resident.as_mut_ptr()) };
         // SAFETY: the mapping made above.
         unsafe { libc::munmap(map, len) };
-        std::fs::remove_file(&path).unwrap();
+        assert_eq!(ret, 0);
         let pages = resident.iter().filter(|b| *b & 1 == 1).count();
         assert!(pages <= 2, "{pages} pages resident after one 4 KiB read");
     }

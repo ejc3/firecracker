@@ -234,7 +234,16 @@
             },
             {
                 "syscall": "fadvise64",
-                "comment": "POSIX_FADV_RANDOM on a drive's backing file when it is opened, so the host reads only what the guest asked for"
+                "comment": "POSIX_FADV_RANDOM on a drive's backing file when it is opened, so the host reads only what the guest asked for",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "advice, the fourth argument of fadvise64(fd, offset, len, advice) on x86_64: POSIX_FADV_RANDOM"
+                    }
+                ]
             },
             {
                 "syscall": "mbind",
