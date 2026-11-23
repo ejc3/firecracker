@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::ops::Deref;
+use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -81,6 +82,8 @@ pub enum NetworkInterfaceError {
     DeviceUpdate(#[from] VmmError),
     /// The MAC address is already in use: {0}
     GuestMacAddressInUse(String),
+    /// Descriptor {0} is already the TAP queue of network device '{1}'
+    HostDevFdInUse(i32, String),
     /// Cannot open/create the tap device: {0}
     OpenTap(#[from] TapError),
 }
@@ -129,6 +132,20 @@ impl NetBuilder {
                 return Err(NetworkInterfaceError::GuestMacAddressInUse(
                     mac_address.to_string(),
                 ));
+            }
+        }
+
+        // An inherited queue is one descriptor, and the device that takes it owns it: a
+        // second device on the same number would read the same queue and close, when it is
+        // dropped, whatever the number names by then. That includes the device this config
+        // replaces, which closes the descriptor when it is removed below.
+        if let Some(tap_fd) = netif_config.host_dev_fd {
+            let holder = self.net_devices.iter().find_map(|net| {
+                let net = net.lock().expect("Poisoned lock");
+                (net.tap.as_raw_fd() == tap_fd).then(|| net.id().to_string())
+            });
+            if let Some(holder) = holder {
+                return Err(NetworkInterfaceError::HostDevFdInUse(tap_fd, holder));
             }
         }
 
@@ -226,8 +243,6 @@ mod tests {
     /// device stays attached once, by its holder, and a queue of another device is refused.
     #[test]
     fn test_create_net_on_an_inherited_queue() {
-        use std::os::unix::io::AsRawFd;
-
         use crate::devices::virtio::net::Tap;
 
         let holder = Tap::open_named("inheritnet").unwrap();
@@ -246,6 +261,38 @@ mod tests {
         NetBuilder::create_net(wrong).unwrap_err();
         // SAFETY: the descriptor is this test's own.
         unsafe { libc::close(fd) };
+    }
+
+    /// One inherited queue is one device's: a second config that names the same descriptor
+    /// is refused, whether it is for another device or replaces the one that has it, and
+    /// the descriptor stays the first device's.
+    #[test]
+    fn test_an_inherited_queue_is_one_devices() {
+        use crate::devices::virtio::net::Tap;
+
+        let holder = Tap::open_named("inheritonce").unwrap();
+        // SAFETY: dup of a descriptor this test owns; the device built on it owns the dup.
+        let fd = unsafe { libc::dup(holder.as_raw_fd()) };
+        let mut builder = NetBuilder::new();
+        let mut first = create_netif("first", "inheritonce", "01:23:45:67:89:0a");
+        first.host_dev_fd = Some(fd);
+        let net = builder.build(first).unwrap();
+        assert_eq!(net.lock().unwrap().tap.as_raw_fd(), fd);
+
+        for (id, mac) in [("second", "01:23:45:67:89:0b"), ("first", "01:23:45:67:89:0a")] {
+            let mut again = create_netif(id, "inheritonce", mac);
+            again.host_dev_fd = Some(fd);
+            match builder.build(again) {
+                Err(NetworkInterfaceError::HostDevFdInUse(refused, by)) => {
+                    assert_eq!((refused, by.as_str()), (fd, "first"), "{id}");
+                }
+                other => panic!("{id}: {other:?}"),
+            }
+        }
+        assert_eq!(builder.len(), 1);
+        // The first device still has its queue: the descriptor is open and attached.
+        // SAFETY: F_GETFD takes no pointer.
+        assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
     }
 
     impl Clone for NetworkInterfaceConfig {

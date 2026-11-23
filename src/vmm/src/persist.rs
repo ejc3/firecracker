@@ -40,7 +40,7 @@ use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::snapshot::{
-    CreateSnapshotParams, DriveOverride, LoadSnapshotParams, MemBackendType,
+    CreateSnapshotParams, DriveOverride, LoadSnapshotParams, MemBackendType, NetworkOverride,
 };
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
@@ -434,6 +434,9 @@ pub fn restore_from_snapshot(
     vm_resources: &mut VmResources,
 ) -> Result<Arc<Mutex<Vmm>>, RestoreFromSnapshotError> {
     let mut microvm_state = snapshot_state_from_file(&params.snapshot_path)?;
+    if let Some(tap_fd) = repeated_inherited_queue(&params.network_overrides) {
+        return Err(SnapshotStateFromFileError::RepeatedNetworkDescriptor(tap_fd).into());
+    }
     for entry in &params.network_overrides {
         // Only the active transport carries virtio device state, so we look at whichever
         // variant this snapshot was saved with. The MMIO and PCI transports wrap their net
@@ -601,10 +604,23 @@ pub enum SnapshotStateFromFileError {
     Load(#[from] crate::snapshot::SnapshotError),
     /// Unknown Network Device.
     UnknownNetworkDevice,
+    /// Two network overrides name descriptor {0} as their inherited TAP queue
+    RepeatedNetworkDescriptor(i32),
     /// Unknown Vsock Device.
     UnknownVsockDevice,
     /// Unknown Block Device.
     UnknownBlockDevice,
+}
+
+/// The first descriptor two of `overrides` name as their inherited TAP queue, if any. One
+/// inherited queue is one device's: two devices on it would read the same queue, and the
+/// second to be dropped would close whatever the number names by then.
+fn repeated_inherited_queue(overrides: &[NetworkOverride]) -> Option<i32> {
+    let mut seen = std::collections::HashSet::new();
+    overrides
+        .iter()
+        .filter_map(|entry| entry.host_dev_fd)
+        .find(|tap_fd| !seen.insert(*tap_fd))
 }
 
 fn snapshot_state_from_file(
@@ -1151,6 +1167,30 @@ fn send_uffd_handshake(
 mod tests {
     use std::cell::RefCell;
     use std::os::unix::net::UnixListener;
+
+    /// Two overrides that name one descriptor are refused; overrides by name alone, or on
+    /// queues of their own, are not.
+    #[test]
+    fn test_one_inherited_queue_is_one_overrides() {
+        let entry = |iface: &str, fd| NetworkOverride {
+            iface_id: iface.to_string(),
+            host_dev_name: "tap0".to_string(),
+            host_dev_fd: fd,
+        };
+        assert_eq!(repeated_inherited_queue(&[]), None);
+        assert_eq!(
+            repeated_inherited_queue(&[entry("eth0", None), entry("eth1", None)]),
+            None
+        );
+        assert_eq!(
+            repeated_inherited_queue(&[entry("eth0", Some(7)), entry("eth1", Some(8))]),
+            None
+        );
+        assert_eq!(
+            repeated_inherited_queue(&[entry("eth0", Some(7)), entry("eth1", None), entry("eth2", Some(7))]),
+            Some(7)
+        );
+    }
 
     /// A write set over 1/4 of guest memory, or a file longer than such a set can be, is refused
     /// before anything is populated; a set within the bound is read.
