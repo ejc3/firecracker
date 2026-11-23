@@ -736,6 +736,7 @@ mod tests {
             let network_interface = NetworkInterfaceConfig {
                 iface_id: String::from("netif"),
                 host_dev_name: String::from("hostname"),
+                host_dev_fd: None,
                 guest_mac: None,
                 mtu: None,
                 rx_rate_limiter: None,

@@ -596,6 +596,7 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .to_string(),
+            host_dev_fd: None,
             guest_mac: Some(MacAddr::from_str("01:23:45:67:89:0a").unwrap()),
             mtu: None,
             rx_rate_limiter: Some(RateLimiterConfig::default()),

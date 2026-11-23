@@ -451,7 +451,10 @@ pub fn restore_from_snapshot(
                 .find(|x| x.id == entry.iface_id),
         };
         device_state
-            .map(|device_state| device_state.tap_if_name.clone_from(&entry.host_dev_name))
+            .map(|device_state| {
+                device_state.tap_if_name.clone_from(&entry.host_dev_name);
+                device_state.inherited_tap_fd = entry.host_dev_fd;
+            })
             .ok_or(SnapshotStateFromFileError::UnknownNetworkDevice)?;
     }
 
@@ -1164,6 +1167,7 @@ mod tests {
         let network_interface = NetworkInterfaceConfig {
             iface_id: String::from("netif"),
             host_dev_name: String::from("hostname"),
+            host_dev_fd: None,
             guest_mac: None,
             mtu: None,
             rx_rate_limiter: None,

@@ -718,6 +718,19 @@
             },
             {
                 "syscall": "ioctl",
+                "comment": "Needed for checking an inherited tap queue during net hotplug",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 2147767506,
+                        "comment": "TUNGETIFF"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
                 "comment": "Needed for configuring tap offload during net hotplug",
                 "args": [
                     {
