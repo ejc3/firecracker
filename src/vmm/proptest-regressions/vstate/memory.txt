@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8905ef089e5a86d3ddc7ee70e05449ff0012109e4a1ae81e1792c905a2cd1848 # shrinks to region_specs = [RegionSpec { gap_pages: 0, region_type: Dram, pages_per_slot: 3, plugged: [true], kvm_bitmaps: [[0]], fc_dirty_pages: [[true, false, true]] }]
+cc 79f4d8adad9f998b6115e2b6e89e537e10193b136b347f369b732532c857cfe1 # shrinks to region_specs = [RegionSpec { gap_pages: 0, region_type: Dram, pages_per_slot: 129, plugged: [true], kvm_bitmaps: [[576460752303423488, 0, 0]], fc_dirty_pages: [[false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true]] }]

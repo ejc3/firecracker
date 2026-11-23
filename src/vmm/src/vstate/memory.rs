@@ -55,6 +55,16 @@ pub const HOLE_GRANULE: usize = 4096;
 /// bounds the size of each write and the time between populating a chunk and writing it.
 const DUMP_CHUNK: usize = mib_to_bytes(2);
 
+/// Clean pages, at most, that a Diff dump into a memory file that already holds the guest's
+/// memory writes between two written runs to make them one write. Each write into a file that
+/// shares its extents with the snapshot it was copied from costs about the same whatever its
+/// length, and most runs are one or two pages: a 128 GiB guest's diff of 15.7 GB was 2.03M runs,
+/// 1.30M of them one page, and writing them took 399 s. Replayed into a copy of the parent's
+/// memory file on btrfs (compress-force=zstd:3), the same runs took 810 s as written and 302 s
+/// with gaps of up to 4 pages written with them (0.84M writes, 25.5 GB), and left 6.54M extents
+/// in the file against 9.33M.
+pub const DIFF_BRIDGE_PAGES: usize = 4;
+
 /// The bits of a /proc/self/pagemap entry that say a page has a page table entry: 63, the page is
 /// in memory, and 62, it is swapped out. For small pages and transparent huge pages the kernel
 /// sets 62 for every entry that is neither empty nor present: swap, migration, and markers. A
@@ -306,7 +316,12 @@ impl DumpScratch {
     /// allow, and not with pread64(2), which they do not. When pagemap or mincore(2) cannot be
     /// read every bit is set, so the caller reads those pages instead.
     fn mapped(&mut self, addr: usize, count: usize, page_size: usize) -> u64 {
-        let all = u64::MAX >> (64 - count);
+        self.entries(addr, count, page_size)
+            .unwrap_or(u64::MAX >> (64 - count))
+    }
+
+    /// [`DumpScratch::mapped`], or `None` when pagemap or mincore(2) cannot be read.
+    fn entries(&mut self, addr: usize, count: usize, page_size: usize) -> Option<u64> {
         let mut entries = [0u8; 64 * 8];
         let entries = &mut entries[..count * 8];
         let pagemap = self.pagemap.get_or_insert_with(|| {
@@ -320,7 +335,7 @@ impl DumpScratch {
                 .ok()
         });
         let Some(file) = pagemap else {
-            return all;
+            return None;
         };
         let offset = usize_to_u64(addr / page_size * 8);
         if let Err(err) = file
@@ -332,7 +347,7 @@ impl DumpScratch {
                  of plugged slots that were also written"
             );
             self.pagemap = Some(None);
-            return all;
+            return None;
         }
         let mut resident = [0u8; 64];
         // SAFETY: `addr` is page aligned, and the `count` pages from it are guest memory, which
@@ -350,13 +365,13 @@ impl DumpScratch {
                  written",
                 io::Error::last_os_error()
             );
-            return all;
+            return None;
         }
         let mut pagemap = [0u64; 64];
         for (entry, bytes) in pagemap.iter_mut().zip(entries.chunks_exact(8)) {
             *entry = u64::from_ne_bytes(bytes.try_into().unwrap());
         }
-        with_entries(&pagemap[..count], &resident[..count])
+        Some(with_entries(&pagemap[..count], &resident[..count]))
     }
 }
 
@@ -374,6 +389,11 @@ struct SlotWriter<'s, 'a, T> {
     action: PageAction,
     start: usize,
     len: usize,
+    /// Clean bytes, at most, written between two copied runs to make them one write
+    /// ([`DIFF_BRIDGE_PAGES`]); 0 writes only marked pages.
+    bridge: usize,
+    /// Clean bytes after the pending copied run, held while they can still join it.
+    held: usize,
 }
 
 impl<T: WriteVolatile + std::io::Seek> SlotWriter<'_, '_, T> {
@@ -389,6 +409,60 @@ impl<T: WriteVolatile + std::io::Seek> SlotWriter<'_, '_, T> {
         }
         self.len += len;
         Ok(())
+    }
+
+    /// [`SlotWriter::push`] for one page, which `bridgeable` says may be read and written with
+    /// copied runs on both sides of it: a clean page with a page table entry, whose bytes in guest
+    /// memory are the bytes the file already holds there.
+    fn push_page(
+        &mut self,
+        offset: usize,
+        len: usize,
+        action: PageAction,
+        bridgeable: bool,
+    ) -> Result<(), MemoryError> {
+        if self.held > 0 {
+            if action == PageAction::Copy {
+                // A copied run follows the held clean bytes, so they are written with both runs.
+                self.len += self.held + len;
+                self.held = 0;
+                return Ok(());
+            }
+            if action == PageAction::Skip && bridgeable && self.held + len <= self.bridge {
+                self.held += len;
+                return Ok(());
+            }
+            self.release_held()?;
+        } else if action == PageAction::Skip
+            && bridgeable
+            && len <= self.bridge
+            && self.len > 0
+            && self.action == PageAction::Copy
+        {
+            self.held = len;
+            return Ok(());
+        }
+        self.push(offset, len, action)
+    }
+
+    /// Writes the pending copied run and makes the clean bytes held after it a run to seek over.
+    fn release_held(&mut self) -> Result<(), MemoryError> {
+        let start = self.start + self.len;
+        let held = self.held;
+        self.held = 0;
+        self.flush()?;
+        self.action = PageAction::Skip;
+        self.start = start;
+        self.len = held;
+        Ok(())
+    }
+
+    /// Writes the pending run, and seeks over the clean bytes held after it.
+    fn finish(&mut self) -> Result<(), MemoryError> {
+        if self.held > 0 {
+            self.release_held()?;
+        }
+        self.flush()
     }
 
     /// Writes the pending run.
@@ -836,6 +910,8 @@ impl<'a> GuestMemorySlot<'a> {
         zero_pages: ZeroPages,
         page_size: usize,
         scratch: &mut DumpScratch,
+        bridge_pages: usize,
+        read_untouched: bool,
     ) -> Result<(), MemoryError> {
         let num_pages = self.slice.len() / page_size;
         let words = num_pages.div_ceil(64);
@@ -861,6 +937,8 @@ impl<'a> GuestMemorySlot<'a> {
             action: PageAction::Skip,
             start: 0,
             len: 0,
+            bridge: if plugged { bridge_pages * page_size } else { 0 },
+            held: 0,
         };
 
         for word in 0..words {
@@ -885,7 +963,8 @@ impl<'a> GuestMemorySlot<'a> {
                 discarded |= u64::from(self.discarded.dirty_at((first + page) * page_size)) << page;
             }
             if written | discarded == 0 {
-                out.push(first * page_size, count * page_size, PageAction::Skip)?;
+                // Through push_page, so clean bytes held after a copied run are seeked over too.
+                out.push_page(first * page_size, count * page_size, PageAction::Skip, false)?;
                 continue;
             }
             // A discarded page with a write mark was written before its discard or after it.
@@ -895,15 +974,32 @@ impl<'a> GuestMemorySlot<'a> {
                 out.scratch
                     .mapped(host + first * page_size, count, page_size)
             };
+            // The clean pages that may join copied runs: every page where reading an untouched one
+            // is a userfaultfd fault its server answers; otherwise those with a page table entry, so
+            // reading them faults nothing in, and none of them when the entries cannot be read.
+            let bridgeable = if out.bridge == 0 || written == 0 {
+                0
+            } else if read_untouched {
+                u64::MAX
+            } else {
+                out.scratch
+                    .entries(host + first * page_size, count, page_size)
+                    .unwrap_or(0)
+            };
             for page in 0..count {
                 let bit = |bits: u64| bits & (1 << page) != 0;
                 let action = page_action(plugged, bit(written), bit(discarded), bit(mapped));
-                out.push((first + page) * page_size, page_size, action)?;
+                out.push_page(
+                    (first + page) * page_size,
+                    page_size,
+                    action,
+                    bit(bridgeable),
+                )?;
             }
         }
 
         // Write the last run, a seek included, so that the next slot starts at its own offset.
-        out.flush()
+        out.finish()
     }
 
     /// Dumps this slot onto the writer, seeking over each all-zero page of [`HOLE_GRANULE`]
@@ -1644,10 +1740,20 @@ where
     /// written as zeros, an unplugged slot's included, and read only when a plugged slot's page
     /// was also written and may hold data. Once the dump has succeeded it clears the marks of what
     /// it wrote; after a failure it keeps them and adds `dirty_bitmap` to them.
+    ///
+    /// With `bridge_pages` above 0 the writer must already hold the guest's memory as of the
+    /// last snapshot, as a Diff written in place requires anyway: up to that many clean pages
+    /// with a page table entry between two written runs are read and written with them, so the
+    /// two runs are one write. A writer that held no data takes 0, so it gets only marked pages.
+    /// With `read_untouched` a clean page without a page table entry is bridged too, which reads
+    /// it: right where the memory is registered with userfaultfd, whose server answers the fault
+    /// with the snapshot's own page.
     fn dump_dirty<T: WriteVolatile + std::io::Seek>(
         &self,
         writer: &mut T,
         dirty_bitmap: &DirtyBitmap,
+        bridge_pages: usize,
+        read_untouched: bool,
     ) -> Result<(), MemoryError>;
 
     /// Clears the write and discard marks of every plugged slot. An unplugged slot keeps its
@@ -1750,7 +1856,15 @@ impl GuestMemoryExtension for GuestMemoryMmap {
             .flat_map(|region| region.slots())
             .try_for_each(|(mem_slot, plugged)| {
                 if !plugged {
-                    mem_slot.dump_marked(writer, None, zero_pages, page_size, &mut scratch)
+                    mem_slot.dump_marked(
+                        writer,
+                        None,
+                        zero_pages,
+                        page_size,
+                        &mut scratch,
+                        0,
+                        false,
+                    )
                 } else {
                     match zero_pages {
                         ZeroPages::Write => write_memory(writer, &mem_slot.slice),
@@ -1771,6 +1885,8 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         &self,
         writer: &mut T,
         dirty_bitmap: &DirtyBitmap,
+        bridge_pages: usize,
+        read_untouched: bool,
     ) -> Result<(), MemoryError> {
         let page_size = host_page_size();
         let mut scratch = DumpScratch::default();
@@ -1793,6 +1909,8 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                         ZeroPages::Write,
                         page_size,
                         &mut scratch,
+                        bridge_pages,
+                        read_untouched,
                     )
                 });
 
@@ -2864,6 +2982,205 @@ mod tests {
         assert!(written == contents, "the file differs from guest memory");
     }
 
+    /// A writer over a file that counts the writes it is given.
+    struct CountingWriter {
+        file: File,
+        writes: usize,
+    }
+
+    impl WriteVolatile for CountingWriter {
+        fn write_volatile<B: vm_memory::bitmap::BitmapSlice>(
+            &mut self,
+            buf: &VolatileSlice<B>,
+        ) -> Result<usize, vm_memory::VolatileMemoryError> {
+            self.writes += 1;
+            self.file.write_volatile(buf)
+        }
+    }
+
+    impl std::io::Seek for CountingWriter {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.file.seek(pos)
+        }
+    }
+
+    /// One plugged slot of `pages` pages, each filled with its own byte, past Firecracker's
+    /// bitmap, except the pages in `untouched`, which never get a page table entry. Returns the
+    /// memory and the host address of its first page.
+    fn filled_slot(pages: usize, untouched: &[usize]) -> (GuestMemoryMmap, *mut u8) {
+        let page_size = host_page_size();
+        let guest_memory = into_region_ext(
+            anonymous(
+                [(GuestAddress(0), pages * page_size)].into_iter(),
+                true,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        let host = guest_memory
+            .iter()
+            .next()
+            .unwrap()
+            .get_host_address(MemoryRegionAddress(0))
+            .unwrap();
+        for page in (0..pages).filter(|page| !untouched.contains(page)) {
+            // SAFETY: the page is inside the slot just mapped.
+            unsafe { std::ptr::write_bytes(host.add(page * page_size), page as u8 + 1, page_size) };
+        }
+        (guest_memory, host)
+    }
+
+    /// The guest's memory as bytes, read past Firecracker's bitmap.
+    fn memory_bytes(host: *mut u8, len: usize) -> Vec<u8> {
+        // SAFETY: `len` bytes from `host` are guest memory, mapped for the test.
+        unsafe { std::slice::from_raw_parts(host, len) }.to_vec()
+    }
+
+    /// Dumps the pages `dirty` marks in KVM's log over a file that holds `parent`, with
+    /// `bridge_pages`, and returns the number of writes and the file's bytes afterwards.
+    fn dump_over(
+        guest_memory: &GuestMemoryMmap,
+        parent: &[u8],
+        dirty: &[usize],
+        bridge_pages: usize,
+        read_untouched: bool,
+    ) -> (usize, Vec<u8>) {
+        let mut file = TempFile::new().unwrap().into_file();
+        file.write_all(parent).unwrap();
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut log = 0u64;
+        for page in dirty {
+            log |= 1 << page;
+        }
+        let mut kvm_dirty_bitmap: DirtyBitmap = HashMap::new();
+        kvm_dirty_bitmap.insert(0, vec![log]);
+        let mut writer = CountingWriter { file, writes: 0 };
+        guest_memory
+            .dump_dirty(&mut writer, &kvm_dirty_bitmap, bridge_pages, read_untouched)
+            .unwrap();
+        let mut bytes = vec![0u8; parent.len()];
+        writer.file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        writer.file.read_exact(&mut bytes).unwrap();
+        (writer.writes, bytes)
+    }
+
+    #[test]
+    fn test_in_place_diff_writes_short_clean_gaps_with_their_runs() {
+        let page_size = host_page_size();
+        let pages = 16;
+        let (guest_memory, host) = filled_slot(pages, &[]);
+        let parent = memory_bytes(host, pages * page_size);
+        // The guest writes pages 0, 2, 7 and 13: clean gaps of 1, 4 and 5 pages between them.
+        let dirty = [0, 2, 7, 13];
+        for page in dirty {
+            // SAFETY: the page is inside the slot.
+            unsafe { std::ptr::write_bytes(host.add(page * page_size), 0xEE, page_size) };
+        }
+        let now = memory_bytes(host, pages * page_size);
+
+        let (writes, bytes) = dump_over(&guest_memory, &parent, &dirty, 0, false);
+        assert_eq!(writes, 4, "without bridging each run is its own write");
+        assert!(bytes == now, "the file holds the guest's memory");
+
+        // With gaps of up to 4 pages bridged, pages 0 to 7 are one write and page 13 another:
+        // its gap of 5 pages is one page too long.
+        assert_eq!(DIFF_BRIDGE_PAGES, 4);
+        let (writes, bytes) = dump_over(&guest_memory, &parent, &dirty, DIFF_BRIDGE_PAGES, false);
+        assert_eq!(writes, 2, "pages 0-7 in one write and page 13 in another");
+        assert!(bytes == now, "the file holds the guest's memory");
+    }
+
+    #[test]
+    fn test_in_place_diff_keeps_a_held_gap_across_a_clean_word() {
+        let page_size = host_page_size();
+        let pages = 192;
+        let (guest_memory, host) = filled_slot(pages, &[]);
+        let parent = memory_bytes(host, pages * page_size);
+        // Page 62 is written and page 63 is a clean page that may join it; pages 64 to 127, a
+        // whole word, are clean; page 130 is written. The held page 63 must still move the file
+        // offset when the clean word is seeked over, or page 130 lands a page early.
+        for page in [62, 130] {
+            // SAFETY: the page is inside the slot.
+            unsafe { std::ptr::write_bytes(host.add(page * page_size), 0xEE, page_size) };
+        }
+        let now = memory_bytes(host, pages * page_size);
+        let mut kvm_dirty_bitmap: DirtyBitmap = HashMap::new();
+        kvm_dirty_bitmap.insert(0, vec![1 << 62, 0, 1 << (130 - 128)]);
+        let mut file = TempFile::new().unwrap().into_file();
+        file.write_all(&parent).unwrap();
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        guest_memory
+            .dump_dirty(&mut file, &kvm_dirty_bitmap, DIFF_BRIDGE_PAGES, false)
+            .unwrap();
+        assert_eq!(
+            file.stream_position().unwrap(),
+            (pages * page_size) as u64,
+            "the dump ends at the end of the slot"
+        );
+        let mut bytes = vec![0u8; pages * page_size];
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut bytes).unwrap();
+        assert!(bytes == now, "the file holds the guest's memory");
+    }
+
+    #[test]
+    fn test_in_place_diff_does_not_bridge_a_page_without_a_page_table_entry() {
+        let page_size = host_page_size();
+        let pages = 4;
+        // Page 1 was never touched, so reading it would fault it in (through userfaultfd in a
+        // restored clone); it must stay a gap.
+        let (guest_memory, host) = filled_slot(pages, &[1]);
+        let parent = vec![0u8; pages * page_size];
+        for page in [0, 2, 3] {
+            // SAFETY: the page is inside the slot.
+            unsafe { std::ptr::write_bytes(host.add(page * page_size), 0xEE, page_size) };
+        }
+        let (writes, _) = dump_over(&guest_memory, &parent, &[0, 2], DIFF_BRIDGE_PAGES, false);
+        assert_eq!(
+            writes, 2,
+            "page 1 has no page table entry, so pages 0 and 2 stay apart"
+        );
+        let mut resident = [0u8; 4];
+        // SAFETY: the 4 pages from `host` are the slot.
+        assert_eq!(
+            unsafe { libc::mincore(host.cast(), pages * page_size, resident.as_mut_ptr()) },
+            0
+        );
+        assert_eq!(resident[1] & 1, 0, "the dump did not fault page 1 in");
+    }
+
+    #[test]
+    fn test_in_place_diff_bridges_an_untouched_page_when_it_may_read_one() {
+        let page_size = host_page_size();
+        let pages = 4;
+        // As above, but the memory is one whose untouched pages a server fills on a fault, so
+        // page 1 is read with pages 0 and 2: one write. Plain anonymous memory reads it as zeros,
+        // which is what the file holds there. The expected bytes are built without reading page
+        // 1, which would give it a page table entry.
+        let (guest_memory, host) = filled_slot(pages, &[1]);
+        let page = |byte: u8| vec![byte; page_size];
+        let parent = [page(1), page(0), page(3), page(4)].concat();
+        for page in [0, 2] {
+            // SAFETY: the page is inside the slot.
+            unsafe { std::ptr::write_bytes(host.add(page * page_size), 0xEE, page_size) };
+        }
+        let now = [page(0xEE), page(0), page(0xEE), page(4)].concat();
+        let mut resident = [0u8; 4];
+        // SAFETY: the 4 pages from `host` are the slot.
+        assert_eq!(
+            unsafe { libc::mincore(host.cast(), pages * page_size, resident.as_mut_ptr()) },
+            0
+        );
+        assert_eq!(
+            resident[1] & 1,
+            0,
+            "page 1 has no page table entry before the dump"
+        );
+        let (writes, bytes) = dump_over(&guest_memory, &parent, &[0, 2], DIFF_BRIDGE_PAGES, true);
+        assert_eq!(writes, 1, "pages 0 to 2 in one write");
+        assert!(bytes == now, "the file holds the guest's memory");
+    }
+
     #[test]
     fn test_dump_dirty() {
         let page_size = host_page_size();
@@ -2909,7 +3226,7 @@ mod tests {
 
         let mut file = TempFile::new().unwrap().into_file();
         guest_memory
-            .dump_dirty(&mut file, &kvm_dirty_bitmap)
+            .dump_dirty(&mut file, &kvm_dirty_bitmap, 0, false)
             .unwrap();
 
         // We can restore from this because this is the first dirty dump.
@@ -2956,7 +3273,7 @@ mod tests {
         kvm_dirty_bitmap.insert(1, vec![0b10]);
 
         guest_memory
-            .dump_dirty(&mut reader, &kvm_dirty_bitmap)
+            .dump_dirty(&mut reader, &kvm_dirty_bitmap, 0, false)
             .unwrap();
 
         // Check that only the dirty regions are dumped.
@@ -2991,7 +3308,7 @@ mod tests {
 
         let mut reader = file.into_file();
         guest_memory
-            .dump_dirty(&mut reader, &kvm_dirty_bitmap)
+            .dump_dirty(&mut reader, &kvm_dirty_bitmap, 0, false)
             .unwrap();
 
         // Check that only the dirty regions are dumped.
@@ -3020,19 +3337,19 @@ mod tests {
         kvm_dirty_bitmap.insert(0, vec![0b1, 0b01]);
         kvm_dirty_bitmap.insert(1, vec![0b10]);
         assert!(matches!(
-            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap),
+            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap, 0, false),
             Err(MemoryError::DirtyBitmapTooLarge)
         ));
         kvm_dirty_bitmap.insert(0, vec![0b01]);
         kvm_dirty_bitmap.insert(1, vec![0b110]);
         assert!(matches!(
-            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap),
+            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap, 0, false),
             Err(MemoryError::DirtyBitmapTooLarge)
         ));
         kvm_dirty_bitmap.insert(0, vec![]);
         kvm_dirty_bitmap.insert(1, vec![0b10]);
         assert!(matches!(
-            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap),
+            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap, 0, false),
             Err(MemoryError::DirtyBitmapTooSmall)
         ));
     }
@@ -3296,7 +3613,8 @@ mod tests {
         let mut file = TempFile::new().unwrap().into_file();
         file.write_all(parent).unwrap();
         file.rewind().unwrap();
-        mem.dump_dirty(&mut file, &clean_kvm_log(mem)).unwrap();
+        mem.dump_dirty(&mut file, &clean_kvm_log(mem), 0, false)
+            .unwrap();
         let mut bytes = vec![0u8; parent.len()];
         file.rewind().unwrap();
         file.read_exact(&mut bytes).unwrap();
@@ -3710,8 +4028,16 @@ mod tests {
         };
         let (slot, plugged) = mem.iter().next().unwrap().slots().next().unwrap();
         assert!(!plugged);
-        slot.dump_marked(&mut file, None, ZeroPages::Write, page_size, &mut scratch)
-            .unwrap();
+        slot.dump_marked(
+            &mut file,
+            None,
+            ZeroPages::Write,
+            page_size,
+            &mut scratch,
+            0,
+            false,
+        )
+        .unwrap();
 
         let mut bytes = vec![0xffu8; len];
         file.rewind().unwrap();
@@ -3836,7 +4162,7 @@ mod tests {
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     mod prop_tests {
-        use std::io::{Read, Seek, SeekFrom};
+        use std::io::{Read, Seek, SeekFrom, Write};
         use std::os::unix::fs::MetadataExt;
 
         use proptest::prelude::*;
@@ -3889,13 +4215,17 @@ mod tests {
             let num_u64s = num_pages.div_ceil(64);
             let last_chunk_valid_bits = num_pages % 64;
 
-            proptest::collection::vec(any::<u64>(), num_u64s).prop_map(move |mut bm| {
-                if last_chunk_valid_bits > 0 {
-                    let last = bm.len() - 1;
-                    bm[last] &= (1u64 << last_chunk_valid_bits) - 1;
-                }
-                bm
-            })
+            // Half the words are clean, as most of a real guest's are, so a dump crosses whole
+            // clean words between written runs.
+            proptest::collection::vec(prop_oneof![Just(0u64), any::<u64>()], num_u64s).prop_map(
+                move |mut bm| {
+                    if last_chunk_valid_bits > 0 {
+                        let last = bm.len() - 1;
+                        bm[last] &= (1u64 << last_chunk_valid_bits) - 1;
+                    }
+                    bm
+                },
+            )
         }
 
         /// A region descriptor produced by the strategy.
@@ -3922,10 +4252,10 @@ mod tests {
         fn region_spec() -> impl Strategy<Value = RegionSpec> {
             prop_oneof![
                 // Dram: 1 slot, always plugged
-                (0usize..=8, 1usize..=128).prop_flat_map(|(gap_pages, pages_per_slot)| {
+                (0usize..=8, 1usize..=256).prop_flat_map(|(gap_pages, pages_per_slot)| {
                     (
                         kvm_bitmap_for(pages_per_slot),
-                        proptest::collection::vec(any::<bool>(), pages_per_slot),
+                        proptest::collection::vec(proptest::bool::weighted(0.02), pages_per_slot),
                     )
                         .prop_map(move |(bm, fc)| RegionSpec {
                             gap_pages,
@@ -3937,13 +4267,16 @@ mod tests {
                         })
                 }),
                 // Hotpluggable: 1-4 slots, each plugged or not
-                (0usize..=8, 1usize..=128, 1usize..=4).prop_flat_map(
+                (0usize..=8, 1usize..=256, 1usize..=4).prop_flat_map(
                     |(gap_pages, pages_per_slot, num_slots)| {
                         (
                             proptest::collection::vec(any::<bool>(), num_slots),
                             proptest::collection::vec(kvm_bitmap_for(pages_per_slot), num_slots),
                             proptest::collection::vec(
-                                proptest::collection::vec(any::<bool>(), pages_per_slot),
+                                proptest::collection::vec(
+                                    proptest::bool::weighted(0.02),
+                                    pages_per_slot,
+                                ),
                                 num_slots,
                             ),
                         )
@@ -4068,7 +4401,7 @@ mod tests {
                 let mut opt_file = TempFile::new().unwrap().into_file();
                 opt_file.set_len(total_size as u64).unwrap();
                 guest_memory
-                    .dump_dirty(&mut opt_file, &kvm_bitmap)
+                    .dump_dirty(&mut opt_file, &kvm_bitmap, 0, false)
                     .unwrap();
                 let opt_pos = opt_file.stream_position().unwrap();
 
@@ -4084,6 +4417,59 @@ mod tests {
                 opt_file.read_exact(&mut opt_buf).unwrap();
                 oracle_file.read_exact(&mut oracle_buf).unwrap();
                 prop_assert_eq!(&opt_buf, &oracle_buf);
+            }
+
+            #[test]
+            fn in_place_dump_dirty_with_bridged_gaps_leaves_the_guest_memory(
+                region_specs in proptest::collection::vec(region_spec(), 1..=3),
+            ) {
+                let page_size = host_page_size();
+                let (guest_memory, kvm_bitmap, total_size) = build_memory(&region_specs);
+                // The memory as of the last snapshot: every page filled, past Firecracker's bitmap.
+                for region in guest_memory.iter() {
+                    let ptr = region.get_host_address(MemoryRegionAddress(0)).unwrap();
+                    // SAFETY: ptr is valid for region.len() bytes.
+                    unsafe { std::ptr::write_bytes(ptr, 0xAB, u64_to_usize(region.len())) };
+                }
+                let image = |mem: &GuestMemoryMmap| {
+                    let mut bytes = Vec::with_capacity(total_size);
+                    for region in mem.iter() {
+                        let ptr = region.get_host_address(MemoryRegionAddress(0)).unwrap();
+                        // SAFETY: ptr is valid for region.len() bytes.
+                        bytes.extend_from_slice(unsafe {
+                            std::slice::from_raw_parts(ptr, u64_to_usize(region.len()))
+                        });
+                    }
+                    bytes
+                };
+                let parent = image(&guest_memory);
+                // Then the guest writes the pages the specs mark, in plugged slots.
+                for (region, spec) in guest_memory.iter().zip(region_specs.iter()) {
+                    for (slot_idx, (slot, plugged)) in region.slots().enumerate() {
+                        if !plugged {
+                            continue;
+                        }
+                        for (page, dirty) in spec.fc_dirty_pages[slot_idx].iter().enumerate() {
+                            if *dirty {
+                                let addr = slot.guest_addr.0 + (page * page_size) as u64;
+                                guest_memory.write(&[0xCD], GuestAddress(addr)).unwrap();
+                            }
+                        }
+                    }
+                }
+                let now = image(&guest_memory);
+
+                let mut file = TempFile::new().unwrap().into_file();
+                file.write_all(&parent).unwrap();
+                file.seek(SeekFrom::Start(0)).unwrap();
+                guest_memory
+                    .dump_dirty(&mut file, &kvm_bitmap, DIFF_BRIDGE_PAGES, false)
+                    .unwrap();
+                prop_assert_eq!(file.stream_position().unwrap(), total_size as u64);
+                let mut bytes = vec![0u8; total_size];
+                file.seek(SeekFrom::Start(0)).unwrap();
+                file.read_exact(&mut bytes).unwrap();
+                prop_assert!(bytes == now, "the file differs from the guest's memory");
             }
 
             #[test]
