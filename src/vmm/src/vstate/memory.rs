@@ -148,17 +148,26 @@ fn populate_read<B: BitmapSlice>(slice: &VolatileSlice<'_, B>) -> Result<bool, M
 /// The bytes of guest memory in `regions` that the file byte ranges `ranges` map, each range
 /// clamped to the regions.
 pub fn file_ranges_len(regions: &[GuestRegionMmap], ranges: &[(u64, u64)]) -> u64 {
+    let bounds: Vec<(u64, u64)> = regions
+        .iter()
+        .filter_map(|region| {
+            let start = region.file_offset()?.start();
+            Some((start, start + region.len()))
+        })
+        .collect();
+    clamped_len(&bounds, ranges)
+}
+
+/// The summed length of `ranges` clamped to each of `bounds` (file offset start and end).
+/// It saturates: overlapping ranges must not wrap past `u64::MAX` to a small number, which
+/// would pass a bound on the total.
+fn clamped_len(bounds: &[(u64, u64)], ranges: &[(u64, u64)]) -> u64 {
     let mut total = 0u64;
-    for region in regions {
-        let Some(file_offset) = region.file_offset() else {
-            continue;
-        };
-        let start = file_offset.start();
-        let end = start + region.len();
+    for &(start, end) in bounds {
         for &(offset, length) in ranges {
             let from = offset.max(start);
             let to = offset.saturating_add(length).min(end);
-            total += to.saturating_sub(from);
+            total = total.saturating_add(to.saturating_sub(from));
         }
     }
     total
@@ -2248,6 +2257,16 @@ mod tests {
                 assert_eq!(region.bitmap().is_some(), dirty_page_tracking);
             });
         }
+    }
+
+    /// Overlapping ranges whose clamped lengths add up past `u64::MAX` saturate there rather
+    /// than wrap to a small total that a bound would pass.
+    #[test]
+    fn overlapping_write_set_ranges_saturate() {
+        let bounds = [(0, u64::MAX)];
+        let ranges = [(0, u64::MAX), (0, u64::MAX), (1, u64::MAX)];
+        assert_eq!(clamped_len(&bounds, &ranges), u64::MAX);
+        assert_eq!(clamped_len(&[(0, 8192)], &[(0, 4096), (4096, 8192)]), 8192);
     }
 
     /// Populating a write set gives exactly its pages a private copy in this process, before
