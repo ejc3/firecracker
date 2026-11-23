@@ -72,6 +72,12 @@ pub struct NetworkOverride {
     pub iface_id: String,
     /// The new name of the interface to be assigned
     pub host_dev_name: String,
+    /// An open descriptor of a queue of `host_dev_name` that this process inherited. The
+    /// load uses it instead of opening the device: it attaches nothing to the device, and
+    /// the device keeps its queue when this process exits, for as long as the process that
+    /// attached it holds its own copy.
+    #[serde(default)]
+    pub host_dev_fd: Option<i32>,
 }
 
 /// Allows for changing the host UDS of the vsock backend during snapshot restore

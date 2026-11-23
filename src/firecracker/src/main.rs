@@ -52,17 +52,17 @@ const DEFAULT_API_SOCK_PATH: &str = "/run/firecracker.socket";
 // The `fcvm` build metadata names what this build takes that another build of the same
 // version may not, so a caller can read it from `--version` before it uses one:
 // `drive-overrides` says a snapshot load takes `drive_overrides`, `numa-window` that the
-// process takes `--numa-balancing-after-secs`, and `write-set` that a File backend load
-// takes `mem_backend.write_set_path`.
+// process takes `--numa-balancing-after-secs`, `write-set` that a File backend load takes
+// `mem_backend.write_set_path`, and `tap-fd` that a net device takes `host_dev_fd`.
 const FIRECRACKER_VERSION: &str = if cfg!(feature = "fuzzing") {
     concat!(
         env!("CARGO_PKG_VERSION"),
-        "+fcvm.drive-overrides.numa-window.write-set.fuzzing"
+        "+fcvm.drive-overrides.numa-window.write-set.tap-fd.fuzzing"
     )
 } else {
     concat!(
         env!("CARGO_PKG_VERSION"),
-        "+fcvm.drive-overrides.numa-window.write-set"
+        "+fcvm.drive-overrides.numa-window.write-set.tap-fd"
     )
 };
 const MMDS_CONTENT_ARG: &str = "metadata";

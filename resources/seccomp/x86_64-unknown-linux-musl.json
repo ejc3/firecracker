@@ -654,6 +654,19 @@
             },
             {
                 "syscall": "ioctl",
+                "comment": "Needed for checking an inherited tap queue during net hotplug",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 2147767506,
+                        "comment": "TUNGETIFF"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
                 "comment": "NE_ADD_DEVICE, used to attach a virtio device to a running enclave (device hotplug)",
                 "args": [
                     {

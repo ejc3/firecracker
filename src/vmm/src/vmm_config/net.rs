@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::ops::Deref;
+use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,12 @@ pub struct NetworkInterfaceConfig {
     pub iface_id: String,
     /// Host level path for the guest network interface.
     pub host_dev_name: String,
+    /// An open descriptor of a queue of `host_dev_name` that this process inherited. The
+    /// device is used through it instead of being opened by name: nothing is attached to
+    /// the device, and it keeps its queue when this process exits, for as long as the
+    /// process that attached the queue holds its own copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_dev_fd: Option<i32>,
     /// Guest MAC address.
     pub guest_mac: Option<MacAddr>,
     /// Maximum Transmission Unit to advertise to the guest via VIRTIO_NET_F_MTU.
@@ -45,6 +52,9 @@ impl From<&Net> for NetworkInterfaceConfig {
         NetworkInterfaceConfig {
             iface_id: net.id().to_string(),
             host_dev_name: net.iface_name(),
+            // A descriptor names a queue in the process that holds it and nowhere else,
+            // so a device's configuration does not carry one.
+            host_dev_fd: None,
             guest_mac: net.guest_mac().copied(),
             mtu: net.mtu(),
             dmb_size_mib: net.dmb_size_mib(),
@@ -78,6 +88,8 @@ pub enum NetworkInterfaceError {
     DeviceUpdate(#[from] VmmError),
     /// The MAC address is already in use: {0}
     GuestMacAddressInUse(String),
+    /// Descriptor {0} is already the TAP queue of network device '{1}'
+    HostDevFdInUse(i32, String),
     /// Cannot open/create the tap device: {0}
     OpenTap(#[from] TapError),
 }
@@ -129,6 +141,20 @@ impl NetBuilder {
             }
         }
 
+        // An inherited queue is one descriptor, and the device that takes it owns it: a
+        // second device on the same number would read the same queue and close, when it is
+        // dropped, whatever the number names by then. That includes the device this config
+        // replaces, which closes the descriptor when it is removed below.
+        if let Some(tap_fd) = netif_config.host_dev_fd {
+            let holder = self.net_devices.iter().find_map(|net| {
+                let net = net.lock().expect("Poisoned lock");
+                (net.tap.as_raw_fd() == tap_fd).then(|| net.id().to_string())
+            });
+            if let Some(holder) = holder {
+                return Err(NetworkInterfaceError::HostDevFdInUse(tap_fd, holder));
+            }
+        }
+
         // If this is an update, just remove the old one.
         if let Some(index) = self
             .net_devices
@@ -161,15 +187,26 @@ impl NetBuilder {
             .map(RateLimiter::from)
             .unwrap_or_default();
 
-        let mut net = crate::devices::virtio::net::Net::new(
-            cfg.iface_id,
-            &cfg.host_dev_name,
-            cfg.guest_mac,
-            rx_rate_limiter,
-            tx_rate_limiter,
-            cfg.mtu,
-        )
-        .map_err(NetworkInterfaceError::CreateNetworkDevice)?;
+        let net = match cfg.host_dev_fd {
+            None => crate::devices::virtio::net::Net::new(
+                cfg.iface_id,
+                &cfg.host_dev_name,
+                cfg.guest_mac,
+                rx_rate_limiter,
+                tx_rate_limiter,
+                cfg.mtu,
+            ),
+            Some(tap_fd) => crate::devices::virtio::net::Net::new_inherited(
+                cfg.iface_id,
+                tap_fd,
+                &cfg.host_dev_name,
+                cfg.guest_mac,
+                rx_rate_limiter,
+                tx_rate_limiter,
+                cfg.mtu,
+            ),
+        };
+        let mut net = net.map_err(NetworkInterfaceError::CreateNetworkDevice)?;
         net.dmb_size_mib = cfg.dmb_size_mib;
         Ok(net)
     }
@@ -201,6 +238,7 @@ mod tests {
         NetworkInterfaceConfig {
             iface_id: String::from(id),
             host_dev_name: String::from(name),
+            host_dev_fd: None,
             guest_mac: Some(MacAddr::from_str(mac).unwrap()),
             mtu: None,
             dmb_size_mib: None,
@@ -209,11 +247,71 @@ mod tests {
         }
     }
 
+    /// A config that names an inherited queue builds its device on that queue: the TAP
+    /// device stays attached once, by its holder, and a queue of another device is refused.
+    #[test]
+    fn test_create_net_on_an_inherited_queue() {
+        use crate::devices::virtio::net::Tap;
+
+        let holder = Tap::open_named("inheritnet").unwrap();
+        let mut cfg = create_netif("id", "inheritnet", "01:23:45:67:89:0a");
+        // SAFETY: dup of a descriptor this test owns.
+        cfg.host_dev_fd = Some(unsafe { libc::dup(holder.as_raw_fd()) });
+        let net = NetBuilder::create_net(cfg).unwrap();
+        assert_eq!(net.iface_name(), "inheritnet");
+        Tap::open_named("inheritnet").unwrap_err();
+        drop(net);
+
+        let mut wrong = create_netif("id", "inheritother", "01:23:45:67:89:0a");
+        // SAFETY: as above; closed below, since a refused descriptor stays open.
+        let fd = unsafe { libc::dup(holder.as_raw_fd()) };
+        wrong.host_dev_fd = Some(fd);
+        NetBuilder::create_net(wrong).unwrap_err();
+        // SAFETY: the descriptor is this test's own.
+        unsafe { libc::close(fd) };
+    }
+
+    /// One inherited queue is one device's: a second config that names the same descriptor
+    /// is refused, whether it is for another device or replaces the one that has it, and
+    /// the descriptor stays the first device's.
+    #[test]
+    fn test_an_inherited_queue_is_one_devices() {
+        use crate::devices::virtio::net::Tap;
+
+        let holder = Tap::open_named("inheritonce").unwrap();
+        // SAFETY: dup of a descriptor this test owns; the device built on it owns the dup.
+        let fd = unsafe { libc::dup(holder.as_raw_fd()) };
+        let mut builder = NetBuilder::new();
+        let mut first = create_netif("first", "inheritonce", "01:23:45:67:89:0a");
+        first.host_dev_fd = Some(fd);
+        let net = builder.build(first).unwrap();
+        assert_eq!(net.lock().unwrap().tap.as_raw_fd(), fd);
+
+        for (id, mac) in [
+            ("second", "01:23:45:67:89:0b"),
+            ("first", "01:23:45:67:89:0a"),
+        ] {
+            let mut again = create_netif(id, "inheritonce", mac);
+            again.host_dev_fd = Some(fd);
+            match builder.build(again) {
+                Err(NetworkInterfaceError::HostDevFdInUse(refused, by)) => {
+                    assert_eq!((refused, by.as_str()), (fd, "first"), "{id}");
+                }
+                other => panic!("{id}: {other:?}"),
+            }
+        }
+        assert_eq!(builder.len(), 1);
+        // The first device still has its queue: the descriptor is open and attached.
+        // SAFETY: F_GETFD takes no pointer.
+        assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+    }
+
     impl Clone for NetworkInterfaceConfig {
         fn clone(&self) -> Self {
             NetworkInterfaceConfig {
                 iface_id: self.iface_id.clone(),
                 host_dev_name: self.host_dev_name.clone(),
+                host_dev_fd: self.host_dev_fd,
                 guest_mac: self.guest_mac,
                 mtu: self.mtu,
                 dmb_size_mib: self.dmb_size_mib,

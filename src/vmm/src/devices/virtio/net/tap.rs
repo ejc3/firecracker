@@ -12,7 +12,7 @@ use std::os::raw::*;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
 use vmm_sys_util::ioctl::{ioctl_with_mut_ref, ioctl_with_ref, ioctl_with_val};
-use vmm_sys_util::ioctl_iow_nr;
+use vmm_sys_util::{ioctl_ior_nr, ioctl_iow_nr};
 
 use crate::devices::virtio::net::generated;
 
@@ -34,10 +34,17 @@ pub enum TapError {
     SetOffloadFlags(IoError),
     /// Error while setting size of the vnet header: {0}
     SetSizeOfVnetHdr(IoError),
+    /// The inherited descriptor {0} is not usable: {1}
+    InheritedFd(RawFd, IoError),
+    /// The inherited descriptor {0} is the device {1} with flags {2:#x}, not the TAP device {3} with flags {4:#x}
+    InheritedFdMismatch(RawFd, String, i16, String, i16),
 }
 
 const TUNTAP: ::std::os::raw::c_uint = 84;
 ioctl_iow_nr!(TUNSETIFF, TUNTAP, 202, ::std::os::raw::c_int);
+ioctl_ior_nr!(TUNGETIFF, TUNTAP, 210, ::std::os::raw::c_uint);
+// `IFF_TUN` of linux/if_tun.h: a queue of a TUN device, which carries IP packets.
+const IFF_TUN: u32 = 1;
 ioctl_iow_nr!(TUNSETOFFLOAD, TUNTAP, 208, ::std::os::raw::c_uint);
 ioctl_iow_nr!(TUNSETVNETHDRSZ, TUNTAP, 216, ::std::os::raw::c_int);
 
@@ -67,6 +74,16 @@ fn build_terminated_if_name(if_name: &str) -> Result<[u8; IFACE_NAME_MAX_LEN], T
     terminated_if_name[..if_name.len()].copy_from_slice(if_name);
 
     Ok(terminated_if_name)
+}
+
+/// A descriptor this module does not own yet, for an ioctl on it.
+#[derive(Debug)]
+struct FdRef(RawFd);
+
+impl AsRawFd for FdRef {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -140,10 +157,7 @@ impl Tap {
         let terminated_if_name = build_terminated_if_name(if_name)?;
         let ifreq = IfReqBuilder::new()
             .if_name(&terminated_if_name)
-            .flags(
-                i16::try_from(generated::IFF_TAP | generated::IFF_NO_PI | generated::IFF_VNET_HDR)
-                    .unwrap(),
-            )
+            .flags(Self::device_flags())
             .execute(&tuntap, TUNSETIFF())
             .map_err(|io_error| TapError::IfreqExecuteError(io_error, if_name.to_owned()))?;
 
@@ -151,6 +165,74 @@ impl Tap {
             tap_file: tuntap,
             // SAFETY: Safe since only the name is accessed, and it's cloned out.
             if_name: unsafe { ifreq.ifr_ifrn.ifrn_name },
+        })
+    }
+
+    /// The flags a TAP device is opened with, and the flags an inherited one must have.
+    fn device_flags() -> i16 {
+        i16::try_from(generated::IFF_TAP | generated::IFF_NO_PI | generated::IFF_VNET_HDR).unwrap()
+    }
+
+    /// Use an open descriptor of the TAP device `if_name` that this process inherited,
+    /// instead of opening the device.
+    ///
+    /// The descriptor is a queue someone else attached to the device and still holds. This
+    /// process attaches nothing and, when it closes its copy, detaches nothing: the device
+    /// keeps its queue and its carrier across the processes that use it one after another.
+    /// Opening the device by name costs the host an `rtnl_mutex` hold for the attach, one
+    /// for the detach at exit with a grace period under it, and two link events.
+    ///
+    /// The descriptor must be attached to `if_name` with the flags [`Tap::open_named`]
+    /// uses, or it is refused and stays open. On success this `Tap` owns it. It is made
+    /// non-blocking and close-on-exec; the first is a property of the open file, so the
+    /// holder's copy becomes non-blocking with it.
+    pub fn from_inherited(fd: RawFd, if_name: &str) -> Result<Tap, TapError> {
+        let wanted = build_terminated_if_name(if_name)?;
+        // A descriptor that is not open fails TUNGETIFF with EBADF, one that is not a
+        // TUN/TAP queue with ENOTTY, and a queue attached to nothing with EBADFD.
+        let borrowed = FdRef(fd);
+        let ifreq = IfReqBuilder::new()
+            .execute(&borrowed, TUNGETIFF())
+            .map_err(|error| TapError::InheritedFd(fd, error))?;
+        // SAFETY: TUNGETIFF filled both union members read here.
+        let (name, flags) = unsafe { (ifreq.ifr_ifrn.ifrn_name, ifreq.ifr_ifru.ifru_flags) };
+        // The kernel reports the flags a queue can be opened with and state bits beside
+        // them (persistence, ownership); only the first are compared.
+        let mask = i16::try_from(
+            IFF_TUN
+                | generated::IFF_TAP
+                | generated::IFF_NO_PI
+                | generated::IFF_VNET_HDR
+                | generated::IFF_MULTI_QUEUE,
+        )
+        .unwrap();
+        if name != wanted || flags & mask != Self::device_flags() {
+            let len = name.iter().position(|b| *b == 0).unwrap_or(name.len());
+            return Err(TapError::InheritedFdMismatch(
+                fd,
+                String::from_utf8_lossy(&name[..len]).into_owned(),
+                flags & mask,
+                if_name.to_owned(),
+                Self::device_flags(),
+            ));
+        }
+        // FIONBIO and F_SETFD, and TUNGETIFF above, are what the VMM thread's seccomp
+        // policy allows on this path (`the_vmm_policy_allows_an_inherited_queue`): a net
+        // device can be added to a running microVM, under that policy.
+        let nonblocking: c_int = 1;
+        // SAFETY: FIONBIO reads one int, which outlives the call; F_SETFD takes no pointer.
+        let prepared = unsafe {
+            libc::ioctl(fd, libc::FIONBIO as _, &nonblocking) == 0
+                && libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) == 0
+        };
+        if !prepared {
+            return Err(TapError::InheritedFd(fd, IoError::last_os_error()));
+        }
+        Ok(Tap {
+            // SAFETY: the descriptor is open, is the queue checked above, and the caller
+            // hands it over: nothing else in this process uses it.
+            tap_file: unsafe { File::from_raw_fd(fd) },
+            if_name: name,
         })
     }
 
@@ -260,6 +342,163 @@ pub mod tests {
         let _tap1 = Tap::open_named("exclusivetap").unwrap();
         // Opening same tap device a second time should not be permitted.
         Tap::open_named("exclusivetap").unwrap_err();
+    }
+
+    /// An inherited queue is used as it is: the device keeps the one queue its holder
+    /// attached, and a second user of the holder's descriptor takes over where the first
+    /// stopped.
+    #[test]
+    fn test_inherited_queue_is_the_holders() {
+        let holder = Tap::open_named("inherittap").unwrap();
+        holder.set_vnet_hdr_size(12).unwrap();
+        // What a process that inherits the queue has: a copy of the holder's descriptor,
+        // without close-on-exec, on a file that may block.
+        let inherited = unsafe { libc::dup(holder.as_raw_fd()) };
+        assert!(inherited >= 0);
+        let status = unsafe { libc::fcntl(holder.as_raw_fd(), libc::F_GETFL) };
+        unsafe {
+            libc::fcntl(
+                holder.as_raw_fd(),
+                libc::F_SETFL,
+                status & !libc::O_NONBLOCK,
+            )
+        };
+
+        let tap = Tap::from_inherited(inherited, "inherittap").unwrap();
+        assert_eq!(tap.as_raw_fd(), inherited);
+        assert_eq!(tap.if_name_as_str(), "inherittap");
+        assert_ne!(
+            unsafe { libc::fcntl(inherited, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        assert_ne!(
+            unsafe { libc::fcntl(inherited, libc::F_GETFL) } & libc::O_NONBLOCK,
+            0
+        );
+        // The same options as on a queue this process attached.
+        tap.set_vnet_hdr_size(12).unwrap();
+        tap.set_offload(0).unwrap();
+        // It is the holder's queue, not a second one: the device is still attached once,
+        // so it cannot be opened by name.
+        Tap::open_named("inherittap").unwrap_err();
+        // The user leaves and the holder still has the device: the next user gets the
+        // same queue, and the device was never without one.
+        drop(tap);
+        let again = unsafe { libc::dup(holder.as_raw_fd()) };
+        let tap = Tap::from_inherited(again, "inherittap").unwrap();
+        Tap::open_named("inherittap").unwrap_err();
+        drop(tap);
+    }
+
+    /// A descriptor that is not the queue asked for is refused and left open.
+    /// Every syscall `Tap::from_inherited` and the device's set-up make on an inherited
+    /// queue is one the VMM thread's seccomp policy allows, on both targets that have a
+    /// policy: a net device hotplugged into a running microVM is made under it.
+    #[test]
+    fn the_vmm_policy_allows_an_inherited_queue() {
+        for policy in [
+            include_str!("../../../../../../resources/seccomp/aarch64-unknown-linux-musl.json"),
+            include_str!("../../../../../../resources/seccomp/x86_64-unknown-linux-musl.json"),
+        ] {
+            let policy: serde_json::Value = serde_json::from_str(policy).unwrap();
+            let rules = policy["vmm"]["filter"].as_array().unwrap();
+            let allows = |syscall: &str, args: &[serde_json::Value]| {
+                rules.iter().any(|rule| {
+                    rule["syscall"] == syscall
+                        && rule["args"].as_array().is_some_and(|rule_args| {
+                            rule_args.len() == args.len()
+                                && rule_args.iter().zip(args).enumerate().all(
+                                    |(position, (arg, value))| {
+                                        arg["index"] == position + 1
+                                            && arg["op"] == "eq"
+                                            && arg["val"] == *value
+                                    },
+                                )
+                        })
+                })
+            };
+            let ioctl = |request: serde_json::Value| allows("ioctl", &[request]);
+            assert!(ioctl(serde_json::json!(TUNGETIFF())), "TUNGETIFF");
+            assert!(ioctl(serde_json::json!(libc::FIONBIO)), "FIONBIO");
+            assert!(
+                ioctl(serde_json::json!(TUNSETVNETHDRSZ())),
+                "TUNSETVNETHDRSZ"
+            );
+            assert!(ioctl(serde_json::json!(TUNSETOFFLOAD())), "TUNSETOFFLOAD");
+            assert!(
+                allows(
+                    "fcntl",
+                    &[
+                        serde_json::json!(libc::F_SETFD),
+                        serde_json::json!(libc::FD_CLOEXEC)
+                    ]
+                ),
+                "F_SETFD"
+            );
+        }
+    }
+
+    #[test]
+    fn test_inherited_queue_must_be_the_device_asked_for() {
+        let holder = Tap::open_named("inheritone").unwrap();
+        let other = unsafe { libc::dup(holder.as_raw_fd()) };
+        match Tap::from_inherited(other, "inherittwo") {
+            Err(TapError::InheritedFdMismatch(fd, found, _, wanted, _)) => {
+                assert_eq!(
+                    (fd, found.as_str(), wanted.as_str()),
+                    (other, "inheritone", "inherittwo")
+                );
+            }
+            result => panic!("{result:?}"),
+        }
+        assert!(
+            unsafe { libc::fcntl(other, libc::F_GETFD) } >= 0,
+            "the descriptor was closed"
+        );
+        unsafe { libc::close(other) };
+
+        // Not a TUN/TAP queue.
+        let file = File::open("/dev/null").unwrap();
+        match Tap::from_inherited(file.as_raw_fd(), "inheritone") {
+            Err(TapError::InheritedFd(_, error)) => {
+                assert_eq!(error.raw_os_error(), Some(libc::ENOTTY));
+            }
+            result => panic!("{result:?}"),
+        }
+        // A queue attached to nothing.
+        let unattached = File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/net/tun")
+            .unwrap();
+        match Tap::from_inherited(unattached.as_raw_fd(), "inheritone") {
+            Err(TapError::InheritedFd(_, error)) => {
+                assert_eq!(error.raw_os_error(), Some(libc::EBADFD));
+            }
+            result => panic!("{result:?}"),
+        }
+        // Not open at all.
+        match Tap::from_inherited(1 << 20, "inheritone") {
+            Err(TapError::InheritedFd(_, error)) => {
+                assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+            }
+            result => panic!("{result:?}"),
+        }
+        // A queue of a device with other flags: here without a virtio-net header.
+        let plain = File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/net/tun")
+            .unwrap();
+        IfReqBuilder::new()
+            .if_name(&build_terminated_if_name("inheritplain").unwrap())
+            .flags(i16::try_from(generated::IFF_TAP | generated::IFF_NO_PI).unwrap())
+            .execute(&plain, TUNSETIFF())
+            .unwrap();
+        match Tap::from_inherited(plain.as_raw_fd(), "inheritplain") {
+            Err(TapError::InheritedFdMismatch(..)) => {}
+            result => panic!("{result:?}"),
+        }
     }
 
     #[test]
