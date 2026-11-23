@@ -36,6 +36,11 @@ pub struct NetConfigSpaceState {
 pub struct NetState {
     pub id: String,
     pub tap_if_name: String,
+    /// An open descriptor of a queue of `tap_if_name` that this process inherited, to use
+    /// instead of opening the device (a snapshot load's `host_dev_fd`). Never part of a
+    /// snapshot: a descriptor means something only in the process that has it.
+    #[serde(skip)]
+    pub inherited_tap_fd: Option<std::os::fd::RawFd>,
     rx_rate_limiter_state: RateLimiterState,
     tx_rate_limiter_state: RateLimiterState,
     /// The associated MMDS network stack.
@@ -77,6 +82,7 @@ impl Persist<'_> for Net {
         NetState {
             id: self.id.clone(),
             tap_if_name: self.iface_name(),
+            inherited_tap_fd: None,
             rx_rate_limiter_state: self.rx_rate_limiter.save(),
             tx_rate_limiter_state: self.tx_rate_limiter.save(),
             mmds_ns: self.mmds_ns.as_ref().map(|mmds| mmds.save()),
@@ -95,14 +101,25 @@ impl Persist<'_> for Net {
         // RateLimiter::restore() can fail at creating a timerfd.
         let rx_rate_limiter = RateLimiter::restore((), &state.rx_rate_limiter_state)?;
         let tx_rate_limiter = RateLimiter::restore((), &state.tx_rate_limiter_state)?;
-        let mut net = Net::new(
-            state.id.clone(),
-            &state.tap_if_name,
-            state.config_space.guest_mac,
-            rx_rate_limiter,
-            tx_rate_limiter,
-            state.config_space.mtu,
-        )?;
+        let mut net = match state.inherited_tap_fd {
+            None => Net::new(
+                state.id.clone(),
+                &state.tap_if_name,
+                state.config_space.guest_mac,
+                rx_rate_limiter,
+                tx_rate_limiter,
+                state.config_space.mtu,
+            )?,
+            Some(tap_fd) => Net::new_inherited(
+                state.id.clone(),
+                tap_fd,
+                &state.tap_if_name,
+                state.config_space.guest_mac,
+                rx_rate_limiter,
+                tx_rate_limiter,
+                state.config_space.mtu,
+            )?,
+        };
 
         // We trust the MMIOVirtioDevices::restore to pass us an MMDS data store reference if
         // there is at least one net device having the MMDS NS present and/or the mmds version was

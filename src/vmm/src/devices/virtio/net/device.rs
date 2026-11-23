@@ -366,6 +366,26 @@ impl Net {
         Self::new_with_tap(id, tap, guest_mac, rx_rate_limiter, tx_rate_limiter, mtu)
     }
 
+    /// Create a virtio network device on a queue of the TAP device `tap_if_name` that this
+    /// process inherited as the open descriptor `tap_fd` ([`Tap::from_inherited`]).
+    pub fn new_inherited(
+        id: String,
+        tap_fd: std::os::fd::RawFd,
+        tap_if_name: &str,
+        guest_mac: Option<MacAddr>,
+        rx_rate_limiter: RateLimiter,
+        tx_rate_limiter: RateLimiter,
+        mtu: Option<u16>,
+    ) -> Result<Self, NetError> {
+        let tap = Tap::from_inherited(tap_fd, tap_if_name).map_err(NetError::TapOpen)?;
+
+        let vnet_hdr_size = i32::try_from(vnet_hdr_len()).unwrap();
+        tap.set_vnet_hdr_size(vnet_hdr_size)
+            .map_err(NetError::TapSetVnetHdrSize)?;
+
+        Self::new_with_tap(id, tap, guest_mac, rx_rate_limiter, tx_rate_limiter, mtu)
+    }
+
     /// Provides the MAC of this net device.
     pub fn guest_mac(&self) -> Option<&MacAddr> {
         self.guest_mac.as_ref()

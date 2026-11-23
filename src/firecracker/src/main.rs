@@ -50,19 +50,19 @@ use crate::seccomp::SeccompConfig;
 // see https://refspecs.linuxfoundation.org/FHS_3.0/fhs/ch03s15.html for more information.
 const DEFAULT_API_SOCK_PATH: &str = "/run/firecracker.socket";
 // The `fcvm.drive-overrides` build metadata says this build's snapshot load takes
-// `drive_overrides`, which upstream releases of the same version reject, and
-// `numa-window` that it takes `--numa-balancing-after-secs`, and `write-set` that a File
-// backend load takes `mem_backend.write_set_path`. fcvm reads them from `--version` before it
-// uses them.
+// `drive_overrides`, which upstream releases of the same version reject,
+// `numa-window` that it takes `--numa-balancing-after-secs`, `write-set` that a File
+// backend load takes `mem_backend.write_set_path`, and `tap-fd` that a net device takes
+// `host_dev_fd`. fcvm reads them from `--version` before it uses them.
 const FIRECRACKER_VERSION: &str = if cfg!(feature = "fuzzing") {
     concat!(
         env!("CARGO_PKG_VERSION"),
-        "+fcvm.drive-overrides.numa-window.write-set.fuzzing"
+        "+fcvm.drive-overrides.numa-window.write-set.tap-fd.fuzzing"
     )
 } else {
     concat!(
         env!("CARGO_PKG_VERSION"),
-        "+fcvm.drive-overrides.numa-window.write-set"
+        "+fcvm.drive-overrides.numa-window.write-set.tap-fd"
     )
 };
 const MMDS_CONTENT_ARG: &str = "metadata";
