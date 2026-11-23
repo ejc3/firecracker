@@ -1187,7 +1187,11 @@ mod tests {
             None
         );
         assert_eq!(
-            repeated_inherited_queue(&[entry("eth0", Some(7)), entry("eth1", None), entry("eth2", Some(7))]),
+            repeated_inherited_queue(&[
+                entry("eth0", Some(7)),
+                entry("eth1", None),
+                entry("eth2", Some(7))
+            ]),
             Some(7)
         );
     }
