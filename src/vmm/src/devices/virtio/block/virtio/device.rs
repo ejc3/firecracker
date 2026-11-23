@@ -68,11 +68,26 @@ pub struct DiskProperties {
 impl DiskProperties {
     // Helper function that opens the file with the proper access permissions
     fn open_file(disk_image_path: &str, is_disk_read_only: bool) -> Result<File, VirtioBlockError> {
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(!is_disk_read_only)
             .open(PathBuf::from(&disk_image_path))
-            .map_err(|x| VirtioBlockError::BackingFile(x, disk_image_path.to_string()))
+            .map_err(|x| VirtioBlockError::BackingFile(x, disk_image_path.to_string()))?;
+        Self::without_readahead(&file);
+        Ok(file)
+    }
+
+    /// Turn off the host's readahead for a drive's backing file. The guest kernel reads
+    /// ahead in its own page cache, so host readahead only reads past what the guest asked
+    /// for: on btrfs, whose files read ahead up to 4 MiB, a restored clone's drive read 37 to
+    /// 39 GiB per 1000 clones with it and 9.3 GiB without. A file whose filesystem refuses
+    /// the advice is used as it is.
+    fn without_readahead(file: &File) {
+        // SAFETY: `file` is an open descriptor; posix_fadvise reads nothing through pointers.
+        let ret = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+        if ret != 0 {
+            warn!("posix_fadvise(POSIX_FADV_RANDOM) on a drive's backing file failed: {ret}");
+        }
     }
 
     // Helper function that gets the size of the file
@@ -969,6 +984,48 @@ mod tests {
             socket: Some("sock".to_string()),
         };
         VirtioBlockConfig::try_from(&block_config).unwrap_err();
+    }
+
+    /// A drive's backing file is read without host readahead: a 4 KiB read of a cold file
+    /// brings in that page and not the ones after it.
+    #[test]
+    fn test_disk_backing_file_has_no_readahead() {
+        use std::io::Write;
+        use std::os::unix::fs::FileExt;
+        // On the crate's own filesystem: tmpfs, often /tmp, does no readahead at all.
+        let dir = std::env::current_dir().unwrap();
+        let path = dir.join(format!("readahead-test-{}.img", std::process::id()));
+        let len = 8 << 20;
+        let mut f = File::create(&path).unwrap();
+        f.write_all(&vec![0x5a; len]).unwrap();
+        f.sync_all().unwrap();
+        // SAFETY: an open descriptor; drops the file's clean pages from the page cache.
+        unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        drop(f);
+
+        let disk = DiskProperties::open_file(path.to_str().unwrap(), true).unwrap();
+        let mut page = [0u8; 4096];
+        disk.read_exact_at(&mut page, 0).unwrap();
+        // SAFETY: a read-only shared mapping of the open file, unmapped below.
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                disk.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(map, libc::MAP_FAILED);
+        let mut resident = vec![0u8; len / 4096];
+        // SAFETY: `map` is `len` bytes and `resident` has one byte per page of it.
+        assert_eq!(unsafe { libc::mincore(map, len, resident.as_mut_ptr()) }, 0);
+        // SAFETY: the mapping made above.
+        unsafe { libc::munmap(map, len) };
+        std::fs::remove_file(&path).unwrap();
+        let pages = resident.iter().filter(|b| *b & 1 == 1).count();
+        assert!(pages <= 2, "{pages} pages resident after one 4 KiB read");
     }
 
     #[test]

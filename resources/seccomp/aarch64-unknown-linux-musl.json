@@ -233,6 +233,10 @@
                 "comment": "Used by the VirtIO balloon device and by musl for some customer workloads. It is also used by aws-lc during random number generation. They setup a memory page that mark with MADV_WIPEONFORK to be able to detect forks. They also call it with -1 to see if madvise is supported in certain platforms." 
             },
             {
+                "syscall": "fadvise64",
+                "comment": "POSIX_FADV_RANDOM on a drive's backing file when it is opened, so the host reads only what the guest asked for"
+            },
+            {
                 "syscall": "mbind",
                 "comment": "Returns guest memory to the default NUMA policy when its window out of NUMA balancing ends (vstate::memory::defer_numa_balancing)",
                 "args": [
