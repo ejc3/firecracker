@@ -6,6 +6,7 @@
 // found in the THIRD-PARTY file.
 
 use std::fmt::Debug;
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -524,6 +525,21 @@ impl DeviceManager {
             });
             if mac_in_use {
                 return Err(NetworkInterfaceError::GuestMacAddressInUse(mac.to_string()).into());
+            }
+        }
+
+        // As in `NetBuilder::build`: one inherited queue is one device's.
+        if let Some(tap_fd) = config.host_dev_fd {
+            let mut holder = None;
+            self.for_each_virtio_device(|_, device| {
+                if let Some(net) = device.as_any().downcast_ref::<Net>()
+                    && net.tap.as_raw_fd() == tap_fd
+                {
+                    holder = Some(net.id().to_string());
+                }
+            });
+            if let Some(holder) = holder {
+                return Err(NetworkInterfaceError::HostDevFdInUse(tap_fd, holder).into());
             }
         }
 
