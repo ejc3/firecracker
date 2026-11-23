@@ -6,6 +6,7 @@
 // found in the THIRD-PARTY file.
 
 use std::fmt::Debug;
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -693,6 +694,21 @@ impl DeviceManager {
             });
             if mac_in_use {
                 return Err(NetworkInterfaceError::GuestMacAddressInUse(mac.to_string()).into());
+            }
+        }
+
+        // As in `NetBuilder::build`: one inherited queue is one device's.
+        if let Some(tap_fd) = config.host_dev_fd {
+            let mut holder = None;
+            self.for_each_virtio_device(|_, device| {
+                if let Some(net) = device.as_any().downcast_ref::<Net>()
+                    && net.tap.as_raw_fd() == tap_fd
+                {
+                    holder = Some(net.id().to_string());
+                }
+            });
+            if let Some(holder) = holder {
+                return Err(NetworkInterfaceError::HostDevFdInUse(tap_fd, holder).into());
             }
         }
 
@@ -1568,6 +1584,7 @@ pub(crate) mod tests {
         let cfg = HotplugDeviceConfig::Net(NetworkInterfaceConfig {
             iface_id: "eth0".to_string(),
             host_dev_name: "hostname".to_string(),
+            host_dev_fd: None,
             guest_mac: Some(mac.parse().unwrap()),
             mtu: None,
             rx_rate_limiter: None,
@@ -1585,6 +1602,7 @@ pub(crate) mod tests {
         let cfg2 = HotplugDeviceConfig::Net(NetworkInterfaceConfig {
             iface_id: "eth1".to_string(),
             host_dev_name: "hostname2".to_string(),
+            host_dev_fd: None,
             guest_mac: Some(mac.parse().unwrap()),
             mtu: None,
             rx_rate_limiter: None,

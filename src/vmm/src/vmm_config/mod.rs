@@ -216,6 +216,7 @@ mod tests {
         let net = crate::vmm_config::net::NetworkInterfaceConfig {
             iface_id: String::from("eth0"),
             host_dev_name: String::from("tap0"),
+            host_dev_fd: None,
             guest_mac: None,
             mtu: None,
             rx_rate_limiter: None,

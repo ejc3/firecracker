@@ -651,6 +651,19 @@
             },
             {
                 "syscall": "ioctl",
+                "comment": "Needed for checking an inherited tap queue during net hotplug",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 2147767506,
+                        "comment": "TUNGETIFF"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
                 "comment": "Used to make vsock UDS nonblocking",
                 "args": [
                     {

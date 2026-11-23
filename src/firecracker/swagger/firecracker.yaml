@@ -1965,6 +1965,13 @@ definitions:
     properties:
       guest_mac:
         type: string
+      host_dev_fd:
+        type: integer
+        description:
+          An open file descriptor, inherited by the Firecracker process, of a queue of
+          the TAP device host_dev_name. The device is used through it instead of being
+          opened by name. It must be attached to host_dev_name with the flags
+          Firecracker opens a TAP device with (IFF_TAP, IFF_NO_PI, IFF_VNET_HDR).
       host_dev_name:
         type: string
         description: Host level path for the guest network interface
@@ -2088,6 +2095,16 @@ definitions:
         type: string
         description:
           The name of the interface to modify
+      host_dev_fd:
+        type: integer
+        description:
+          An open file descriptor, inherited by the Firecracker process, of a queue of
+          the TAP device host_dev_name. The load uses it instead of opening the device,
+          so it attaches nothing to the device, and the device keeps its queue when
+          Firecracker exits for as long as the process that attached it holds its own
+          copy. The descriptor must be attached to host_dev_name with the flags
+          Firecracker opens a TAP device with (IFF_TAP, IFF_NO_PI, IFF_VNET_HDR), or
+          the load fails.
       host_dev_name:
         type: string
         description:

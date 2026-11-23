@@ -41,7 +41,9 @@ use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfigError;
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, NetworkOverride,
+};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
     self, BackingFileSystem, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
@@ -478,6 +480,9 @@ pub fn restore_from_snapshot(
     vm_resources: &mut VmResources,
 ) -> Result<Arc<Mutex<Vmm>>, RestoreFromSnapshotError> {
     let mut microvm_state = snapshot_state_from_file(&params.snapshot_path)?;
+    if let Some(tap_fd) = repeated_inherited_queue(&params.network_overrides) {
+        return Err(SnapshotStateFromFileError::RepeatedNetworkDescriptor(tap_fd).into());
+    }
     match &mut microvm_state.device_states.virtio_state {
         VirtioDevicesState::Mmio(devices) => apply_device_overrides(devices, params)?,
         VirtioDevicesState::Pci(pci) => apply_device_overrides(&mut pci.virtio_devices, params)?,
@@ -583,10 +588,10 @@ fn apply_device_overrides<Tr>(
     params: &LoadSnapshotParams,
 ) -> Result<(), SnapshotStateFromFileError> {
     for entry in &params.network_overrides {
-        device_state_mut(&mut devices.net_devices, &entry.iface_id)
-            .ok_or(SnapshotStateFromFileError::UnknownNetworkDevice)?
-            .tap_if_name
-            .clone_from(&entry.host_dev_name);
+        let state = device_state_mut(&mut devices.net_devices, &entry.iface_id)
+            .ok_or(SnapshotStateFromFileError::UnknownNetworkDevice)?;
+        state.tap_if_name.clone_from(&entry.host_dev_name);
+        state.inherited_tap_fd = entry.host_dev_fd;
     }
     if let Some(entry) = &params.vsock_override {
         devices
@@ -637,6 +642,8 @@ pub enum SnapshotStateFromFileError {
     Load(#[from] crate::snapshot::SnapshotError),
     /// Unknown Network Device.
     UnknownNetworkDevice,
+    /// Two network overrides name descriptor {0} as their inherited TAP queue
+    RepeatedNetworkDescriptor(i32),
     /// Unknown Vsock Device.
     UnknownVsockDevice,
     /// Unknown Block Device.
@@ -645,6 +652,17 @@ pub enum SnapshotStateFromFileError {
     VhostUserDrive,
     /// Unknown Pmem Device.
     UnknownPmemDevice,
+}
+
+/// The first descriptor two of `overrides` name as their inherited TAP queue, if any. One
+/// inherited queue is one device's: two devices on it would read the same queue, and the
+/// second to be dropped would close whatever the number names by then.
+fn repeated_inherited_queue(overrides: &[NetworkOverride]) -> Option<i32> {
+    let mut seen = std::collections::HashSet::new();
+    overrides
+        .iter()
+        .filter_map(|entry| entry.host_dev_fd)
+        .find(|tap_fd| !seen.insert(*tap_fd))
 }
 
 fn snapshot_state_from_file(
@@ -1191,6 +1209,34 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
 
+    /// Two overrides that name one descriptor are refused; overrides by name alone, or on
+    /// queues of their own, are not.
+    #[test]
+    fn test_one_inherited_queue_is_one_overrides() {
+        let entry = |iface: &str, fd| NetworkOverride {
+            iface_id: iface.to_string(),
+            host_dev_name: "tap0".to_string(),
+            host_dev_fd: fd,
+        };
+        assert_eq!(repeated_inherited_queue(&[]), None);
+        assert_eq!(
+            repeated_inherited_queue(&[entry("eth0", None), entry("eth1", None)]),
+            None
+        );
+        assert_eq!(
+            repeated_inherited_queue(&[entry("eth0", Some(7)), entry("eth1", Some(8))]),
+            None
+        );
+        assert_eq!(
+            repeated_inherited_queue(&[
+                entry("eth0", Some(7)),
+                entry("eth1", None),
+                entry("eth2", Some(7))
+            ]),
+            Some(7)
+        );
+    }
+
     /// A write set over 1/4 of guest memory, or a file longer than such a set can be, is refused
     /// before anything is populated; a set within the bound is read.
     #[test]
@@ -1318,6 +1364,7 @@ mod tests {
         let network_interface = NetworkInterfaceConfig {
             iface_id: String::from("netif"),
             host_dev_name: String::from("hostname"),
+            host_dev_fd: None,
             guest_mac: None,
             mtu: None,
             rx_rate_limiter: None,
@@ -1434,6 +1481,7 @@ mod tests {
                 network_overrides: vec![NetworkOverride {
                     iface_id: String::from("netif"),
                     host_dev_name: String::from("tap_override"),
+                    host_dev_fd: Some(7),
                 }],
                 vsock_override: Some(VsockOverride {
                     uds_path: String::from("/vsock_override"),
@@ -1452,6 +1500,7 @@ mod tests {
 
             let net = device_state_mut(&mut devices.net_devices, "netif").unwrap();
             assert_eq!(net.tap_if_name, "tap_override");
+            assert_eq!(net.inherited_tap_fd, Some(7));
             let vsock = &devices.vsock_device.as_ref().unwrap().device_state;
             assert_eq!(vsock.backend.uds_path, "/vsock_override");
             let Some(BlockState::Virtio(block)) =
@@ -1482,6 +1531,7 @@ mod tests {
                 network_overrides: vec![NetworkOverride {
                     iface_id: String::from("root"),
                     host_dev_name: String::from("tap_override"),
+                    host_dev_fd: None,
                 }],
                 ..default_load_snapshot_params()
             };

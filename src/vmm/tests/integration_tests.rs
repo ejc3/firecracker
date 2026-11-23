@@ -584,6 +584,7 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
     let req = VmmAction::InsertNetworkDevice(NetworkInterfaceConfig {
         iface_id: String::new(),
         host_dev_name: String::new(),
+        host_dev_fd: None,
         guest_mac: None,
         mtu: None,
         rx_rate_limiter: None,

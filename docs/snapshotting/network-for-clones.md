@@ -181,6 +181,13 @@ curl --unix-socket /tmp/firecracker.socket -i \
     }'
 ```
 
+An override can also carry `host_dev_fd`, an open descriptor of a queue of
+`host_dev_name` that the Firecracker process inherited. The load then uses that
+queue instead of opening the device. A process that keeps its own copy of the
+descriptor can hand the same device to one microVM after another: no microVM
+attaches to the device or detaches from it, so its carrier never changes. The
+holder is responsible for the frames left in the queue between two microVMs.
+
 This may require reconfiguration of the networking inside the VM so that it is
 still routable externally.
 [network setup documentation](../network-setup.md#in-the-guest) describes what
