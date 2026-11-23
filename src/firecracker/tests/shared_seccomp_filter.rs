@@ -58,13 +58,28 @@ fn the_default_policy_is_installed_once_and_inherited() {
 
     let threads: Vec<u32> = std::fs::read_dir(format!("/proc/{pid}/task"))
         .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_str().unwrap().parse().unwrap())
+        .map(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
         .collect();
-    assert!(threads.len() >= 2, "expected the main and the API thread: {threads:?}");
+    assert!(
+        threads.len() >= 2,
+        "expected the main and the API thread: {threads:?}"
+    );
     for tid in threads {
         // Mode 2 is SECCOMP_MODE_FILTER. No microVM is built yet, so a main thread that
         // waited for one to install its own copy would still read 0 here.
-        assert_eq!(status(pid, tid, "Seccomp"), 2, "thread {tid} runs unfiltered");
+        assert_eq!(
+            status(pid, tid, "Seccomp"),
+            2,
+            "thread {tid} runs unfiltered"
+        );
         assert_eq!(
             status(pid, tid, "Seccomp_filters"),
             1,

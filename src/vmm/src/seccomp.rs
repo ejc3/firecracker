@@ -221,8 +221,14 @@ mod tests {
             Some(&program.to_vec())
         );
         // Categories that differ keep a program each.
-        assert_eq!(shared_filter(&thread_map(&program, &program, &[1, 2])), None);
-        assert_eq!(shared_filter(&thread_map(&[9, 2, 3], &program, &program)), None);
+        assert_eq!(
+            shared_filter(&thread_map(&program, &program, &[1, 2])),
+            None
+        );
+        assert_eq!(
+            shared_filter(&thread_map(&[9, 2, 3], &program, &program)),
+            None
+        );
         // --no-seccomp: nothing to install.
         assert_eq!(shared_filter(&get_empty_filters()), None);
         assert_eq!(shared_filter(&BpfThreadMap::new()), None);
