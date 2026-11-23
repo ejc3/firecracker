@@ -350,6 +350,11 @@ mod tests {
                 {
                     "iface_id": "eth0",
                     "host_dev_name": "vmtap2"
+                },
+                {
+                    "iface_id": "eth1",
+                    "host_dev_name": "vmtap3",
+                    "host_dev_fd": 7
                 }
             ]
         }"#;
@@ -362,10 +367,18 @@ mod tests {
             },
             track_dirty_pages: false,
             resume_vm: true,
-            network_overrides: vec![NetworkOverride {
-                iface_id: String::from("eth0"),
-                host_dev_name: String::from("vmtap2"),
-            }],
+            network_overrides: vec![
+                NetworkOverride {
+                    iface_id: String::from("eth0"),
+                    host_dev_name: String::from("vmtap2"),
+                    host_dev_fd: None,
+                },
+                NetworkOverride {
+                    iface_id: String::from("eth1"),
+                    host_dev_name: String::from("vmtap3"),
+                    host_dev_fd: Some(7),
+                },
+            ],
             drive_overrides: vec![],
             vsock_override: None,
             clock_realtime: false,
