@@ -641,35 +641,66 @@ fn guest_memory_from_file(
     Ok(guest_mem)
 }
 
-/// Reads a write-set file: `<offset> <length>` lines, decimal bytes of the memory file.
-fn read_write_set(path: &Path) -> std::io::Result<Vec<(u64, u64)>> {
-    let text = std::fs::read_to_string(path)?;
-    text.lines()
+/// A write set names at most 1/WRITE_SET_FRACTION of guest memory: every page it names becomes
+/// private to the clone, so a foreign or broken set must not copy all of guest memory into it.
+const WRITE_SET_FRACTION: u64 = 4;
+/// The longest write-set line: two 20-digit numbers, a space and a newline.
+const WRITE_SET_LINE_MAX: u64 = 42;
+
+/// Reads the write-set file at `path` (`<offset> <length>` lines, decimal bytes of the memory
+/// file) for `guest_memory`. A file longer than a set within the bound can be, or a set that
+/// names more than 1/WRITE_SET_FRACTION of guest memory, is refused before anything is
+/// populated.
+fn read_write_set(
+    path: &Path,
+    guest_memory: &[GuestRegionMmap],
+) -> Result<Vec<(u64, u64)>, String> {
+    use vm_memory::GuestMemoryRegion as _;
+    let memory: u64 = guest_memory.iter().map(|region| region.len()).sum();
+    let longest = (memory / 4096 / WRITE_SET_FRACTION + 1) * WRITE_SET_LINE_MAX;
+    let length = std::fs::metadata(path)
+        .map_err(|err| err.to_string())?
+        .len();
+    if length > longest {
+        return Err(format!(
+            "the file is {length} bytes, longer than a set of 1/{WRITE_SET_FRACTION} of guest \
+             memory can be ({longest})"
+        ));
+    }
+    let text = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let ranges = text
+        .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
             let mut words = line.split_whitespace();
-            let mut number = || -> std::io::Result<u64> {
-                words.next().and_then(|w| w.parse().ok()).ok_or_else(|| {
-                    std::io::Error::other(format!("not '<offset> <length>': {line}"))
-                })
+            let mut number = || -> Result<u64, String> {
+                words
+                    .next()
+                    .and_then(|w| w.parse().ok())
+                    .ok_or_else(|| format!("not '<offset> <length>': {line}"))
             };
             Ok((number()?, number()?))
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    let named = crate::vstate::memory::file_ranges_len(guest_memory, &ranges);
+    if named > memory / WRITE_SET_FRACTION {
+        return Err(format!(
+            "it names {named} bytes, more than 1/{WRITE_SET_FRACTION} of guest memory ({memory})"
+        ));
+    }
+    Ok(ranges)
 }
 
 /// Populates the write set at `path` into `guest_memory` before the VM runs. The set is a hint:
-/// a file that cannot be read or a populate the kernel refuses is logged and the restore goes on,
-/// with the guest taking those pages' copy-on-write faults itself.
+/// a file that cannot be read, one over the bound, or a populate the kernel refuses is logged
+/// and the restore goes on, with the guest taking those pages' copy-on-write faults itself.
 fn populate_write_set(guest_memory: &[GuestRegionMmap], path: &Path) {
     let started = std::time::Instant::now();
-    let outcome = read_write_set(path)
-        .map_err(|err| err.to_string())
-        .and_then(|ranges| {
-            crate::vstate::memory::populate_write_file_ranges(guest_memory, &ranges)
-                .map(|bytes| (ranges.len(), bytes))
-                .map_err(|err| err.to_string())
-        });
+    let outcome = read_write_set(path, guest_memory).and_then(|ranges| {
+        crate::vstate::memory::populate_write_file_ranges(guest_memory, &ranges)
+            .map(|bytes| (ranges.len(), bytes))
+            .map_err(|err| err.to_string())
+    });
     match outcome {
         Ok((ranges, bytes)) => info!(
             "populated the write set: {ranges} ranges, {} KiB, in {} us",
@@ -1117,6 +1148,37 @@ fn send_uffd_handshake(
 mod tests {
     use std::cell::RefCell;
     use std::os::unix::net::UnixListener;
+
+    /// A write set over 1/4 of guest memory, or a file longer than such a set can be, is refused
+    /// before anything is populated; a set within the bound is read.
+    #[test]
+    fn a_write_set_over_the_bound_is_refused() {
+        use vmm_sys_util::tempfile::TempFile;
+        let page = 0x1000usize;
+        let page_bytes = 0x1000u64;
+        let mut memory = TempFile::new().unwrap().into_file();
+        std::io::Write::write_all(&mut memory, &vec![0u8; 16 * page]).unwrap();
+        let regions = crate::vstate::memory::snapshot_file(
+            memory,
+            vec![(vm_memory::GuestAddress(0), 16 * page)].into_iter(),
+            false,
+            crate::vmm_config::machine_config::HugePageConfig::None,
+            false,
+        )
+        .unwrap();
+        let set = TempFile::new().unwrap();
+        std::fs::write(set.as_path(), format!("0 {}\n", 4 * page_bytes)).unwrap();
+        assert_eq!(
+            read_write_set(set.as_path(), &regions).unwrap(),
+            vec![(0, 4 * page_bytes)]
+        );
+        std::fs::write(set.as_path(), format!("0 {}\n", 5 * page_bytes)).unwrap();
+        let refused = read_write_set(set.as_path(), &regions).unwrap_err();
+        assert!(refused.contains("more than 1/4"), "{refused}");
+        std::fs::write(set.as_path(), format!("{}\n", "0 4096 ".repeat(100))).unwrap();
+        let refused = read_write_set(set.as_path(), &regions).unwrap_err();
+        assert!(refused.contains("longer than"), "{refused}");
+    }
 
     use vm_memory::{Bytes, GuestAddress, MemoryRegionAddress};
     use vmm_sys_util::tempfile::TempFile;

@@ -145,6 +145,25 @@ fn populate_read<B: BitmapSlice>(slice: &VolatileSlice<'_, B>) -> Result<bool, M
     Err(MemoryError::WriteMemory(GuestMemoryError::IOError(err)))
 }
 
+/// The bytes of guest memory in `regions` that the file byte ranges `ranges` map, each range
+/// clamped to the regions.
+pub fn file_ranges_len(regions: &[GuestRegionMmap], ranges: &[(u64, u64)]) -> u64 {
+    let mut total = 0u64;
+    for region in regions {
+        let Some(file_offset) = region.file_offset() else {
+            continue;
+        };
+        let start = file_offset.start();
+        let end = start + region.len();
+        for &(offset, length) in ranges {
+            let from = offset.max(start);
+            let to = offset.saturating_add(length).min(end);
+            total += to.saturating_sub(from);
+        }
+    }
+    total
+}
+
 /// Populates writable, with MADV_POPULATE_WRITE, the guest memory that maps the byte ranges
 /// `ranges` (offset, length) of the file backing `regions`: on a private file mapping each page
 /// is copied from the page cache into this process now, rather than on the guest's first write

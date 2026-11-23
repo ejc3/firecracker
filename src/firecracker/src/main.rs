@@ -51,17 +51,18 @@ use crate::seccomp::SeccompConfig;
 const DEFAULT_API_SOCK_PATH: &str = "/run/firecracker.socket";
 // The `fcvm.drive-overrides` build metadata says this build's snapshot load takes
 // `drive_overrides`, which upstream releases of the same version reject, and
-// `numa-window` that it takes `--numa-balancing-after-secs`. fcvm reads both from
-// `--version` before it uses them.
+// `numa-window` that it takes `--numa-balancing-after-secs`, and `write-set` that a File
+// backend load takes `mem_backend.write_set_path`. fcvm reads them from `--version` before it
+// uses them.
 const FIRECRACKER_VERSION: &str = if cfg!(feature = "fuzzing") {
     concat!(
         env!("CARGO_PKG_VERSION"),
-        "+fcvm.drive-overrides.numa-window.fuzzing"
+        "+fcvm.drive-overrides.numa-window.write-set.fuzzing"
     )
 } else {
     concat!(
         env!("CARGO_PKG_VERSION"),
-        "+fcvm.drive-overrides.numa-window"
+        "+fcvm.drive-overrides.numa-window.write-set"
     )
 };
 const MMDS_CONTENT_ARG: &str = "metadata";
