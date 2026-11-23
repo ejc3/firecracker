@@ -37,8 +37,8 @@ use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorGroup};
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{
-    GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemoryState, GuestRegionMmap,
-    GuestRegionMmapExt, MemoryError, ZeroPages,
+    DIFF_BRIDGE_PAGES, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemoryState,
+    GuestRegionMmap, GuestRegionMmapExt, MemoryError, ZeroPages,
 };
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
@@ -647,7 +647,20 @@ impl KvmVm {
         match snapshot_type {
             SnapshotType::Diff => {
                 let dirty_bitmap = self.get_dirty_bitmap()?;
-                self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
+                // Over a file that holds the guest's memory as of the last snapshot, short clean
+                // gaps are written with the runs around them; a file that held no data gets only
+                // the marked pages, so it keeps its holes.
+                let bridge_pages = if starts_empty { 0 } else { DIFF_BRIDGE_PAGES };
+                // Memory registered with userfaultfd answers a read of an untouched page with the
+                // snapshot's page, so such pages are bridged too. Elsewhere reading one could map
+                // the shared zero page, so only pages with a page table entry are.
+                let read_untouched = self.common.uffd.is_some();
+                self.guest_memory().dump_dirty(
+                    &mut file,
+                    &dirty_bitmap,
+                    bridge_pages,
+                    read_untouched,
+                )?;
             }
             SnapshotType::Full => {
                 // A file that held no data reads as one hole after the set_len above, so the dump
