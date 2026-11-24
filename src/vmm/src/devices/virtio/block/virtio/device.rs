@@ -79,8 +79,8 @@ impl DiskProperties {
 
     /// Turn off the host's readahead for a drive's backing file. The guest kernel reads
     /// ahead in its own page cache, so host readahead only reads past what the guest asked
-    /// for: on btrfs, whose files read ahead up to 4 MiB, a restored clone's drive read 37 to
-    /// 39 GiB per 1000 clones with it and 9.3 GiB without. A file whose filesystem refuses
+    /// for, and on btrfs, whose files read ahead up to 4 MiB, each clone's drive reads well
+    /// past what its guest asked for. A file whose filesystem refuses
     /// the advice is used as it is.
     fn without_readahead(file: &File) {
         // SAFETY: `file` is an open descriptor; posix_fadvise reads nothing through pointers.
