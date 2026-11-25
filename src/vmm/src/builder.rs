@@ -18,6 +18,8 @@ use vm_memory::GuestAddress;
 
 #[cfg(target_arch = "aarch64")]
 use crate::Vcpu;
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86_64::vm::RestoreKvmStateError;
 use crate::arch::{ConfigurationError, configure_system_for_boot, load_kernel};
 #[cfg(target_arch = "aarch64")]
 use crate::construct_kvm_mpidrs;
@@ -443,6 +445,8 @@ pub fn build_microvm_from_snapshot(
     // Build custom CPU config if a custom template is provided.
     let mut vm = KvmVm::new(kvm).map_err(StartMicrovmError::KvmVm)?;
 
+    // Only aarch64's vCPU restore takes the vCPU mutably.
+    #[cfg_attr(target_arch = "x86_64", allow(unused_mut))]
     let mut vcpus = vm
         .create_vcpus(vm_resources.machine_config.vcpu_count)
         .map_err(StartMicrovmError::KvmVm)?;
@@ -464,16 +468,16 @@ pub fn build_microvm_from_snapshot(
         }
     }
 
-    // Restore vcpus kvm state.
-    for (vcpu, state) in vcpus.iter_mut().zip(microvm_state.vcpu_states.iter()) {
-        vcpu.kvm_vcpu
-            .restore_state(state)
-            .map_err(VcpuError::VcpuResponse)
-            .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)?;
-    }
-
     #[cfg(target_arch = "aarch64")]
     {
+        // Restore vcpus kvm state.
+        for (vcpu, state) in vcpus.iter_mut().zip(microvm_state.vcpu_states.iter()) {
+            vcpu.kvm_vcpu
+                .restore_state(state)
+                .map_err(VcpuError::VcpuResponse)
+                .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)?;
+        }
+
         if clock_realtime {
             return Err(BuildMicrovmFromSnapshotError::UnsupportedClockRealtime);
         }
@@ -482,9 +486,21 @@ pub fn build_microvm_from_snapshot(
         vm.restore_state(&mpidrs, &microvm_state.vm_state)?;
     }
 
-    // Restore kvm vm state.
+    // Restore the vCPUs' and then the VM's KVM state. The call ends with a paravirtual kick
+    // for every runnable vCPU, which has to follow every vCPU's KVM_SET_MP_STATE.
     #[cfg(target_arch = "x86_64")]
-    vm.restore_state(&microvm_state.vm_state, clock_realtime)?;
+    vm.restore_kvm_state(
+        vcpus.iter().map(|vcpu| &vcpu.kvm_vcpu),
+        &microvm_state.vcpu_states,
+        &microvm_state.vm_state,
+        clock_realtime,
+    )
+    .map_err(|err| match err {
+        RestoreKvmStateError::Vcpu(err) => {
+            BuildMicrovmFromSnapshotError::RestoreVcpus(VcpuError::VcpuResponse(err))
+        }
+        RestoreKvmStateError::Vm(err) => BuildMicrovmFromSnapshotError::RestoreState(err),
+    })?;
 
     // Restore the boot source config paths.
     vm_resources.boot_source.config = microvm_state.vm_info.boot_source;
