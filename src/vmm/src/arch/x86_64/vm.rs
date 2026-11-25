@@ -83,6 +83,10 @@ const MSI_DATA_DELIVERY_REMOTE_READ: u32 = 0b011 << 8;
 const APIC_ID_REGISTER: usize = 0x20;
 /// The id that addresses every local APIC, not one.
 const XAPIC_BROADCAST_ID: u8 = 0xff;
+/// CPUID leaf of KVM's paravirtual features (`KVM_CPUID_FEATURES`).
+const KVM_CPUID_FEATURES_LEAF: u32 = 0x4000_0001;
+/// The bit of that leaf's EAX that offers the guest the kick (`KVM_FEATURE_PV_UNHALT`).
+const KVM_FEATURE_PV_UNHALT_BIT: u32 = 7;
 
 /// The id of a saved local APIC. `KVM_GET_LAPIC` returns it in the xAPIC layout, bits 31:24
 /// of the id register, in x2APIC mode too, because this VMM does not enable
@@ -92,16 +96,25 @@ fn saved_apic_id(lapic: &kvm_lapic_state) -> u8 {
     lapic.regs[APIC_ID_REGISTER + 3].to_ne_bytes()[0]
 }
 
-/// The MSI that records a paravirtual kick for the vCPU a snapshot holds `state` of, or
+/// The APIC id to send a paravirtual kick to for the vCPU a snapshot holds `state` of, or
 /// `None` when that vCPU gets none.
 ///
-/// Only a runnable vCPU gets one. A halted vCPU with a kick pending is saved as runnable
-/// (`KVM_GET_MP_STATE` folds the kick in), so a vCPU saved as halted has none to lose. A
-/// vCPU that waits for INIT or SIPI must get none: with a kick recorded KVM takes it for
-/// runnable, and its `KVM_RUN` returns at once (uninitialized) or spins in the kernel
-/// (INIT received) where it would block.
-fn pv_kick_msi(state: &VcpuState) -> Option<kvm_msi> {
+/// Only a runnable vCPU of a guest that was offered the kick gets one. A guest that was not
+/// offered `KVM_FEATURE_PV_UNHALT` has no paravirtual spinlocks and so no kick to lose. A
+/// halted vCPU with a kick pending is saved as runnable (`KVM_GET_MP_STATE` folds the kick
+/// in), so a vCPU saved as halted has none to lose either. A vCPU that waits for INIT or
+/// SIPI must get none: with a kick recorded KVM takes it for runnable, and its `KVM_RUN`
+/// returns at once (uninitialized) or spins in the kernel (INIT received) where it would
+/// block.
+fn pv_kick_target(state: &VcpuState) -> Option<u8> {
     if state.mp_state.mp_state != KVM_MP_STATE_RUNNABLE {
+        return None;
+    }
+    let offered = state.cpuid.as_slice().iter().any(|entry| {
+        entry.function == KVM_CPUID_FEATURES_LEAF
+            && entry.eax & (1 << KVM_FEATURE_PV_UNHALT_BIT) != 0
+    });
+    if !offered {
         return None;
     }
     let apic_id = saved_apic_id(&state.lapic);
@@ -111,12 +124,17 @@ fn pv_kick_msi(state: &VcpuState) -> Option<kvm_msi> {
         warn!("A restored vCPU has the broadcast APIC id; it gets no paravirtual kick");
         return None;
     }
-    Some(kvm_msi {
+    Some(apic_id)
+}
+
+/// The MSI that records a paravirtual kick for the vCPU whose local APIC has `apic_id`.
+fn pv_kick_msi(apic_id: u8) -> kvm_msi {
+    kvm_msi {
         address_lo: MSI_ADDRESS_BASE | (u32::from(apic_id) << MSI_ADDRESS_DEST_ID_SHIFT),
         address_hi: 0,
         data: MSI_DATA_DELIVERY_REMOTE_READ,
         ..Default::default()
-    })
+    }
 }
 
 /// Structure representing the current architecture's understand of what a "virtual machine" is.
@@ -250,8 +268,8 @@ impl KvmVm {
         Ok(())
     }
 
-    /// Records a paravirtual kick in KVM for every vCPU that `states` holds as runnable, and
-    /// returns how many it kicked.
+    /// Records a paravirtual kick in KVM for every vCPU that `states` holds as runnable, in a
+    /// guest that was offered the kick, and returns how many it kicked.
     ///
     /// A guest with paravirtual spinlocks waits for a lock by checking the lock word and
     /// then executing HLT (`kvm_wait()`), with interrupts off when it took the lock in
@@ -267,24 +285,35 @@ impl KvmVm {
     ///
     /// The kick is delivered as KVM delivers a guest's: an interrupt with the "remote read"
     /// delivery mode, sent here with `KVM_SIGNAL_MSI`, which needs the in-kernel irqchip.
-    /// It stays recorded until the vCPU's next HLT, so a VM that is loaded paused and
-    /// resumed later needs no second one.
+    /// Nothing this VMM does between a load and the guest's next instruction clears it, so a
+    /// VM that is loaded paused and resumed later needs no second one.
+    ///
+    /// The host kernel can clear it. From Linux 6.15 on, `kvm_arch_async_page_present()`
+    /// drops a pending kick, and a restored vCPU runs that function on its first `KVM_RUN`:
+    /// restoring `MSR_KVM_ASYNC_PF_EN` queues a wake-up of every waiter in the guest, and a
+    /// guest page that has to be read in completes through it too. On such a host the kick
+    /// reaches the HLT only with that function fixed to keep it (ejc3/fcvm#2130; not
+    /// upstream as of 7.3.3).
     pub fn kick_runnable_vcpus(&self, states: &[VcpuState]) -> Result<usize, KvmVmError> {
         let mut kicked = 0;
-        for msi in states.iter().filter_map(pv_kick_msi) {
-            // The id is the 8 bits `pv_kick_msi` put there.
-            let apic_id = (msi.address_lo >> MSI_ADDRESS_DEST_ID_SHIFT).to_le_bytes()[0];
-            match self.fd().signal_msi(msi) {
-                Ok(0) => warn!(
-                    "No local APIC with id {apic_id} took a paravirtual kick after the restore of \
-                     its vCPU"
-                ),
-                Ok(_) => kicked += 1,
+        for apic_id in states.iter().filter_map(pv_kick_target) {
+            let delivered = match self.fd().signal_msi(pv_kick_msi(apic_id)) {
+                Ok(delivered) => delivered > 0,
+                // KVM's answer when it looks the destination up without its map of the local
+                // APICs and finds none.
+                Err(err) if err.errno() == libc::EPERM => false,
                 Err(err) => return Err(KvmVmError::KickRestoredVcpu(apic_id, err)),
+            };
+            if delivered {
+                kicked += 1;
+            } else {
+                // No enabled local APIC has the id. Its guest cannot kick such a vCPU
+                // either, so it had no kick to lose.
+                warn!("No local APIC with id {apic_id} took a paravirtual kick");
             }
         }
         info!(
-            "Restored the KVM state of {} vCPUs and gave {kicked} runnable ones a paravirtual kick",
+            "Gave {kicked} of {} restored vCPUs a paravirtual kick",
             states.len()
         );
         Ok(kicked)
@@ -395,15 +424,17 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use kvm_bindings::{
-        KVM_CLOCK_REALTIME, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
-        KVM_MP_STATE_HALTED, KVM_MP_STATE_INIT_RECEIVED, KVM_MP_STATE_RUNNABLE,
-        KVM_MP_STATE_SIPI_RECEIVED, KVM_MP_STATE_UNINITIALIZED, KVM_PIT_SPEAKER_DUMMY,
-        kvm_mp_state,
+        CpuId, KVM_CLOCK_REALTIME, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER,
+        KVM_IRQCHIP_PIC_SLAVE, KVM_MP_STATE_HALTED, KVM_MP_STATE_INIT_RECEIVED,
+        KVM_MP_STATE_RUNNABLE, KVM_MP_STATE_SIPI_RECEIVED, KVM_MP_STATE_UNINITIALIZED,
+        KVM_PIT_SPEAKER_DUMMY, Msrs, kvm_cpuid_entry2, kvm_mp_state, kvm_msr_entry,
     };
     use kvm_ioctls::{Cap, VcpuExit};
     use vm_memory::GuestAddress;
 
-    use super::{KvmVm, pv_kick_msi};
+    use super::{
+        KVM_CPUID_FEATURES_LEAF, KVM_FEATURE_PV_UNHALT_BIT, KvmVm, pv_kick_msi, pv_kick_target,
+    };
     use crate::arch::x86_64::vcpu::{KvmVcpu, VcpuState};
     use crate::arch::{BootProtocol, EntryPoint, KvmVmError};
     use crate::cpu_config::x86_64::cpuid::Cpuid;
@@ -546,8 +577,8 @@ mod tests {
     const GUEST_MEM_SIZE: usize = 0x20000;
     const RFLAGS_IF: u64 = 1 << 9;
 
-    // How long a vCPU that should run past its HLT gets to do it. It takes microseconds;
-    // the whole of it is spent only when the test fails.
+    // How long a vCPU that should run past its HLT gets to do it. The whole of it is spent
+    // only when the test fails.
     const RUN_WAIT: Duration = Duration::from_secs(10);
     // How long a vCPU that should stay blocked is watched.
     const BLOCK_WAIT: Duration = Duration::from_millis(500);
@@ -588,12 +619,56 @@ mod tests {
         (vm, vcpus)
     }
 
+    // What a Linux guest sets up for async page faults (`kvm_guest_cpu_init()`).
+    const MSR_KVM_ASYNC_PF_EN: u32 = 0x4b56_4d02;
+    const MSR_KVM_ASYNC_PF_INT: u32 = 0x4b56_4d06;
+    const KVM_ASYNC_PF_ENABLED: u64 = 1 << 0;
+    const KVM_ASYNC_PF_DELIVERY_AS_INT: u64 = 1 << 3;
+    // Guest address of the 64 bytes KVM writes page-ready tokens to.
+    const ASYNC_PF_DATA_ADDR: u64 = 0x18000;
+    const ASYNC_PF_VECTOR: u64 = 0xf3;
+
+    // Sets a vCPU up for async page faults as Linux does: the local APIC enabled in software,
+    // the page-ready vector, and MSR_KVM_ASYNC_PF_EN with its data area.
+    fn enable_async_pf(vcpu: &KvmVcpu) {
+        let mut lapic = vcpu.fd.get_lapic().unwrap();
+        // Bit 8 of the spurious interrupt vector register, at 0xf0.
+        lapic.regs[0xf1] |= 1;
+        vcpu.fd.set_lapic(&lapic).unwrap();
+        let msrs = Msrs::from_entries(&[
+            kvm_msr_entry {
+                index: MSR_KVM_ASYNC_PF_INT,
+                data: ASYNC_PF_VECTOR,
+                ..Default::default()
+            },
+            kvm_msr_entry {
+                index: MSR_KVM_ASYNC_PF_EN,
+                data: ASYNC_PF_DATA_ADDR | KVM_ASYNC_PF_ENABLED | KVM_ASYNC_PF_DELIVERY_AS_INT,
+                ..Default::default()
+            },
+        ])
+        .unwrap();
+        assert_eq!(vcpu.fd.set_msrs(&msrs).unwrap(), 2);
+    }
+
+    fn async_pf_is_enabled(state: &VcpuState) -> bool {
+        state
+            .saved_msrs
+            .iter()
+            .flat_map(|msrs| msrs.as_slice())
+            .any(|msr| msr.index == MSR_KVM_ASYNC_PF_EN && msr.data & KVM_ASYNC_PF_ENABLED != 0)
+    }
+
     // `guest`, with its first vCPU run up to its first HLT: runnable, interrupts off, the
     // HLT its next instruction. That is a vCPU in `kvm_wait()` between the check of the
-    // lock word and the HLT.
-    fn guest_stopped_before_hlt(vcpu_count: u8) -> (KvmVm, Vec<KvmVcpu>) {
+    // lock word and the HLT. With `async_pf` the vCPU has async page faults on, as a Linux
+    // guest's has.
+    fn guest_stopped_before_hlt(vcpu_count: u8, async_pf: bool) -> (KvmVm, Vec<KvmVcpu>) {
         let (vm, mut vcpus) = guest(vcpu_count);
         let vcpu = &mut vcpus[0];
+        if async_pf {
+            enable_async_pf(vcpu);
+        }
         match vcpu.fd.run() {
             Ok(VcpuExit::IoOut(port, data)) => {
                 assert_eq!((port, data), (u16::from(GUEST_PORT), &[BEFORE_HLT][..]));
@@ -608,6 +683,13 @@ mod tests {
         let regs = vcpu.fd.get_regs().unwrap();
         assert_eq!(regs.rip, GUEST_CODE_ADDR + GUEST_HLT_OFFSET);
         assert_eq!(regs.rflags & RFLAGS_IF, 0);
+        if async_pf {
+            // Enabling async page faults made KVM report one page-ready event to this vCPU.
+            // A guest's handler takes the token and clears the slot. This guest has none.
+            vm.guest_memory()
+                .write_slice(&[0u8; 64], GuestAddress(ASYNC_PF_DATA_ADDR))
+                .unwrap();
+        }
         (vm, vcpus)
     }
 
@@ -718,13 +800,11 @@ mod tests {
         }
     }
 
-    // A vCPU stopped just before a HLT with interrupts off, with a paravirtual kick pending,
-    // is saved and restored into a new VM. The saved state does not hold the kick, so
-    // without the one the restore gives, the restored vCPU halts for ever
-    // (test_a_restored_vcpu_blocks_in_its_hlt_without_a_kick).
-    #[test]
-    fn test_restore_kicks_a_vcpu_stopped_before_its_hlt() {
-        let (vm, mut vcpus) = guest_stopped_before_hlt(1);
+    // Saves a vCPU stopped just before a HLT with interrupts off, with a paravirtual kick
+    // pending, restores it into a new VM with `restore_kvm_state`, and runs the restored
+    // vCPU and then the source. Returns how each run ended.
+    fn restore_a_vcpu_stopped_before_its_hlt(async_pf: bool) -> (Ran, Ran) {
+        let (vm, mut vcpus) = guest_stopped_before_hlt(1, async_pf);
 
         // The kick of a lock holder's KVM_HC_KICK_CPU, delivered the same way.
         let kicked = vm.kick_runnable_vcpus(&[vcpus[0].save_state().unwrap()]);
@@ -733,23 +813,55 @@ mod tests {
         // KVM reports a runnable vCPU and nothing of the kick.
         let vcpu_states = [vcpus[0].save_state().unwrap()];
         assert_eq!(vcpu_states[0].mp_state.mp_state, KVM_MP_STATE_RUNNABLE);
+        assert_eq!(async_pf_is_enabled(&vcpu_states[0]), async_pf);
         let vm_state = vm.save_state().unwrap();
 
         let (mut restored_vm, mut restored_vcpus) = guest_to_restore(&vm, &vcpu_states);
         restored_vm
             .restore_kvm_state(&restored_vcpus, &vcpu_states, &vm_state, false)
             .unwrap();
-        let (_, ran) = run_bounded(restored_vcpus.remove(0), RUN_WAIT);
+        let (_, restored) = run_bounded(restored_vcpus.remove(0), RUN_WAIT);
+        let (_, source) = run_bounded(vcpus.remove(0), RUN_WAIT);
+        (restored, source)
+    }
+
+    // The saved state does not hold the kick, so without the one the restore gives, the
+    // restored vCPU halts for ever (test_a_restored_vcpu_blocks_in_its_hlt_without_a_kick).
+    #[test]
+    fn test_restore_kicks_a_vcpu_stopped_before_its_hlt() {
+        let (restored, source) = restore_a_vcpu_stopped_before_its_hlt(false);
         assert_eq!(
-            ran,
+            restored,
             Ran::PastHlt,
             "the restored vCPU did not run past its HLT"
         );
-
-        // Saving changed nothing in the source: it still has its kick.
-        let (_, ran) = run_bounded(vcpus.remove(0), RUN_WAIT);
+        // Saving changed nothing in the source: it still had its kick.
         assert_eq!(
-            ran,
+            source,
+            Ran::PastHlt,
+            "the source vCPU did not run past its HLT"
+        );
+    }
+
+    // The same restore of a vCPU with async page faults on, as every vCPU of a Linux guest
+    // has. Restoring MSR_KVM_ASYNC_PF_EN queues a wake-up of every waiter in the guest, and
+    // the vCPU's first KVM_RUN completes it through kvm_arch_async_page_present() before it
+    // runs an instruction. From Linux 6.15 on that function clears a pending kick unless the
+    // host carries the fix of ejc3/fcvm#2130. On a host without it this test fails, and so
+    // does the restore of any such guest caught before its HLT.
+    #[test]
+    fn test_the_restore_kick_survives_the_page_ready_wakeup_of_the_restore() {
+        let (restored, source) = restore_a_vcpu_stopped_before_its_hlt(true);
+        assert_eq!(
+            restored,
+            Ran::PastHlt,
+            "the restored vCPU did not run past its HLT. If \
+             test_restore_kicks_a_vcpu_stopped_before_its_hlt passes, the host kernel cleared the \
+             kick when it completed the page-ready wake-up the restore queued (Linux 6.15 and \
+             later without the fix of ejc3/fcvm#2130)"
+        );
+        assert_eq!(
+            source,
             Ran::PastHlt,
             "the source vCPU did not run past its HLT"
         );
@@ -759,7 +871,7 @@ mod tests {
     // HLT, and the kick is what it waits for.
     #[test]
     fn test_a_restored_vcpu_blocks_in_its_hlt_without_a_kick() {
-        let (vm, vcpus) = guest_stopped_before_hlt(1);
+        let (vm, vcpus) = guest_stopped_before_hlt(1, false);
         assert_eq!(
             vm.kick_runnable_vcpus(&[vcpus[0].save_state().unwrap()]),
             Ok(1)
@@ -781,7 +893,7 @@ mod tests {
         // A kick wakes it.
         restored_vm
             .fd()
-            .signal_msi(pv_kick_msi(&vcpu_states[0]).unwrap())
+            .signal_msi(pv_kick_msi(pv_kick_target(&vcpu_states[0]).unwrap()))
             .unwrap();
         let (_, ran) = run_bounded(vcpu, RUN_WAIT);
         assert_eq!(ran, Ran::PastHlt);
@@ -793,7 +905,7 @@ mod tests {
     #[test]
     fn test_restore_gives_no_kick_to_a_vcpu_that_waits_for_init_or_sipi() {
         for waiting in [KVM_MP_STATE_UNINITIALIZED, KVM_MP_STATE_INIT_RECEIVED] {
-            let (vm, vcpus) = guest_stopped_before_hlt(2);
+            let (vm, vcpus) = guest_stopped_before_hlt(2, false);
             vcpus[1]
                 .fd
                 .set_mp_state(kvm_mp_state { mp_state: waiting })
@@ -817,23 +929,54 @@ mod tests {
         }
     }
 
+    // A runnable vCPU whose local APIC is off cannot be kicked, by its guest or by a
+    // restore. The restore goes on without the kick.
     #[test]
-    fn test_pv_kick_msi_is_for_runnable_vcpus_only() {
-        let state_of = |mp_state, apic_id: u8| {
+    fn test_restore_of_a_vcpu_with_its_local_apic_off_gets_no_kick() {
+        let (vm, vcpus) = guest_stopped_before_hlt(1, false);
+        let mut sregs = vcpus[0].fd.get_sregs().unwrap();
+        // The enable bit of IA32_APIC_BASE.
+        sregs.apic_base &= !(1 << 11);
+        vcpus[0].fd.set_sregs(&sregs).unwrap();
+        let vcpu_states = [vcpus[0].save_state().unwrap()];
+        assert_eq!(vcpu_states[0].mp_state.mp_state, KVM_MP_STATE_RUNNABLE);
+        let vm_state = vm.save_state().unwrap();
+
+        let (mut restored_vm, restored_vcpus) = guest_to_restore(&vm, &vcpu_states);
+        restored_vm
+            .restore_kvm_state(&restored_vcpus, &vcpu_states, &vm_state, false)
+            .unwrap();
+        assert_eq!(restored_vm.kick_runnable_vcpus(&vcpu_states), Ok(0));
+    }
+
+    #[test]
+    fn test_pv_kick_target_is_a_runnable_vcpu_that_was_offered_the_kick() {
+        let state_of = |mp_state, apic_id: u8, kvm_features: u32| {
             let mut state = VcpuState::default();
             state.mp_state.mp_state = mp_state;
             state.lapic.regs[0x23] = i8::from_ne_bytes([apic_id]);
+            state.cpuid = CpuId::from_entries(&[kvm_cpuid_entry2 {
+                function: KVM_CPUID_FEATURES_LEAF,
+                eax: kvm_features,
+                ..Default::default()
+            }])
+            .unwrap();
             state
         };
+        let pv_unhalt = 1 << KVM_FEATURE_PV_UNHALT_BIT;
 
-        // Remote read delivery to the physical destination 5, vector unused.
-        let msi = pv_kick_msi(&state_of(KVM_MP_STATE_RUNNABLE, 5)).unwrap();
-        assert_eq!(msi.address_lo, 0xfee0_5000);
-        assert_eq!(msi.address_hi, 0);
-        assert_eq!(msi.data, 0x300);
-        assert_eq!(msi.flags, 0);
-        let msi = pv_kick_msi(&state_of(KVM_MP_STATE_RUNNABLE, 254)).unwrap();
-        assert_eq!(msi.address_lo, 0xfeef_e000);
+        assert_eq!(
+            pv_kick_target(&state_of(KVM_MP_STATE_RUNNABLE, 5, pv_unhalt)),
+            Some(5)
+        );
+        assert_eq!(
+            pv_kick_target(&state_of(
+                KVM_MP_STATE_RUNNABLE,
+                254,
+                pv_unhalt | 0x0000_000b
+            )),
+            Some(254)
+        );
 
         for mp_state in [
             KVM_MP_STATE_UNINITIALIZED,
@@ -841,9 +984,28 @@ mod tests {
             KVM_MP_STATE_SIPI_RECEIVED,
             KVM_MP_STATE_HALTED,
         ] {
-            assert!(pv_kick_msi(&state_of(mp_state, 5)).is_none(), "{mp_state}");
+            assert_eq!(pv_kick_target(&state_of(mp_state, 5, pv_unhalt)), None);
         }
+        // The guest was offered other features and not the kick.
+        assert_eq!(
+            pv_kick_target(&state_of(KVM_MP_STATE_RUNNABLE, 5, 0x0000_000b)),
+            None
+        );
         // 0xff addresses every local APIC.
-        assert!(pv_kick_msi(&state_of(KVM_MP_STATE_RUNNABLE, 0xff)).is_none());
+        assert_eq!(
+            pv_kick_target(&state_of(KVM_MP_STATE_RUNNABLE, 0xff, pv_unhalt)),
+            None
+        );
+    }
+
+    // Remote read delivery to one physical destination, the vector unused.
+    #[test]
+    fn test_pv_kick_msi_addresses_one_local_apic() {
+        let msi = pv_kick_msi(5);
+        assert_eq!(msi.address_lo, 0xfee0_5000);
+        assert_eq!(msi.address_hi, 0);
+        assert_eq!(msi.data, 0x300);
+        assert_eq!(msi.flags, 0);
+        assert_eq!(pv_kick_msi(254).address_lo, 0xfeef_e000);
     }
 }
