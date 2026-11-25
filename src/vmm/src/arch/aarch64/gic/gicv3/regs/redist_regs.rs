@@ -62,6 +62,10 @@ impl VgicRegEngine for RedistRegEngine {
     fn mpidr_mask() -> u64 {
         KVM_DEV_ARM_VGIC_V3_MPIDR_MASK as u64
     }
+
+    fn clears_on_write(reg: &Self::Reg) -> bool {
+        [GICR_ICENABLER0, GICR_ICACTIVER0].contains(reg)
+    }
 }
 
 fn redist_regs() -> Box<dyn Iterator<Item = &'static SimpleReg>> {
@@ -91,6 +95,7 @@ mod tests {
     use kvm_ioctls::Kvm;
 
     use super::*;
+    use crate::arch::aarch64::gic::regs::MmioReg;
     use crate::arch::aarch64::gic::{GICVersion, create_gic};
 
     #[test]
@@ -123,5 +128,57 @@ mod tests {
 
         // dropping gic_fd would double close the gic fd, so leak it
         std::mem::forget(gic_fd);
+    }
+
+    #[test]
+    fn test_clears_on_write() {
+        let clear: Vec<&SimpleReg> = redist_regs()
+            .filter(|reg| RedistRegEngine::clears_on_write(reg))
+            .collect();
+        assert!(clear == [&GICR_ICENABLER0, &GICR_ICACTIVER0]);
+    }
+
+    fn enabled(fd: &DeviceFd, mpidr: u64) -> u32 {
+        RedistRegEngine::get_reg_data(fd, &GICR_ISENABLER0, mpidr)
+            .unwrap()
+            .chunks[0]
+    }
+
+    fn write(fd: &DeviceFd, reg: &SimpleReg, mpidr: u64, val: u32) {
+        let mut val = val;
+        fd.set_device_attr(&RedistRegEngine::kvm_device_attr(
+            reg.range().start,
+            &mut val,
+            mpidr,
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn test_restore_clears_what_the_saved_state_has_clear() {
+        let kvm = Kvm::new().unwrap();
+        let vm = kvm.create_vm().unwrap();
+        let _ = vm.create_vcpu(0).unwrap();
+        let gic_fd = create_gic(&vm, 1, Some(GICVersion::GICV3)).expect("Cannot create gic");
+        let fd = gic_fd.device_fd();
+        let mpidr = 0;
+
+        // KVM starts a vCPU with its SGIs enabled. A guest that disabled some of them and
+        // enabled a PPI is saved.
+        let at_start = enabled(fd, mpidr);
+        assert_eq!(at_start & 0xffff, 0xffff);
+        write(fd, &GICR_ICENABLER0, mpidr, 0xff00);
+        write(fd, &GICR_ISENABLER0, mpidr, 1 << 27);
+        let wanted = (at_start & !0xff00) | 1 << 27;
+        assert_eq!(enabled(fd, mpidr), wanted);
+        let state = get_redist_regs(fd, mpidr).unwrap();
+
+        // A VM that is about to be restored has what KVM starts it with.
+        write(fd, &GICR_ICENABLER0, mpidr, u32::MAX);
+        write(fd, &GICR_ISENABLER0, mpidr, at_start);
+        assert_eq!(enabled(fd, mpidr), at_start);
+
+        set_redist_regs(fd, mpidr, &state).unwrap();
+        assert_eq!(enabled(fd, mpidr), wanted);
     }
 }

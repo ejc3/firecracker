@@ -114,6 +114,12 @@ impl VgicRegEngine for DistRegEngine {
     fn mpidr_mask() -> u64 {
         0
     }
+
+    fn clears_on_write(reg: &Self::Reg) -> bool {
+        [GICD_ICENABLER, GICD_ICACTIVER]
+            .iter()
+            .any(|clear| clear.range() == reg.range())
+    }
 }
 
 pub(crate) fn get_dist_regs(fd: &DeviceFd) -> Result<Vec<GicRegState<u32>>, GicError> {
@@ -165,5 +171,56 @@ mod tests {
 
         // dropping gic_fd would double close the gic fd, so leak it
         std::mem::forget(gic_fd);
+    }
+
+    #[test]
+    fn test_clears_on_write() {
+        let clear: Vec<u64> = VGIC_DIST_REGS
+            .iter()
+            .filter(|reg| DistRegEngine::clears_on_write(reg))
+            .map(|reg| reg.range().start)
+            .collect();
+        assert_eq!(
+            clear,
+            [GICD_ICENABLER.range().start, GICD_ICACTIVER.range().start]
+        );
+    }
+
+    #[test]
+    fn test_restore_clears_what_the_saved_state_has_clear() {
+        let kvm = Kvm::new().unwrap();
+        let vm = kvm.create_vm().unwrap();
+        let _ = vm.create_vcpu(0).unwrap();
+        let gic_fd = match create_gic(&vm, 1, Some(GICVersion::GICV2)) {
+            Ok(gic_fd) => gic_fd,
+            Err(GicError::CreateGIC(_)) => return,
+            _ => panic!("Failed to open setup GICv2"),
+        };
+        let fd = gic_fd.device_fd();
+        // The first word of each register that covers SPIs: interrupts 32 to 63.
+        let first = |reg: &DistReg| reg.range().start;
+        let enabled = || {
+            DistRegEngine::get_reg_data(fd, &GICD_ISENABLER, 0)
+                .unwrap()
+                .chunks[0]
+        };
+        let write = |offset: u64, val: u32| {
+            let mut val = val;
+            fd.set_device_attr(&DistRegEngine::kvm_device_attr(offset, &mut val, 0))
+                .unwrap();
+        };
+
+        // A guest with SPIs 32 and 35 enabled is saved.
+        assert_eq!(enabled(), 0);
+        write(first(&GICD_ISENABLER), 0b1001);
+        let state = get_dist_regs(fd).unwrap();
+
+        // Restored into a distributor that has another interrupt enabled.
+        write(first(&GICD_ICENABLER), u32::MAX);
+        write(first(&GICD_ISENABLER), 0b0110);
+        assert_eq!(enabled(), 0b0110);
+
+        set_dist_regs(fd, &state).unwrap();
+        assert_eq!(enabled(), 0b1001);
     }
 }
