@@ -99,8 +99,8 @@ fn saved_apic_id(lapic: &kvm_lapic_state) -> u8 {
 /// The APIC id to send a paravirtual kick to for the vCPU a snapshot holds `state` of, or
 /// `None` when that vCPU gets none.
 ///
-/// Only a runnable vCPU of a guest that was offered the kick gets one. A guest that was not
-/// offered `KVM_FEATURE_PV_UNHALT` has no paravirtual spinlocks and so no kick to lose. A
+/// Only a runnable vCPU of a guest that was offered the kick gets one. A Linux guest that was
+/// not offered `KVM_FEATURE_PV_UNHALT` has no paravirtual spinlocks and so no kick to lose. A
 /// halted vCPU with a kick pending is saved as runnable (`KVM_GET_MP_STATE` folds the kick
 /// in), so a vCPU saved as halted has none to lose either. A vCPU that waits for INIT or
 /// SIPI must get none: with a kick recorded KVM takes it for runnable, and its `KVM_RUN`
@@ -288,12 +288,14 @@ impl KvmVm {
     /// Nothing this VMM does between a load and the guest's next instruction clears it, so a
     /// VM that is loaded paused and resumed later needs no second one.
     ///
-    /// The host kernel can clear it. From Linux 6.15 on, `kvm_arch_async_page_present()`
-    /// drops a pending kick, and a restored vCPU runs that function on its first `KVM_RUN`:
-    /// restoring `MSR_KVM_ASYNC_PF_EN` queues a wake-up of every waiter in the guest, and a
-    /// guest page that has to be read in completes through it too. On such a host the kick
-    /// reaches the HLT only with that function fixed to keep it (ejc3/fcvm#2130; not
-    /// upstream as of 7.3.3).
+    /// On Linux 6.15 and later this needs the host kernel to keep a kick across an async
+    /// page-ready completion (the fcvm host kernel patch
+    /// `kvm-x86-keep-a-pending-pv-kick-across-async-page-ready`, ejc3/fcvm#2130; not upstream
+    /// as of 7.3.3). Restoring `MSR_KVM_ASYNC_PF_EN` queues a completion that wakes every
+    /// waiter in the guest, the vCPU handles it on its first entry before it runs an
+    /// instruction, and an unpatched `kvm_arch_async_page_present()` clears the kick there
+    /// (ejc3/fcvm#2132). No order of the restore's ioctls avoids that: the completion runs
+    /// inside `KVM_RUN`, after the last of them.
     pub fn kick_runnable_vcpus(&self, states: &[VcpuState]) -> Result<usize, KvmVmError> {
         let mut kicked = 0;
         for apic_id in states.iter().filter_map(pv_kick_target) {
@@ -624,8 +626,11 @@ mod tests {
     const MSR_KVM_ASYNC_PF_INT: u32 = 0x4b56_4d06;
     const KVM_ASYNC_PF_ENABLED: u64 = 1 << 0;
     const KVM_ASYNC_PF_DELIVERY_AS_INT: u64 = 1 << 3;
-    // Guest address of the 64 bytes KVM writes page-ready tokens to.
+    // Guest address of the 64 bytes KVM writes page-ready tokens to: 4 bytes of flags, then
+    // the token.
     const ASYNC_PF_DATA_ADDR: u64 = 0x18000;
+    // The token of the completion that wakes every waiter.
+    const ASYNC_PF_WAKE_ALL: u32 = !0;
     const ASYNC_PF_VECTOR: u64 = 0xf3;
 
     // Sets a vCPU up for async page faults as Linux does: the local APIC enabled in software,
@@ -649,6 +654,15 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(vcpu.fd.set_msrs(&msrs).unwrap(), 2);
+    }
+
+    // The token in the vCPU's page-ready slot.
+    fn page_ready_token(vm: &KvmVm) -> u32 {
+        let mut token = [0u8; 4];
+        vm.guest_memory()
+            .read_slice(&mut token, GuestAddress(ASYNC_PF_DATA_ADDR + 4))
+            .unwrap();
+        u32::from_le_bytes(token)
     }
 
     fn async_pf_is_enabled(state: &VcpuState) -> bool {
@@ -684,8 +698,10 @@ mod tests {
         assert_eq!(regs.rip, GUEST_CODE_ADDR + GUEST_HLT_OFFSET);
         assert_eq!(regs.rflags & RFLAGS_IF, 0);
         if async_pf {
-            // Enabling async page faults made KVM report one page-ready event to this vCPU.
-            // A guest's handler takes the token and clears the slot. This guest has none.
+            // Enabling async page faults queued the completion that wakes every waiter, and
+            // the run above delivered it. A guest's handler takes the token and clears the
+            // slot. This guest has none.
+            assert_eq!(page_ready_token(&vm), ASYNC_PF_WAKE_ALL);
             vm.guest_memory()
                 .write_slice(&[0u8; 64], GuestAddress(ASYNC_PF_DATA_ADDR))
                 .unwrap();
@@ -821,12 +837,19 @@ mod tests {
             .restore_kvm_state(&restored_vcpus, &vcpu_states, &vm_state, false)
             .unwrap();
         let (_, restored) = run_bounded(restored_vcpus.remove(0), RUN_WAIT);
+        if async_pf {
+            // The restore of MSR_KVM_ASYNC_PF_EN queued the completion again, and the
+            // restored vCPU's first entry delivered it.
+            assert_eq!(page_ready_token(&restored_vm), ASYNC_PF_WAKE_ALL);
+        }
         let (_, source) = run_bounded(vcpus.remove(0), RUN_WAIT);
         (restored, source)
     }
 
     // The saved state does not hold the kick, so without the one the restore gives, the
     // restored vCPU halts for ever (test_a_restored_vcpu_blocks_in_its_hlt_without_a_kick).
+    // On Linux 6.15 and later this also holds the kick to its place after every vCPU's
+    // KVM_SET_MP_STATE: given before, it is cleared and the vCPU halts.
     #[test]
     fn test_restore_kicks_a_vcpu_stopped_before_its_hlt() {
         let (restored, source) = restore_a_vcpu_stopped_before_its_hlt(false);
@@ -930,7 +953,8 @@ mod tests {
     }
 
     // A runnable vCPU whose local APIC is off cannot be kicked, by its guest or by a
-    // restore. The restore goes on without the kick.
+    // restore. KVM answers 0 and the restore goes on without the kick. The EPERM answer
+    // needs a VM whose APIC map KVM failed to build, which a test cannot make.
     #[test]
     fn test_restore_of_a_vcpu_with_its_local_apic_off_gets_no_kick() {
         let (vm, vcpus) = guest_stopped_before_hlt(1, false);
