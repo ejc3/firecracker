@@ -18,6 +18,8 @@ use vm_memory::GuestAddress;
 
 #[cfg(target_arch = "aarch64")]
 use crate::Vcpu;
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86_64::vm::RestoreKvmStateError;
 use crate::arch::{ConfigurationError, configure_system_for_boot, load_kernel};
 #[cfg(target_arch = "aarch64")]
 use crate::construct_kvm_mpidrs;
@@ -482,18 +484,22 @@ pub enum BuildMicrovmFromSnapshotError {
 }
 
 /// Align restored TSC offsets before starting any vCPU threads.
+///
+/// Restoring TSC MSRs separately can leave different offsets on each vCPU. This preserves
+/// vCPU0's restored timeline while preventing time from going backwards when the guest
+/// migrates between vCPUs.
 #[cfg(target_arch = "x86_64")]
-fn synchronize_tsc_offsets(vcpus: &[crate::Vcpu]) {
+pub(crate) fn synchronize_tsc_offsets(vcpus: &[&crate::arch::x86_64::vcpu::KvmVcpu]) {
     let reference = vcpus
         .first()
         .expect("TSC synchronization requires at least one vCPU");
     // KVM_VCPU_TSC_OFFSET is supported since Linux 5.16 (commit 828ca89628bf).
     // Probe the attribute to keep restore best-effort on older hosts.
-    if !reference.kvm_vcpu.supports_tsc_offset_attr() {
+    if !reference.supports_tsc_offset_attr() {
         crate::logger::debug!("KVM does not support TSC offset synchronization");
         return;
     }
-    let offset = match reference.kvm_vcpu.get_tsc_offset() {
+    let offset = match reference.get_tsc_offset() {
         Ok(offset) => offset,
         Err(err) => {
             crate::logger::warn!("Failed to read vCPU 0 TSC offset: {err}");
@@ -503,10 +509,10 @@ fn synchronize_tsc_offsets(vcpus: &[crate::Vcpu]) {
 
     let mut synchronized = true;
     for vcpu in vcpus {
-        if let Err(err) = vcpu.kvm_vcpu.set_tsc_offset(offset) {
+        if let Err(err) = vcpu.set_tsc_offset(offset) {
             crate::logger::warn!(
                 "Failed to synchronize vCPU {} TSC offset: {err}",
-                vcpu.kvm_vcpu.index
+                vcpu.index
             );
             synchronized = false;
         }
@@ -554,6 +560,8 @@ pub fn build_microvm_from_snapshot(
         .restore_pmem_devices(&kvm_vm, kvm_vm.guest_memory())?;
 
     // All memslots are registered by now, see `create_vcpus`.
+    // Only aarch64's vCPU restore takes the vCPU mutably.
+    #[cfg_attr(target_arch = "x86_64", allow(unused_mut))]
     let mut vcpus = kvm_vm
         .create_vcpus(vcpu_count)
         .map_err(StartMicrovmError::KvmVm)?;
@@ -572,22 +580,16 @@ pub fn build_microvm_from_snapshot(
         }
     }
 
-    // Restore vcpus kvm state.
-    for (vcpu, state) in vcpus.iter_mut().zip(microvm_state.vcpu_states.iter()) {
-        vcpu.kvm_vcpu
-            .restore_state(state)
-            .map_err(VcpuError::VcpuResponse)
-            .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)?;
-    }
-
-    // Restoring TSC MSRs separately can leave different offsets on each vCPU.
-    // Preserve vCPU0's restored timeline while preventing time from going backwards
-    // when the guest migrates between vCPUs.
-    #[cfg(target_arch = "x86_64")]
-    synchronize_tsc_offsets(&vcpus);
-
     #[cfg(target_arch = "aarch64")]
     {
+        // Restore vcpus kvm state.
+        for (vcpu, state) in vcpus.iter_mut().zip(microvm_state.vcpu_states.iter()) {
+            vcpu.kvm_vcpu
+                .restore_state(state)
+                .map_err(VcpuError::VcpuResponse)
+                .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)?;
+        }
+
         if clock_realtime {
             return Err(BuildMicrovmFromSnapshotError::UnsupportedClockRealtime);
         }
@@ -596,9 +598,23 @@ pub fn build_microvm_from_snapshot(
         kvm_vm.restore_state(&mpidrs, &microvm_state.vm_state)?;
     }
 
-    // Restore kvm vm state.
+    // Restore the vCPUs' KVM state, align their TSC offsets, and restore the VM's KVM state.
+    // The call ends with a paravirtual kick for every runnable vCPU, which has to follow
+    // every vCPU's KVM_SET_MP_STATE.
     #[cfg(target_arch = "x86_64")]
-    kvm_vm.restore_state(&microvm_state.vm_state, clock_realtime)?;
+    kvm_vm
+        .restore_kvm_state(
+            &vcpus.iter().map(|vcpu| &vcpu.kvm_vcpu).collect::<Vec<_>>(),
+            &microvm_state.vcpu_states,
+            &microvm_state.vm_state,
+            clock_realtime,
+        )
+        .map_err(|err| match err {
+            RestoreKvmStateError::Vcpu(err) => {
+                BuildMicrovmFromSnapshotError::RestoreVcpus(VcpuError::VcpuResponse(err))
+            }
+            RestoreKvmStateError::Vm(err) => BuildMicrovmFromSnapshotError::RestoreState(err),
+        })?;
 
     // Restore the boot source config paths.
     vm_resources.boot_source.config = microvm_state.vm_info.boot_source;
@@ -1012,7 +1028,7 @@ pub(crate) mod tests {
                 assert_eq!(vcpu.kvm_vcpu.get_tsc_offset().unwrap(), offset);
             }
 
-            synchronize_tsc_offsets(&vcpus);
+            synchronize_tsc_offsets(&vcpus.iter().map(|vcpu| &vcpu.kvm_vcpu).collect::<Vec<_>>());
             for vcpu in &vcpus {
                 assert_eq!(vcpu.kvm_vcpu.get_tsc_offset().unwrap(), offsets[0]);
             }
