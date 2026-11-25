@@ -22,8 +22,8 @@ def test_fuzzing_warning(guest_kernel, rootfs, vm_backend):
         "built with the `fuzzing` feature enabled" in uvm.log_data
     ), f"Fuzzing warning not found in logs:\n{uvm.log_data}"
     assert (
-        "+fuzzing" in uvm.log_data
-    ), f"Version string missing +fuzzing suffix:\n{uvm.log_data}"
+        ".fuzzing" in uvm.log_data
+    ), f"Version string missing .fuzzing suffix:\n{uvm.log_data}"
 
 
 @pin_guest_kernel(GUEST_KERNEL_DEFAULT)

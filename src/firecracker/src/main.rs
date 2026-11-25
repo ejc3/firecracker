@@ -49,10 +49,13 @@ use crate::seccomp::SeccompConfig;
 // runtime file.
 // see https://refspecs.linuxfoundation.org/FHS_3.0/fhs/ch03s15.html for more information.
 const DEFAULT_API_SOCK_PATH: &str = "/run/firecracker.socket";
+// The `fcvm` build metadata names what this build takes that another build of the same
+// version may not, so a caller can read it from `--version` before it uses one:
+// `drive-overrides` says a snapshot load takes `drive_overrides`.
 const FIRECRACKER_VERSION: &str = if cfg!(feature = "fuzzing") {
-    concat!(env!("CARGO_PKG_VERSION"), "+fuzzing")
+    concat!(env!("CARGO_PKG_VERSION"), "+fcvm.drive-overrides.fuzzing")
 } else {
-    env!("CARGO_PKG_VERSION")
+    concat!(env!("CARGO_PKG_VERSION"), "+fcvm.drive-overrides")
 };
 const MMDS_CONTENT_ARG: &str = "metadata";
 
