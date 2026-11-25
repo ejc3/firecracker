@@ -38,8 +38,8 @@ use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorGroup};
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{
-    GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemoryState, GuestRegionMmap,
-    GuestRegionMmapExt, MemoryError,
+    AbsentPages, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemoryState,
+    GuestRegionMmap, GuestRegionMmapExt, MemoryError, ZeroPages,
 };
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
@@ -661,7 +661,8 @@ impl KvmVm {
     ///
     /// If `snapshot_type` is [`SnapshotType::Diff`], and `mem_file_path` exists and is a snapshot
     /// file of matching size, then the diff snapshot will be directly merged into the existing
-    /// snapshot. Otherwise, existing files are simply overwritten.
+    /// snapshot. Otherwise, existing files are simply overwritten. A full snapshot into a file
+    /// that held no data (a new file, or one of the wrong size) leaves all-zero pages as holes.
     pub(crate) fn snapshot_memory_to_path(
         &self,
         mem_file_path: &Path,
@@ -669,9 +670,6 @@ impl KvmVm {
         sync_snapshot_files: bool,
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::*;
-
-        // Need to check this here, as we create the file in the line below
-        let file_existed = mem_file_path.exists();
 
         let mut file = OpenOptions::new()
             .write(true)
@@ -684,39 +682,55 @@ impl KvmVm {
         let mem_size_mib = mem_size_mib(self.guest_memory());
         let expected_size = mem_size_mib * 1024 * 1024;
 
-        if file_existed {
-            let file_size = file
-                .metadata()
-                .map_err(|e| MemoryBackingFile("get_metadata", e))?
-                .len();
+        // The size comes from the file just opened, not from a check before the open, so a file
+        // created at the path in between is never taken for an empty one.
+        let file_size = file
+            .metadata()
+            .map_err(|e| MemoryBackingFile("get_metadata", e))?
+            .len();
 
-            // Here we only truncate the file if the size mismatches.
-            // - For full snapshots, the entire file's contents will be overwritten anyway. We have
-            //   to avoid truncating here to deal with the edge case where it represents the
-            //   snapshot file from which this very microVM was loaded (as modifying the memory file
-            //   would be reflected in the mmap of the file, meaning a truncate operation would zero
-            //   out guest memory, and thus corrupt the VM).
-            // - For diff snapshots, we want to merge the diff layer directly into the file.
-            if file_size != expected_size {
-                file.set_len(0)
-                    .map_err(|err| MemoryBackingFile("truncate", err))?;
-            }
+        // Here we only truncate the file if the size mismatches.
+        // - For full snapshots, the file's contents will be overwritten anyway, except under an
+        //   unplugged slot, which the dump seeks over. We have to avoid truncating here to deal
+        //   with the edge case where it represents the snapshot file from which this very microVM
+        //   was loaded (as modifying the memory file would be reflected in the mmap of the file,
+        //   meaning a truncate operation would zero out guest memory, and thus corrupt the VM).
+        // - For diff snapshots, we want to merge the diff layer directly into the file.
+        // A file this call created is empty, so truncating it changes nothing. Either way the
+        // file holds no data afterwards.
+        let starts_empty = file_size != expected_size;
+        if starts_empty {
+            file.set_len(0)
+                .map_err(|err| MemoryBackingFile("truncate", err))?;
         }
 
         // Set the length of the file to the full size of the memory area.
         file.set_len(expected_size)
             .map_err(|e| MemoryBackingFile("set_length", e))?;
 
-        self.snapshot_memory_to_file(&mut file, snapshot_type, sync_snapshot_files)
+        // A file that held no data reads as one hole after the set_len above, so a full snapshot
+        // may skip zero pages. A page of anonymous memory that has no page table entry is one of
+        // them and is skipped without being read, unless a userfaultfd handler supplies the
+        // missing pages of guest memory, which then need not be zeros. In a file that already had
+        // the right size a skipped page would keep its old bytes, so every page of a plugged slot
+        // is written.
+        let zero_pages = match (starts_empty, &self.common.uffd) {
+            (false, _) => ZeroPages::Write,
+            (true, Some(_)) => ZeroPages::Hole(AbsentPages::Read),
+            (true, None) => ZeroPages::Hole(AbsentPages::Skip),
+        };
+
+        self.snapshot_memory_to_file(&mut file, snapshot_type, zero_pages, sync_snapshot_files)
     }
 
     /// Writes guest memory to `file` as a snapshot of `snapshot_type`, taking the dirty pages it
     /// covers, then flushes it and, if asked, syncs it. If any of that fails, the pages taken are
-    /// marked dirty again.
+    /// marked dirty again. `zero_pages` says what a full snapshot does with all-zero pages.
     fn snapshot_memory_to_file<F: MemoryFile>(
         &self,
         file: &mut F,
         snapshot_type: SnapshotType,
+        zero_pages: ZeroPages,
         sync_snapshot_files: bool,
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::{Memory, MemoryBackingFile};
@@ -731,7 +745,7 @@ impl KvmVm {
 
         match snapshot_type {
             SnapshotType::Diff => guest_memory.dump_dirty(file, &dirty_bitmap),
-            SnapshotType::Full => guest_memory.dump(file),
+            SnapshotType::Full => guest_memory.dump(file, zero_pages),
         }
         .map_err(Memory)
         .inspect_err(put_back)?;
@@ -900,6 +914,8 @@ pub(crate) mod tests {
     use std::sync::atomic::Ordering;
 
     use vm_memory::GuestAddress;
+    use vmm_sys_util::tempdir::TempDir;
+    use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
     use crate::arch;
@@ -910,7 +926,8 @@ pub(crate) mod tests {
     use crate::utils::mib_to_bytes;
     use crate::vmm_config::machine_config::HugePageConfig;
     use crate::vstate::kvm::Kvm;
-    use crate::vstate::memory::anonymous;
+    use crate::vstate::memory::test_utils::data_runs;
+    use crate::vstate::memory::{Bytes, HOLE_GRANULE, anonymous};
 
     // Auxiliary function being used throughout the tests.
     pub(crate) fn setup_vm() -> KvmVm {
@@ -1022,13 +1039,13 @@ pub(crate) mod tests {
                     file: TempFile::new().unwrap().into_file(),
                     state: TestMemoryFileState::Fails(fails),
                 };
-                vm.snapshot_memory_to_file(&mut file, snapshot_type, true)
+                vm.snapshot_memory_to_file(&mut file, snapshot_type, ZeroPages::Write, true)
                     .unwrap_err();
                 assert!(is_dirty(), "{snapshot_type:?}: {fails} failed");
             }
 
             let mut file = TempFile::new().unwrap().into_file();
-            vm.snapshot_memory_to_file(&mut file, snapshot_type, true)
+            vm.snapshot_memory_to_file(&mut file, snapshot_type, ZeroPages::Write, true)
                 .unwrap();
             assert!(!is_dirty(), "{snapshot_type:?} succeeded");
         }
@@ -1063,7 +1080,7 @@ pub(crate) mod tests {
                     value: 2,
                 },
             };
-            vm.snapshot_memory_to_file(&mut racing_file, snapshot_type, false)
+            vm.snapshot_memory_to_file(&mut racing_file, snapshot_type, ZeroPages::Write, false)
                 .unwrap();
             file = racing_file.file;
             let is_dirty = vm
@@ -1073,7 +1090,7 @@ pub(crate) mod tests {
             assert!(is_dirty, "{snapshot_type:?}");
 
             file.rewind().unwrap();
-            vm.snapshot_memory_to_file(&mut file, SnapshotType::Diff, false)
+            vm.snapshot_memory_to_file(&mut file, SnapshotType::Diff, ZeroPages::Write, false)
                 .unwrap();
             let mut byte = [0];
             file.read_exact_at(&mut byte, page_size as u64).unwrap();
@@ -1124,6 +1141,257 @@ pub(crate) mod tests {
         let gm = single_region_mem_raw(mem_size);
         vm.register_dram_memory_regions(gm).unwrap();
         vm
+    }
+
+    // Offset of the one all-zero page in the guest memory of setup_vm_with_one_zero_page.
+    const ZERO_PAGE: usize = 2 * HOLE_GRANULE;
+
+    // A VM with 1 MiB of guest memory holding 0x11 everywhere but one all-zero page at
+    // ZERO_PAGE. Returns the VM and its memory contents.
+    fn setup_vm_with_one_zero_page() -> (KvmVm, Vec<u8>) {
+        let mem_size = mib_to_bytes(1);
+        let vm = setup_vm_with_memory(mem_size);
+        let mut contents = vec![0x11u8; mem_size];
+        contents[ZERO_PAGE..ZERO_PAGE + HOLE_GRANULE].fill(0);
+        vm.guest_memory()
+            .write_slice(&contents, GuestAddress(0))
+            .unwrap();
+        (vm, contents)
+    }
+
+    // Offset of the first byte where the file differs from `expected`, or None.
+    fn first_difference(path: &Path, expected: &[u8]) -> Option<usize> {
+        let contents = std::fs::read(path).unwrap();
+        assert_eq!(contents.len(), expected.len());
+        contents.iter().zip(expected).position(|(a, b)| a != b)
+    }
+
+    #[test]
+    fn test_full_snapshot_overwrites_zero_pages_in_an_existing_file() {
+        let (vm, contents) = setup_vm_with_one_zero_page();
+        // A file of the snapshot's size full of 0xFF stands in for an earlier snapshot.
+        let file = TempFile::new().unwrap();
+        std::fs::write(file.as_path(), vec![0xFFu8; contents.len()]).unwrap();
+
+        vm.snapshot_memory_to_path(file.as_path(), SnapshotType::Full, false)
+            .unwrap();
+
+        // Seeking over the zero page would leave the old 0xFF bytes under it.
+        assert_eq!(first_difference(file.as_path(), &contents), None);
+    }
+
+    #[test]
+    fn test_full_snapshot_leaves_zero_pages_as_holes_in_an_empty_target() {
+        let (vm, contents) = setup_vm_with_one_zero_page();
+        // A path with no file yet, and a file of the wrong size, which the snapshot truncates.
+        let dir = TempDir::new().unwrap();
+        let new_path = dir.as_path().join("new");
+        let wrong_size_path = dir.as_path().join("wrong-size");
+        std::fs::write(&wrong_size_path, vec![0xFFu8; 2 * contents.len()]).unwrap();
+
+        for path in [new_path, wrong_size_path] {
+            vm.snapshot_memory_to_path(&path, SnapshotType::Full, false)
+                .unwrap();
+
+            let len = contents.len() as u64;
+            let (zero_page, page) = (ZERO_PAGE as u64, HOLE_GRANULE as u64);
+            assert_eq!(
+                data_runs(&File::open(&path).unwrap()),
+                vec![(0, zero_page), (zero_page + page, len - zero_page - page)],
+                "{path:?}"
+            );
+            assert_eq!(first_difference(&path, &contents), None, "{path:?}");
+        }
+    }
+
+    /// Size of the guest memory the tests of never-written pages dump: whole MiBs, and several
+    /// 2 MiB extents, so a transparent huge page that a write in the first extent populates
+    /// cannot reach the pages the tests expect to stay absent.
+    const DUMP_TEST_MEM: usize = 8 << 20;
+
+    /// Whether each page of `[addr, addr + len)` is mapped or swapped out, from
+    /// `/proc/self/pagemap`.
+    fn populated_pages(addr: usize, len: usize) -> Vec<bool> {
+        use std::io::{Read, SeekFrom};
+
+        let page_size = host_page_size();
+        let mut pagemap = File::open("/proc/self/pagemap").unwrap();
+        pagemap
+            .seek(SeekFrom::Start((addr / page_size * 8) as u64))
+            .unwrap();
+        let mut bytes = vec![0u8; len / page_size * 8];
+        pagemap.read_exact(&mut bytes).unwrap();
+        bytes
+            .chunks_exact(8)
+            .map(|e| u64::from_ne_bytes(e.try_into().unwrap()) & (0b11 << 62) != 0)
+            .collect()
+    }
+
+    /// Writes two marks into the first 2 MiB of guest memory and returns them with their guest
+    /// addresses.
+    fn write_marks(vm: &KvmVm) -> [(u64, [u8; 16]); 2] {
+        let marks = [(0, [0xab; 16]), (5 * host_page_size() as u64, [0xcd; 16])];
+        for (addr, bytes) in &marks {
+            vm.guest_memory()
+                .write_slice(bytes, GuestAddress(*addr))
+                .unwrap();
+        }
+        marks
+    }
+
+    /// The file must hold the marks, over each page's `filler` byte.
+    fn assert_file_holds_marks_on(
+        path: &Path,
+        marks: &[(u64, [u8; 16])],
+        filler: impl Fn(usize) -> u8,
+    ) {
+        let file = std::fs::read(path).unwrap();
+        assert_eq!(file.len(), DUMP_TEST_MEM);
+        let mut expected: Vec<u8> = (0..DUMP_TEST_MEM)
+            .map(|byte| filler(byte / host_page_size()))
+            .collect();
+        for (addr, bytes) in marks {
+            let addr = usize::try_from(*addr).unwrap();
+            expected[addr..addr + bytes.len()].copy_from_slice(bytes);
+        }
+        // Compare page by page so a failure names the page instead of printing 8 MiB.
+        for (page, (got, want)) in file
+            .chunks(host_page_size())
+            .zip(expected.chunks(host_page_size()))
+            .enumerate()
+        {
+            assert!(
+                got == want,
+                "snapshot page {page} differs from guest memory"
+            );
+        }
+    }
+
+    #[test]
+    fn test_full_snapshot_leaves_never_written_guest_pages_unmapped() {
+        // Reading a never-written anonymous page maps the shared zero page, and the guest's first
+        // write to it after the snapshot is then a copy-on-write whose MMU notifier invalidation
+        // unmaps every shadow stage-2 of a nested guest. The dump must leave those pages as they
+        // were: unmapped in the VMM, and holes in the file.
+        let vm = setup_vm_with_memory(DUMP_TEST_MEM);
+        let marks = write_marks(&vm);
+        let host = vm.guest_memory().get_host_address(GuestAddress(0)).unwrap() as usize;
+        let tail = (host + DUMP_TEST_MEM / 2, DUMP_TEST_MEM / 2);
+        assert!(
+            populated_pages(tail.0, tail.1).iter().all(|p| !p),
+            "test setup: the second half of guest memory must start never written"
+        );
+
+        let file = TempFile::new().unwrap();
+        vm.snapshot_memory_to_path(file.as_path(), SnapshotType::Full, false)
+            .unwrap();
+
+        let mapped = populated_pages(tail.0, tail.1)
+            .iter()
+            .filter(|p| **p)
+            .count();
+        assert_eq!(
+            mapped, 0,
+            "the Full snapshot mapped {mapped} never-written guest pages into the VMM"
+        );
+        assert_file_holds_marks_on(file.as_path(), &marks, |_| 0);
+        // Only the two granules that hold a mark are data. The rest of the file is a hole, not
+        // written zeros.
+        assert_eq!(
+            data_runs(file.as_file()),
+            marks.map(|(addr, _)| (addr, HOLE_GRANULE as u64))
+        );
+    }
+
+    #[test]
+    fn test_full_snapshot_into_a_file_of_the_same_size_writes_every_page() {
+        // A Full snapshot overwrites a memory file of the right size in place, so a page it left
+        // as a hole there would keep the old file's data. Every page must be written, the
+        // never-written ones included.
+        let vm = setup_vm_with_memory(DUMP_TEST_MEM);
+        let marks = write_marks(&vm);
+        let file = TempFile::new().unwrap();
+        std::fs::write(file.as_path(), vec![0xffu8; DUMP_TEST_MEM]).unwrap();
+
+        vm.snapshot_memory_to_path(file.as_path(), SnapshotType::Full, false)
+            .unwrap();
+
+        assert_file_holds_marks_on(file.as_path(), &marks, |_| 0);
+    }
+
+    #[test]
+    fn test_full_snapshot_of_userfaultfd_memory_reads_every_page() {
+        // A restored VM's missing page holds what its page server will supply, not zeros, so the
+        // dump must read it (and the server fill it) rather than leave a hole.
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::sync::atomic::AtomicBool;
+
+        use userfaultfd::{Event, UffdBuilder};
+
+        const SERVED: u8 = 0x5a;
+        let mut vm = setup_vm_with_memory(DUMP_TEST_MEM);
+        let marks = write_marks(&vm);
+        let host = vm.guest_memory().get_host_address(GuestAddress(0)).unwrap();
+        // Created as for a snapshot restore: the dump faults guest memory from kernel context.
+        let uffd = UffdBuilder::new()
+            .close_on_exec(true)
+            .non_blocking(true)
+            .user_mode_only(false)
+            .create()
+            .expect("this test needs vm.unprivileged_userfaultfd=1 or CAP_SYS_PTRACE");
+        // A page the marks' writes populated (a whole huge page, when transparent huge pages are
+        // always on) holds zeros around the marks; the server fills every other page.
+        let populated = populated_pages(host as usize, DUMP_TEST_MEM);
+        assert!(
+            populated.iter().any(|p| !p),
+            "test setup: no page left to serve"
+        );
+        uffd.register(host.cast(), DUMP_TEST_MEM).unwrap();
+        // SAFETY: dup returns a new descriptor that the server's Uffd owns.
+        let server = unsafe { Uffd::from_raw_fd(libc::dup(uffd.as_raw_fd())) };
+        vm.set_uffd(Some(uffd));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let page_size = host_page_size();
+        let serving = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let page = vec![SERVED; page_size];
+                while !stop.load(Ordering::Relaxed) {
+                    let mut pollfd = libc::pollfd {
+                        fd: server.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // SAFETY: polls one valid pollfd for 50 ms.
+                    if unsafe { libc::poll(&mut pollfd, 1, 50) } <= 0 {
+                        continue;
+                    }
+                    while let Some(event) = server.read_event().unwrap() {
+                        if let Event::Pagefault { addr, .. } = event {
+                            let addr = (addr as usize) & !(page_size - 1);
+                            // SAFETY: copies one page from a live buffer to the faulting
+                            // page of the registered guest memory.
+                            unsafe {
+                                server
+                                    .copy(page.as_ptr().cast(), addr as *mut _, page_size, true)
+                                    .unwrap();
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
+        let file = TempFile::new().unwrap();
+        let result = vm.snapshot_memory_to_path(file.as_path(), SnapshotType::Full, false);
+        stop.store(true, Ordering::Relaxed);
+        serving.join().unwrap();
+        result.unwrap();
+
+        assert_file_holds_marks_on(file.as_path(), &marks, |page| {
+            if populated[page] { 0 } else { SERVED }
+        });
     }
 
     #[test]

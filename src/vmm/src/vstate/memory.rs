@@ -8,7 +8,7 @@
 use std::ffi::c_void;
 use std::fs::File;
 use std::io;
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::ops::{Deref, Range};
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
@@ -29,7 +29,7 @@ use vm_memory::{
 
 use crate::arch::host_page_size;
 use crate::logger::{error, warn};
-use crate::utils::{mib_to_bytes, u64_to_usize};
+use crate::utils::{mib_to_bytes, u64_to_usize, usize_to_u64};
 use crate::vmm_config::machine_config::HugePageConfig;
 use crate::vstate::vm::{KvmVm, VmError};
 use crate::{DirtyBitmap, align_down, align_up, warn_unrestricted};
@@ -42,6 +42,271 @@ pub type GuestMemoryMmap = vm_memory::GuestRegionCollection<GuestRegionMmapExt>;
 const GUEST_MEMORY_ALIGNMENT: usize = mib_to_bytes(2);
 /// A mask to extract mmap's flags related to HUGETLB
 const HUGETLB_FLAG_MASK: libc::c_int = libc::MAP_HUGETLB | (0x3F << libc::MAP_HUGE_SHIFT);
+
+/// Size and alignment of the all-zero pages a Full dump into an empty file leaves as holes.
+///
+/// This is fcvm's `working_set::GRANULE` (src/uffd/working_set.rs in fcvm), the 4 KiB unit its
+/// page server records and replays guest memory in, so every hole fcvm finds in a memory file
+/// covers whole granules. It is not `host_page_size()`, which is larger on some arm64 hosts.
+pub const HOLE_GRANULE: usize = 4096;
+
+/// How much guest memory a Full dump into an empty file pages in and scans at a time. A run of
+/// non-zero pages is written where the scan ends it or at the end of its chunk, so the chunk
+/// bounds the size of each write and the time between populating a chunk and writing it.
+const DUMP_CHUNK: usize = mib_to_bytes(2);
+
+/// The most host pages in a [`DUMP_CHUNK`]: a host page is at least 4 KiB.
+const DUMP_CHUNK_PAGES: usize = DUMP_CHUNK / 4096;
+
+/// The bits of a /proc/self/pagemap entry that say a page has a page table entry: 63, the page is
+/// in memory, and 62, it is swapped out. For small pages and transparent huge pages the kernel
+/// sets 62 for every entry that is neither empty nor present: swap, migration, and markers. A
+/// hugetlb entry that is not present (migration, hwpoison) gets neither bit, so this alone cannot
+/// say that a page has no entry.
+const PAGEMAP_PRESENT_OR_SWAPPED: u64 = 0b11 << 62;
+
+/// What a Full dump does with an all-zero page of [`HOLE_GRANULE`] bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZeroPages {
+    /// Write it like any other page.
+    Write,
+    /// Seek over it and leave a hole. Correct only when the file holds no data under the page,
+    /// because a page that is skipped keeps whatever the file held there before.
+    Hole(AbsentPages),
+}
+
+/// What a Full dump that leaves holes does with a page of anonymous guest memory that has no
+/// page table entry: one that was never written, or that a discard emptied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbsentPages {
+    /// Read it like any other page. Required when a userfaultfd handler supplies the missing
+    /// pages of guest memory, so that such a page can hold something other than zeros.
+    Read,
+    /// Leave it as a hole without reading it. Reading it would map the shared zero page (or take
+    /// a huge page from the pool on hugetlbfs), and the resumed guest's first write to the page
+    /// would then be a copy-on-write. On arm64, each such copy drops every shadow stage-2
+    /// mapping of a nested guest.
+    Skip,
+}
+
+/// Whether every byte of `slice` is zero. Reads guest memory in place, eight bytes at a time
+/// where aligned, and stops at the first non-zero byte.
+fn is_zero<B: BitmapSlice>(slice: &VolatileSlice<'_, B>) -> bool {
+    let guard = slice.ptr_guard();
+    let ptr = guard.as_ptr();
+    let len = slice.len();
+    let head = ptr.align_offset(8).min(len);
+    let words = (len - head) / 8;
+    // SAFETY: every read is inside `slice`, which stays valid for reads while `guard` lives, and
+    // the word reads start at an 8-byte aligned address. The reads are volatile, as for all guest
+    // memory, because the guest and other processes can share it.
+    unsafe {
+        (0..head).all(|i| ptr.add(i).read_volatile() == 0)
+            && (0..words).all(|i| ptr.add(head).cast::<u64>().add(i).read_volatile() == 0)
+            && (head + words * 8..len).all(|i| ptr.add(i).read_volatile() == 0)
+    }
+}
+
+/// Moves the writer `len` bytes forward without writing.
+fn seek_forward<T: std::io::Seek>(writer: &mut T, len: usize) -> Result<(), MemoryError> {
+    let offset = i64::try_from(len).map_err(|_| MemoryError::SlotSizeTooLarge)?;
+    writer
+        .seek(SeekFrom::Current(offset))
+        .map_err(MemoryError::SeekError)?;
+    Ok(())
+}
+
+/// Writes all of `slice` to the writer. A failure is [`MemoryError::WriteMemory`] in both
+/// [`ZeroPages`] modes.
+fn write_memory<T: WriteVolatile, B: BitmapSlice>(
+    writer: &mut T,
+    slice: &VolatileSlice<'_, B>,
+) -> Result<(), MemoryError> {
+    writer
+        .write_all_volatile(slice)
+        .map_err(|err| MemoryError::WriteMemory(err.into()))
+}
+
+/// Faults in every page of `slice` for reading with MADV_POPULATE_READ. A page the kernel cannot
+/// provide at populate time (a hugetlb page the pool cannot supply, a file page past the end of a
+/// truncated file or behind a read error) is then an error here instead of a SIGBUS when
+/// [`is_zero`] reads it, which Firecracker's handler answers by exiting. The populate does not
+/// hold the pages: if the file backing a mapping is truncated after this call and before the scan
+/// of the chunk reads a page past the new end, that read still raises SIGBUS, where writing the
+/// range with write(2), as [`ZeroPages::Write`] does, fails with EFAULT.
+///
+/// Before Linux 6.9 (commit 631426ba1d45, "make MADV_POPULATE_(READ|WRITE) handle
+/// VM_FAULT_RETRY properly") the populate could retry forever on a page whose read fails, so on
+/// an unpatched 5.14 to 6.8 kernel that case can hang here where write(2) fails with EFAULT.
+///
+/// Returns false on EINVAL, which means the advice is unknown (kernels before 5.14) or the
+/// mapping does not allow it (a PROT_NONE range, for one).
+fn populate_read<B: BitmapSlice>(slice: &VolatileSlice<'_, B>) -> Result<bool, MemoryError> {
+    let guard = slice.ptr_guard();
+    // SAFETY: the range lies inside `slice`, which stays mapped while `guard` lives.
+    // MADV_POPULATE_READ only faults pages in for reading and changes no memory.
+    let ret = unsafe {
+        libc::madvise(
+            guard.as_ptr().cast_mut().cast(),
+            slice.len(),
+            libc::MADV_POPULATE_READ,
+        )
+    };
+    if ret == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EINVAL) {
+        return Ok(false);
+    }
+    Err(MemoryError::WriteMemory(GuestMemoryError::IOError(err)))
+}
+
+/// Dumps `run`, at most [`DUMP_CHUNK`] bytes of a slot, onto the writer: pages it in with
+/// [`populate_read`], writes each run of its pages of [`HOLE_GRANULE`] bytes that are not all
+/// zero, and adds the zero pages to `skip_size`, the bytes to seek over before the next write.
+/// Where MADV_POPULATE_READ returns EINVAL the run is written in full, as [`ZeroPages::Write`]
+/// does, so that write(2) reports a page that cannot be read.
+fn dump_nonzero_run<T: WriteVolatile + std::io::Seek, B: BitmapSlice>(
+    writer: &mut T,
+    run: &VolatileSlice<'_, B>,
+    skip_size: &mut usize,
+) -> Result<(), MemoryError> {
+    let scan = populate_read(run)?;
+    // The pending run of non-zero pages, as an offset and a length inside `run`.
+    let mut write_start = 0;
+    let mut write_size = 0;
+
+    for offset in (0..run.len()).step_by(HOLE_GRANULE) {
+        let page = run.subslice(offset, HOLE_GRANULE.min(run.len() - offset))?;
+        if scan && is_zero(&page) {
+            // We are at the end of a run of non-zero pages.
+            if write_size > 0 {
+                write_memory(writer, &run.subslice(write_start, write_size)?)?;
+                write_size = 0;
+            }
+            *skip_size += page.len();
+        } else {
+            // We are at the end of a run of zero pages.
+            if *skip_size > 0 {
+                seek_forward(writer, *skip_size)?;
+                *skip_size = 0;
+            }
+            if write_size == 0 {
+                write_start = offset;
+            }
+            write_size += page.len();
+        }
+    }
+
+    // Write the last run before the caller populates more memory, so no write covers more than
+    // one chunk.
+    if write_size > 0 {
+        write_memory(writer, &run.subslice(write_start, write_size)?)?;
+    }
+    Ok(())
+}
+
+/// Which pages have a page table entry, as bit `i` for page `i`, given each page's
+/// /proc/self/pagemap entry and its mincore(2) byte.
+///
+/// A page has no entry only when pagemap shows it neither present nor swapped and mincore reports
+/// it not resident. Neither is enough alone. pagemap shows a small page that is swapped out or
+/// migrating as swapped, and mincore reports it resident only while it is in the swap cache. A
+/// hugetlb entry that is not present, such as a migration entry, gets neither pagemap bit, and
+/// mincore reports it resident.
+fn with_entries(pagemap: &[u64], resident: &[u8]) -> u64 {
+    pagemap
+        .iter()
+        .zip(resident)
+        .enumerate()
+        .fold(0, |mapped, (page, (&entry, &resident))| {
+            let has_entry = entry & PAGEMAP_PRESENT_OR_SWAPPED != 0 || resident & 1 != 0;
+            mapped | (u64::from(has_entry) << page)
+        })
+}
+
+/// State that one dump shares across the slots it writes.
+#[derive(Debug, Default)]
+struct DumpScratch {
+    /// /proc/self/pagemap: `None` until first use, then the open file, or `None` when it cannot
+    /// be read.
+    pagemap: Option<Option<File>>,
+}
+
+impl DumpScratch {
+    /// Which of the `count` host pages from host address `addr` have a page table entry, as bit
+    /// `i % 64` of word `i / 64`, by [`with_entries`]. `count` is 1 to [`DUMP_CHUNK_PAGES`].
+    ///
+    /// /proc/self/pagemap is read with lseek(2) and read(2), which Firecracker's seccomp filters
+    /// allow on the thread that dumps, as they do mincore(2). When pagemap or mincore cannot be
+    /// read every bit is set, so the caller reads those pages.
+    fn mapped(
+        &mut self,
+        addr: usize,
+        count: usize,
+        page_size: usize,
+    ) -> [u64; DUMP_CHUNK_PAGES / 64] {
+        let all = [u64::MAX; DUMP_CHUNK_PAGES / 64];
+        let mut entries = [0u8; DUMP_CHUNK_PAGES * 8];
+        let entries = &mut entries[..count * 8];
+        let pagemap = self.pagemap.get_or_insert_with(|| {
+            File::open("/proc/self/pagemap")
+                .inspect_err(|err| {
+                    warn!(
+                        "Cannot open /proc/self/pagemap ({err}), so a snapshot reads every guest \
+                         page it writes"
+                    )
+                })
+                .ok()
+        });
+        let Some(file) = pagemap else {
+            return all;
+        };
+        let offset = usize_to_u64(addr / page_size * 8);
+        if let Err(err) = file
+            .seek(SeekFrom::Start(offset))
+            .and_then(|_| file.read_exact(entries))
+        {
+            warn!(
+                "Cannot read /proc/self/pagemap ({err}), so a snapshot reads every guest page it \
+                 writes"
+            );
+            self.pagemap = Some(None);
+            return all;
+        }
+        let mut resident = [0u8; DUMP_CHUNK_PAGES];
+        // SAFETY: `addr` is page aligned, and the `count` pages from it are guest memory, which
+        // stays mapped while the dump runs. `resident` has a byte for each of them.
+        let ret = unsafe {
+            libc::mincore(
+                addr as *mut c_void,
+                count * page_size,
+                resident.as_mut_ptr(),
+            )
+        };
+        if ret != 0 {
+            warn!(
+                "mincore failed ({}), so a snapshot reads these guest pages",
+                io::Error::last_os_error()
+            );
+            return all;
+        }
+        let mut mapped = [0u64; DUMP_CHUNK_PAGES / 64];
+        for ((word, entries), resident) in mapped
+            .iter_mut()
+            .zip(entries.chunks(64 * 8))
+            .zip(resident[..count].chunks(64))
+        {
+            let mut pagemap = [0u64; 64];
+            for (entry, bytes) in pagemap.iter_mut().zip(entries.chunks_exact(8)) {
+                *entry = u64::from_ne_bytes(bytes.try_into().unwrap());
+            }
+            *word = with_entries(&pagemap[..resident.len()], resident);
+        }
+        mapped
+    }
+}
 
 /// Errors associated with dumping guest memory to file.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -502,9 +767,64 @@ impl<'a> GuestMemorySlot<'a> {
         // Advance the cursor even if the trailing pages are clean, so that the
         // next slot starts writing at the correct offset.
         if skip_size > 0 {
-            writer
-                .seek(SeekFrom::Current(skip_size.try_into().unwrap()))
-                .map_err(MemoryError::SeekError)?;
+            seek_forward(writer, skip_size)?;
+        }
+
+        Ok(())
+    }
+
+    /// Dumps this slot onto the writer, seeking over each all-zero page of [`HOLE_GRANULE`]
+    /// bytes instead of writing it. Non-zero runs go from guest memory straight to the writer.
+    ///
+    /// The slot goes [`DUMP_CHUNK`] bytes at a time: each chunk is paged in with
+    /// MADV_POPULATE_READ, scanned, and has its non-zero runs written before the next chunk is
+    /// read. Given `absent`, the host pages of a chunk that have no page table entry
+    /// ([`DumpScratch::mapped`]) are seeked over without being paged in or read, and each run of
+    /// pages between them is paged in and scanned on its own. That is correct only for anonymous
+    /// memory whose missing pages no userfaultfd handler supplies, where such a page reads as
+    /// zeros.
+    fn dump_nonzero<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        mut absent: Option<&mut DumpScratch>,
+    ) -> Result<(), MemoryError> {
+        let len = self.slice.len();
+        let page_size = host_page_size();
+        let host = self.slice.ptr_guard().as_ptr() as usize;
+        // Bytes of zero pages to seek over before the next write. A zero run can span chunks.
+        let mut skip_size = 0;
+
+        for chunk_start in (0..len).step_by(DUMP_CHUNK) {
+            let chunk_len = DUMP_CHUNK.min(len - chunk_start);
+            let Some(scratch) = absent.as_deref_mut() else {
+                let chunk = self.slice.subslice(chunk_start, chunk_len)?;
+                dump_nonzero_run(writer, &chunk, &mut skip_size)?;
+                continue;
+            };
+            let pages = chunk_len.div_ceil(page_size);
+            let mapped = scratch.mapped(host + chunk_start, pages, page_size);
+            let has_entry = |page: usize| mapped[page / 64] & (1 << (page % 64)) != 0;
+            let mut page = 0;
+            while page < pages {
+                let run_pages = (page..pages)
+                    .take_while(|&next| has_entry(next) == has_entry(page))
+                    .count();
+                let run_start = page * page_size;
+                let run_len = (run_pages * page_size).min(chunk_len - run_start);
+                if has_entry(page) {
+                    let run = self.slice.subslice(chunk_start + run_start, run_len)?;
+                    dump_nonzero_run(writer, &run, &mut skip_size)?;
+                } else {
+                    skip_size += run_len;
+                }
+                page += run_pages;
+            }
+        }
+
+        // Seek over a trailing zero run too, so that the next slot starts writing at the correct
+        // offset.
+        if skip_size > 0 {
+            seek_forward(writer, skip_size)?;
         }
 
         Ok(())
@@ -1355,8 +1675,15 @@ where
     /// Mark memory range as dirty
     fn mark_dirty(&self, addr: GuestAddress, len: usize);
 
-    /// Dumps all contents of GuestMemoryMmap to a writer.
-    fn dump<T: WriteVolatile + std::io::Seek>(&self, writer: &mut T) -> Result<(), MemoryError>;
+    /// Dumps all contents of GuestMemoryMmap to a writer. With [`ZeroPages::Hole`], all-zero
+    /// pages are seeked over instead of written, and with [`AbsentPages::Skip`] so are the pages
+    /// of anonymous memory that have no page table entry, without reading them. An unplugged slot
+    /// is seeked over, so the file keeps what it held there.
+    fn dump<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        zero_pages: ZeroPages,
+    ) -> Result<(), MemoryError>;
 
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
     fn dump_dirty<T: WriteVolatile + std::io::Seek>(
@@ -1461,20 +1788,34 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         }
     }
 
-    /// Dumps all contents of GuestMemoryMmap to a writer.
-    fn dump<T: WriteVolatile + std::io::Seek>(&self, writer: &mut T) -> Result<(), MemoryError> {
-        self.iter()
-            .flat_map(|region| region.slots())
-            .try_for_each(|(mem_slot, plugged)| {
+    /// Dumps all contents of GuestMemoryMmap to a writer. With [`ZeroPages::Hole`], all-zero
+    /// pages are seeked over instead of written, and with [`AbsentPages::Skip`] so are the pages
+    /// of anonymous memory that have no page table entry, without reading them. An unplugged slot
+    /// is seeked over, so the file keeps what it held there.
+    fn dump<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        zero_pages: ZeroPages,
+    ) -> Result<(), MemoryError> {
+        let mut scratch = DumpScratch::default();
+        for region in self.iter() {
+            // A page of a file mapping that has no page table entry holds the file's data.
+            let anonymous = region.file_offset().is_none();
+            for (mem_slot, plugged) in region.slots() {
                 if !plugged {
-                    let ilen = i64::try_from(mem_slot.slice.len()).unwrap();
-                    writer.seek(SeekFrom::Current(ilen)).unwrap();
-                } else {
-                    writer.write_all_volatile(&mem_slot.slice)?;
+                    seek_forward(writer, mem_slot.slice.len())?;
+                    continue;
                 }
-                Ok(())
-            })
-            .map_err(MemoryError::WriteMemory)
+                match zero_pages {
+                    ZeroPages::Write => write_memory(writer, &mem_slot.slice)?,
+                    ZeroPages::Hole(absent_pages) => {
+                        let skip_absent = anonymous && absent_pages == AbsentPages::Skip;
+                        mem_slot.dump_nonzero(writer, skip_absent.then_some(&mut scratch))?
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
@@ -1648,6 +1989,43 @@ fn create_memfd(
 /// Test utilities
 pub mod test_utils {
     use super::*;
+
+    /// Returns the data runs of `file` as (offset, len) pairs, found with SEEK_DATA and
+    /// SEEK_HOLE, so a test sees which ranges the filesystem holds as holes.
+    #[cfg(test)]
+    pub(crate) fn data_runs(file: &File) -> Vec<(u64, u64)> {
+        let fd = file.as_raw_fd();
+        let len = i64::try_from(file.metadata().unwrap().len()).unwrap();
+        let mut runs = Vec::new();
+        let mut pos = 0;
+        while pos < len {
+            // SAFETY: lseek on an open descriptor touches no memory.
+            let data = unsafe { libc::lseek(fd, pos, libc::SEEK_DATA) };
+            if data < 0 {
+                let err = io::Error::last_os_error();
+                // ENXIO: no data at or after `pos`.
+                assert_eq!(
+                    err.raw_os_error(),
+                    Some(libc::ENXIO),
+                    "SEEK_DATA at {pos}: {err}"
+                );
+                break;
+            }
+            // SAFETY: lseek on an open descriptor touches no memory.
+            let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+            assert!(
+                hole > data,
+                "SEEK_HOLE at {data}: {}",
+                io::Error::last_os_error()
+            );
+            runs.push((
+                u64::try_from(data).unwrap(),
+                u64::try_from(hole - data).unwrap(),
+            ));
+            pos = hole;
+        }
+        runs
+    }
 
     /// Converts a vec of GuestRegionMmap into a GuestMemoryMmap using GuestRegionMmapExt
     pub fn into_region_ext(regions: Vec<GuestRegionMmap>) -> GuestMemoryMmap {
@@ -1888,7 +2266,7 @@ mod tests {
     use crate::snapshot::Snapshot;
     use crate::test_utils::single_region_mem;
     use crate::utils::mib_to_bytes;
-    use crate::vstate::memory::test_utils::into_region_ext;
+    use crate::vstate::memory::test_utils::{data_runs, into_region_ext};
 
     #[test]
     fn test_anonymous() {
@@ -2088,7 +2466,9 @@ mod tests {
             guest_memory.write(&vec![value; size], addr).unwrap();
         }
         let mut memory_file = TempFile::new().unwrap().into_file();
-        guest_memory.dump(&mut memory_file).unwrap();
+        guest_memory
+            .dump(&mut memory_file, ZeroPages::Write)
+            .unwrap();
         let mut dumped = Vec::new();
         memory_file.rewind().unwrap();
         memory_file.read_to_end(&mut dumped).unwrap();
@@ -2355,7 +2735,9 @@ mod tests {
 
         // dump the full memory.
         let mut memory_file = TempFile::new().unwrap().into_file();
-        guest_memory.dump(&mut memory_file).unwrap();
+        guest_memory
+            .dump(&mut memory_file, ZeroPages::Write)
+            .unwrap();
 
         let restored_guest_memory = into_region_ext(
             snapshot_file(
@@ -2378,6 +2760,444 @@ mod tests {
             .read(restored_region.as_mut_slice(), region_2_address)
             .unwrap();
         assert_eq!(second_region, restored_region);
+    }
+
+    #[test]
+    fn test_hole_granule_is_fcvm_working_set_granule() {
+        // fcvm's working_set::GRANULE (src/uffd/working_set.rs in fcvm) is 4096, and fcvm reads
+        // each hole in a memory file as whole granules of that size. Change both or neither.
+        assert_eq!(HOLE_GRANULE, 4096);
+    }
+
+    #[test]
+    fn test_dump_leaves_zero_pages_as_holes() {
+        let page = HOLE_GRANULE;
+        // Region 1 holds [ones, zero, zero, a page whose last byte is two, zero]. It ends in a
+        // zero page, so region 2 lands at the right file offset only if that page is seeked
+        // over. Region 2 holds [zero, threes, threes, zero] and ends the file in a zero page.
+        // The zero pages are never written, so AbsentPages::Skip leaves them out unread where
+        // the host page is no larger than a granule.
+        let regions = [
+            (GuestAddress(0), page * 5),
+            (GuestAddress(page as u64 * 8), page * 4),
+        ];
+        for absent_pages in [AbsentPages::Read, AbsentPages::Skip] {
+            let guest_memory =
+                into_region_ext(anonymous(&regions, false, HugePageConfig::None).unwrap());
+            guest_memory
+                .write_slice(&vec![1u8; page], GuestAddress(0))
+                .unwrap();
+            guest_memory
+                .write_slice(&[2u8], GuestAddress(page as u64 * 4 - 1))
+                .unwrap();
+            guest_memory
+                .write_slice(&vec![3u8; page * 2], GuestAddress(page as u64 * 9))
+                .unwrap();
+            let memory_state = guest_memory.describe();
+
+            // The file starts empty and at its full length, as snapshot_memory_to_path leaves it.
+            let total = page as u64 * 9;
+            let mut memory_file = TempFile::new().unwrap().into_file();
+            memory_file.set_len(total).unwrap();
+            guest_memory
+                .dump(&mut memory_file, ZeroPages::Hole(absent_pages))
+                .unwrap();
+            assert_eq!(
+                memory_file.stream_position().unwrap(),
+                total,
+                "{absent_pages:?}"
+            );
+
+            // Only the pages holding a non-zero byte are data.
+            let page = page as u64;
+            assert_eq!(
+                data_runs(&memory_file),
+                vec![(0, page), (page * 3, page), (page * 6, page * 2)],
+                "{absent_pages:?}"
+            );
+
+            // Every byte reads back as it was in guest memory.
+            let restored_guest_memory = into_region_ext(
+                snapshot_file(
+                    memory_file,
+                    &memory_state.regions(),
+                    false,
+                    HugePageConfig::None,
+                )
+                .unwrap(),
+            );
+            for (address, size) in regions {
+                let mut expected = vec![0u8; size];
+                guest_memory.read_slice(&mut expected, address).unwrap();
+                let mut restored = vec![0xAAu8; size];
+                restored_guest_memory
+                    .read_slice(&mut restored, address)
+                    .unwrap();
+                assert_eq!(
+                    expected, restored,
+                    "{absent_pages:?}: region at {address:?}"
+                );
+            }
+        }
+    }
+
+    // Dumps guest memory mapped from a file that was then cut to half its length, as when the
+    // file a guest was restored from is truncated under it. Reading the second half raises
+    // SIGBUS. Returns the error the dump reports.
+    fn dump_memory_of_truncated_file(zero_pages: ZeroPages) -> MemoryError {
+        let size = host_page_size() * 8;
+        let mut backing = TempFile::new().unwrap().into_file();
+        backing.write_all(&vec![0x11u8; size]).unwrap();
+        let truncate = backing.try_clone().unwrap();
+        let guest_memory = into_region_ext(
+            snapshot_file(
+                backing,
+                &[(GuestAddress(0), size)],
+                false,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        truncate.set_len(size as u64 / 2).unwrap();
+
+        let mut memory_file = TempFile::new().unwrap().into_file();
+        memory_file.set_len(size as u64).unwrap();
+        guest_memory.dump(&mut memory_file, zero_pages).unwrap_err()
+    }
+
+    #[test]
+    fn test_dump_write_reports_unreadable_guest_memory() {
+        let err = dump_memory_of_truncated_file(ZeroPages::Write);
+        assert!(err.to_string().starts_with("Cannot dump memory: "), "{err}");
+    }
+
+    #[test]
+    fn test_dump_hole_reports_unreadable_guest_memory() {
+        let err = dump_memory_of_truncated_file(ZeroPages::Hole(AbsentPages::Read));
+        assert!(err.to_string().starts_with("Cannot dump memory: "), "{err}");
+    }
+
+    // A writer whose every write fails, as on a full disk. Seeks go to a file.
+    struct FailingWriter(File);
+
+    impl WriteVolatile for FailingWriter {
+        fn write_volatile<B: BitmapSlice>(
+            &mut self,
+            _buf: &VolatileSlice<B>,
+        ) -> Result<usize, vm_memory::VolatileMemoryError> {
+            Err(vm_memory::VolatileMemoryError::IOError(
+                io::Error::from_raw_os_error(libc::ENOSPC),
+            ))
+        }
+    }
+
+    impl Seek for FailingWriter {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.0.seek(pos)
+        }
+    }
+
+    #[test]
+    fn test_dump_reports_a_failed_write_in_both_modes() {
+        let page = HOLE_GRANULE;
+        // Guest memory of two pages, one of them all zero. With the zero page second, a Hole dump
+        // writes the first page when its scan reaches the zero page; with the zero page first, it
+        // writes the second page at the end of the chunk. A Write dump writes the whole slot.
+        for zero_page in [1, 0] {
+            for zero_pages in [
+                ZeroPages::Write,
+                ZeroPages::Hole(AbsentPages::Read),
+                ZeroPages::Hole(AbsentPages::Skip),
+            ] {
+                let guest_memory = into_region_ext(
+                    anonymous(&[(GuestAddress(0), page * 2)], false, HugePageConfig::None).unwrap(),
+                );
+                let data_page = 1 - zero_page;
+                guest_memory
+                    .write_slice(&vec![0x5Au8; page], GuestAddress((data_page * page) as u64))
+                    .unwrap();
+
+                let mut writer = FailingWriter(TempFile::new().unwrap().into_file());
+                let err = guest_memory.dump(&mut writer, zero_pages).unwrap_err();
+                assert!(
+                    err.to_string().starts_with("Cannot dump memory: "),
+                    "{zero_pages:?}, zero page {zero_page}: {err}"
+                );
+            }
+        }
+    }
+
+    // A writer whose every seek fails. Writes go to a file.
+    struct FailingSeeker(File);
+
+    impl WriteVolatile for FailingSeeker {
+        fn write_volatile<B: BitmapSlice>(
+            &mut self,
+            buf: &VolatileSlice<B>,
+        ) -> Result<usize, vm_memory::VolatileMemoryError> {
+            self.0.write_volatile(buf)
+        }
+    }
+
+    impl Seek for FailingSeeker {
+        fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+            Err(io::Error::from_raw_os_error(libc::ESPIPE))
+        }
+    }
+
+    #[test]
+    fn test_dumps_return_a_failed_seek() {
+        let page_size = host_page_size();
+        let len = 2 * page_size;
+        let memory = |plugged: bool| {
+            let region = anonymous(&[(GuestAddress(0), len)], true, HugePageConfig::None).unwrap();
+            let state = GuestMemoryRegionState {
+                base_address: 0,
+                size: len,
+                region_type: GuestRegionType::Hotpluggable,
+                plugged: vec![plugged],
+            };
+            let region =
+                GuestRegionMmapExt::from_state(region.into_iter().next().unwrap(), &state, 0)
+                    .unwrap();
+            GuestMemoryMmap::from_regions(vec![region]).unwrap()
+        };
+
+        // A Full dump seeks over an unplugged slot.
+        for zero_pages in [ZeroPages::Write, ZeroPages::Hole(AbsentPages::Skip)] {
+            let mut writer = FailingSeeker(TempFile::new().unwrap().into_file());
+            let err = memory(false).dump(&mut writer, zero_pages).unwrap_err();
+            assert!(
+                matches!(err, MemoryError::SeekError(_)),
+                "{zero_pages:?}: {err}"
+            );
+        }
+
+        // A Diff dump seeks over the clean second page, the last of its slot.
+        let mut writer = FailingSeeker(TempFile::new().unwrap().into_file());
+        let err = memory(true)
+            .dump_dirty(&mut writer, &vec![vec![0b01]])
+            .unwrap_err();
+        assert!(matches!(err, MemoryError::SeekError(_)), "{err}");
+    }
+
+    #[test]
+    fn test_is_zero_reads_unaligned_head_and_tail_bytes() {
+        // u64 storage starts the buffer on an 8-byte boundary, so a slice from byte 3 has a
+        // 5-byte head before its first aligned word. 3 + 4091 is not a multiple of 8, so the
+        // slice also ends in a tail after its last aligned word.
+        let (start, len) = (3, 4091);
+        let mut storage = vec![0u64; 4096 / 8];
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(storage.as_mut_ptr().cast::<u8>(), storage.len() * 8)
+        };
+        let head = bytes[start..].as_ptr().align_offset(8);
+        assert!(head > 0 && (len - head) % 8 > 0, "head {head}");
+
+        assert!(is_zero(&VolatileSlice::from(
+            &mut bytes[start..start + len]
+        )));
+
+        bytes[start] = 1;
+        assert!(
+            !is_zero(&VolatileSlice::from(&mut bytes[start..start + len])),
+            "non-zero first byte, in the head"
+        );
+        bytes[start] = 0;
+
+        bytes[start + len - 1] = 1;
+        assert!(
+            !is_zero(&VolatileSlice::from(&mut bytes[start..start + len])),
+            "non-zero last byte, in the tail"
+        );
+    }
+
+    // A file writer that records the length of every write a dump asks for.
+    struct RecordingWriter {
+        file: File,
+        writes: Vec<usize>,
+    }
+
+    impl WriteVolatile for RecordingWriter {
+        fn write_volatile<B: BitmapSlice>(
+            &mut self,
+            buf: &VolatileSlice<B>,
+        ) -> Result<usize, vm_memory::VolatileMemoryError> {
+            self.writes.push(buf.len());
+            self.file.write_volatile(buf)
+        }
+    }
+
+    impl Seek for RecordingWriter {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.file.seek(pos)
+        }
+    }
+
+    #[test]
+    fn test_dump_hole_writes_at_most_one_chunk_at_a_time() {
+        let (page, chunk) = (HOLE_GRANULE, DUMP_CHUNK);
+        // [zero page, a non-zero run longer than a chunk that crosses the first chunk boundary,
+        // a zero run that crosses the second, one non-zero page, one trailing zero page]. Only
+        // the non-zero runs are written to guest memory, so with AbsentPages::Skip the zero runs
+        // are scanned where a transparent huge page backs them and left out unread elsewhere.
+        let size = chunk * 2 + page * 3;
+        let mut contents = vec![0u8; size];
+        contents[page..chunk + page * 2].fill(0x5A);
+        contents[chunk * 2 + page..chunk * 2 + page * 2].fill(0x5A);
+        for absent_pages in [AbsentPages::Read, AbsentPages::Skip] {
+            let guest_memory = into_region_ext(
+                anonymous(&[(GuestAddress(0), size)], false, HugePageConfig::None).unwrap(),
+            );
+            guest_memory
+                .write_slice(&contents[page..chunk + page * 2], GuestAddress(page as u64))
+                .unwrap();
+            guest_memory
+                .write_slice(
+                    &contents[chunk * 2 + page..chunk * 2 + page * 2],
+                    GuestAddress((chunk * 2 + page) as u64),
+                )
+                .unwrap();
+
+            let mut writer = RecordingWriter {
+                file: TempFile::new().unwrap().into_file(),
+                writes: Vec::new(),
+            };
+            writer.file.set_len(size as u64).unwrap();
+            guest_memory
+                .dump(&mut writer, ZeroPages::Hole(absent_pages))
+                .unwrap();
+
+            // A long run is written in pieces of at most a chunk, each soon after it is scanned.
+            assert!(
+                writer.writes.iter().all(|&len| len <= chunk),
+                "{absent_pages:?}: writes {:?}",
+                writer.writes
+            );
+            assert_eq!(
+                writer.file.stream_position().unwrap(),
+                size as u64,
+                "{absent_pages:?}"
+            );
+            let (page, chunk) = (page as u64, chunk as u64);
+            assert_eq!(
+                data_runs(&writer.file),
+                vec![(page, chunk + page), (chunk * 2 + page, page)],
+                "{absent_pages:?}"
+            );
+            let mut written = Vec::new();
+            writer.file.rewind().unwrap();
+            writer.file.read_to_end(&mut written).unwrap();
+            assert!(
+                written == contents,
+                "{absent_pages:?}: the file differs from guest memory"
+            );
+        }
+    }
+
+    /// Whether each host page of the `len` bytes of guest memory at `addr` is resident, by
+    /// mincore(2). Asking does not fault the pages in.
+    fn resident(mem: &GuestMemoryMmap, addr: GuestAddress, len: usize) -> Vec<bool> {
+        let page_size = host_page_size();
+        let host = mem.get_host_address(addr).unwrap();
+        let mut pages = vec![0u8; len / page_size];
+        let ret = unsafe { libc::mincore(host.cast(), len, pages.as_mut_ptr()) };
+        assert_eq!(ret, 0, "mincore: {}", io::Error::last_os_error());
+        pages.iter().map(|page| page & 1 != 0).collect()
+    }
+
+    #[test]
+    fn test_dump_skipping_absent_pages_leaves_them_unmapped() {
+        // AbsentPages::Skip must neither page in nor read a page of anonymous memory that has no
+        // page table entry: either would map the zero page there. Four host pages cannot hold a
+        // transparent huge page, so the write to the second maps that page alone.
+        let page_size = host_page_size();
+        let len = 4 * page_size;
+        let guest_memory = into_region_ext(
+            anonymous(&[(GuestAddress(0), len)], false, HugePageConfig::None).unwrap(),
+        );
+        guest_memory
+            .write_slice(&vec![0x77u8; page_size], GuestAddress(page_size as u64))
+            .unwrap();
+        assert_eq!(
+            resident(&guest_memory, GuestAddress(0), len),
+            [false, true, false, false],
+            "test setup"
+        );
+
+        let mut memory_file = TempFile::new().unwrap().into_file();
+        memory_file.set_len(len as u64).unwrap();
+        guest_memory
+            .dump(&mut memory_file, ZeroPages::Hole(AbsentPages::Skip))
+            .unwrap();
+
+        assert_eq!(
+            resident(&guest_memory, GuestAddress(0), len),
+            [false, true, false, false],
+            "the dump mapped pages that had no page table entry"
+        );
+        let mut expected = vec![0u8; len];
+        expected[page_size..2 * page_size].fill(0x77);
+        let mut dumped = Vec::new();
+        memory_file.rewind().unwrap();
+        memory_file.read_to_end(&mut dumped).unwrap();
+        assert!(dumped == expected, "the file differs from guest memory");
+
+        // AbsentPages::Read pages every page in to scan it.
+        memory_file.rewind().unwrap();
+        guest_memory
+            .dump(&mut memory_file, ZeroPages::Hole(AbsentPages::Read))
+            .unwrap();
+        assert_eq!(
+            resident(&guest_memory, GuestAddress(0), len),
+            [true; 4],
+            "AbsentPages::Read"
+        );
+    }
+
+    #[test]
+    fn test_dump_skipping_absent_pages_reads_file_backed_regions() {
+        // A page of a file-backed region that the VMM never touched reads as the file's data, so
+        // AbsentPages::Skip must not leave it as a hole. The file's pages are dropped from the
+        // page cache first, so neither pagemap nor mincore reports them, and only the region's
+        // file backing keeps the dump from skipping them.
+        let page_size = host_page_size();
+        let region_size = page_size * 4;
+        let mut source = TempFile::new().unwrap().into_file();
+        source.write_all(&vec![0x77u8; region_size]).unwrap();
+        source.sync_all().unwrap();
+        let ret =
+            unsafe { libc::posix_fadvise(source.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        assert_eq!(ret, 0);
+        let guest_memory = into_region_ext(
+            snapshot_file(
+                source,
+                &[(GuestAddress(0), region_size)],
+                false,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            resident(&guest_memory, GuestAddress(0), region_size),
+            [false; 4],
+            "test setup: the file's pages must not be in the page cache; is the temporary \
+             directory on tmpfs?"
+        );
+
+        let mut memory_file = TempFile::new().unwrap().into_file();
+        guest_memory
+            .dump(&mut memory_file, ZeroPages::Hole(AbsentPages::Skip))
+            .unwrap();
+
+        let mut dumped = Vec::new();
+        memory_file.rewind().unwrap();
+        memory_file.read_to_end(&mut dumped).unwrap();
+        assert!(
+            dumped == vec![0x77u8; region_size],
+            "the dump left {} of {region_size} bytes of the file-backed region as holes",
+            region_size - dumped.len().min(region_size)
+        );
     }
 
     #[test]
@@ -2544,7 +3364,7 @@ mod tests {
             .unwrap(),
         );
         let mut file = TempFile::new().unwrap().into_file();
-        guest_memory.dump(&mut file).unwrap();
+        guest_memory.dump(&mut file, ZeroPages::Write).unwrap();
         let diff = |file: &mut File| {
             let dirty_bitmap = guest_memory.take_dirty();
             file.rewind().unwrap();
