@@ -130,6 +130,14 @@ and this project adheres to
 
 ### Fixed
 
+- [#6486](https://github.com/firecracker-microvm/firecracker/issues/6486): Fixed
+  the interrupt enable and active state of an aarch64 microVM after a snapshot
+  restore. The saved value was written to the GIC registers that clear bits
+  (`GICD_ICENABLER`, `GICD_ICACTIVER`, `GICR_ICENABLER0`, `GICR_ICACTIVER0`),
+  which cleared nothing the restored state was missing, so every SGI the guest
+  had disabled came back enabled. The complement of the saved value is now
+  written to those registers.
+
 - [#6302](https://github.com/firecracker-microvm/firecracker/issues/6302): Fixed
   AMX tile state being lost after a snapshot restore. The IA32_XFD and
   IA32_XFD_ERR MSRs are now saved in snapshots. Without them a restored guest
