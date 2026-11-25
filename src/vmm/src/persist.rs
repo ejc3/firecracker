@@ -223,6 +223,21 @@ pub enum CreateSnapshotError {
 /// Snapshot version
 pub const SNAPSHOT_VERSION: Version = Version::new(13, 0, 0);
 
+/// The layout of the state this build saves and loads, in the numbering of fcvm's patch chain
+/// (ejc3/firecracker). A snapshot file ends with it (see [`crate::snapshot`]), and a load
+/// refuses a file that ends with another number or with none before it decodes anything.
+///
+/// [`SNAPSHOT_VERSION`] cannot do this for the chain. It is upstream's number, so a build of
+/// the chain that saves more state than upstream would share a version with builds that lay
+/// the state out differently, and a load decodes the whole file before it looks at the
+/// version, so what it reports for a file of another layout depends on how the decode fails.
+///
+/// Give it a number no earlier build of the chain used: when the chain moves to a new
+/// upstream base, and when a commit of the chain changes a type that is saved.
+/// `test_the_layout_was_chosen_for_this_snapshot_version` fails when upstream's version moves
+/// under it.
+pub const FCVM_SNAPSHOT_LAYOUT: u32 = 1;
+
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
     vmm: &mut Vmm,

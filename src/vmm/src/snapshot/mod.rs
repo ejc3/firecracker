@@ -32,7 +32,7 @@ use crc64::crc64;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::persist::SNAPSHOT_VERSION;
+use crate::persist::{FCVM_SNAPSHOT_LAYOUT, SNAPSHOT_VERSION};
 use crate::snapshot::crc::CRC64Writer;
 pub use crate::snapshot::persist::Persist;
 use crate::utils::Version;
@@ -48,6 +48,43 @@ const SNAPSHOT_MAGIC_ID: u64 = 0x0710_1984_AAAA_0000u64;
 /// This limit is 10MB which should be sufficient for any legitimate snapshot.
 const SNAPSHOT_DESERIALIZATION_BYTES_LIMIT: usize = 10_000_000;
 
+/// The first eight bytes of the layout mark that ends a snapshot file: "FCVMSNAP".
+const LAYOUT_MARK_MAGIC: [u8; 8] = *b"FCVMSNAP";
+/// Length of the layout mark: [`LAYOUT_MARK_MAGIC`], the layout number, and the layout number
+/// with every bit inverted, both little-endian.
+const LAYOUT_MARK_LEN: usize = 16;
+
+/// The layout mark of a snapshot whose state has layout `layout`.
+fn layout_mark(layout: u32) -> [u8; LAYOUT_MARK_LEN] {
+    let mut mark = [0; LAYOUT_MARK_LEN];
+    mark[..8].copy_from_slice(&LAYOUT_MARK_MAGIC);
+    mark[8..12].copy_from_slice(&layout.to_le_bytes());
+    mark[12..].copy_from_slice(&(!layout).to_le_bytes());
+    mark
+}
+
+/// Checks that `buf`, the contents of a snapshot file, ends with the mark of the layout this
+/// build reads ([`FCVM_SNAPSHOT_LAYOUT`]) and returns what precedes it: the serialized
+/// snapshot and its CRC.
+///
+/// The mark is checked before anything is decoded, and it is the last thing in the file, after
+/// the CRC. A file without one was written by a build that did not write marks, whatever
+/// version it holds, and a build that does not know the mark takes the mark's last eight
+/// bytes for the CRC, which then cannot match.
+fn strip_layout_mark(buf: &[u8]) -> Result<&[u8], SnapshotError> {
+    let Some((snapshot, mark)) = buf.split_last_chunk::<LAYOUT_MARK_LEN>() else {
+        return Err(SnapshotError::NoLayoutMark);
+    };
+    let layout = u32::from_le_bytes(mark[8..12].try_into().unwrap());
+    if *mark != layout_mark(layout) {
+        return Err(SnapshotError::NoLayoutMark);
+    }
+    if layout != FCVM_SNAPSHOT_LAYOUT {
+        return Err(SnapshotError::InvalidLayout(layout, FCVM_SNAPSHOT_LAYOUT));
+    }
+    Ok(snapshot)
+}
+
 /// Error definitions for the Snapshot API.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum SnapshotError {
@@ -55,6 +92,10 @@ pub enum SnapshotError {
     Crc64,
     /// Invalid data version: {0}
     InvalidFormatVersion(Version),
+    /// Invalid data version: the snapshot has no layout mark, so another Firecracker build wrote it
+    NoLayoutMark,
+    /// Invalid data version: the snapshot's state has layout {0} and this build reads layout {1}
+    InvalidLayout(u32, u32),
     /// Magic value does not match arch: {0}
     InvalidMagic(u64),
     /// An error occurred during bitcode serialization: {0}
@@ -94,7 +135,7 @@ pub fn get_format_version<R: Read>(reader: &mut R) -> Result<Version, SnapshotEr
         ));
     }
 
-    format_version_from_buf(&buf)
+    format_version_from_buf(strip_layout_mark(&buf)?)
 }
 
 /// Returns the version of the snapshot in `buf`, the contents of a snapshot file including its
@@ -196,6 +237,8 @@ impl<Data: DeserializeOwned> Snapshot<Data> {
             ));
         }
 
+        let buf = strip_layout_mark(&buf)?;
+
         // The last 8 bytes are the CRC, so we need to separate them
         if buf.len() < 8 {
             return Err(SnapshotError::Io(std::io::Error::new(
@@ -207,7 +250,7 @@ impl<Data: DeserializeOwned> Snapshot<Data> {
         let (data_buf, _crc_buf) = buf.split_at(buf.len() - 8);
         let snapshot = Self::load_without_crc_check(data_buf)?;
 
-        let computed_checksum = crc64(0, buf.as_slice());
+        let computed_checksum = crc64(0, buf);
         // When we read the entire file, we also read the checksum into the buffer. The CRC has the
         // property that crc(0, buf.as_slice()) == 0 iff the last 8 bytes of buf are the checksum
         // of all the preceding bytes, and this is the property we are using here.
@@ -220,7 +263,7 @@ impl<Data: DeserializeOwned> Snapshot<Data> {
 
 impl<Data: Serialize> Snapshot<Data> {
     /// Saves `self` to the given [`Write`] instance, computing the CRC of the written data,
-    /// and then writing the CRC into the `Write` instance, too.
+    /// and then writing the CRC into the `Write` instance, too, followed by the layout mark.
     pub fn save<W: Write>(&self, writer: &mut W) -> Result<(), SnapshotError> {
         let mut crc_writer = CRC64Writer::new(writer);
         serialize(self, &mut crc_writer)?;
@@ -228,6 +271,10 @@ impl<Data: Serialize> Snapshot<Data> {
         crc_writer
             .writer
             .write_all(&crc_writer.checksum().to_le_bytes())
+            .map_err(SnapshotError::Io)?;
+        crc_writer
+            .writer
+            .write_all(&layout_mark(FCVM_SNAPSHOT_LAYOUT))
             .map_err(SnapshotError::Io)
     }
 }
@@ -302,17 +349,96 @@ mod tests {
         let mut valid_data = Vec::new();
         snapshot.save(&mut valid_data).unwrap();
 
-        // Corrupt the CRC by changing the last 8 bytes (where CRC is stored)
-        if valid_data.len() >= 8 {
-            for i in (valid_data.len() - 8)..valid_data.len() {
-                valid_data[i] ^= 0xFF; // Corrupt the CRC by flipping bits
-            }
+        // Corrupt the CRC by changing the 8 bytes before the layout mark (where CRC is stored)
+        let crc_end = valid_data.len() - LAYOUT_MARK_LEN;
+        for byte in &mut valid_data[crc_end - 8..crc_end] {
+            *byte ^= 0xFF; // Corrupt the CRC by flipping bits
         }
 
         assert!(matches!(
             Snapshot::<()>::load(&mut std::io::Cursor::new(&valid_data)),
             Err(SnapshotError::Crc64)
         ));
+    }
+
+    /// A file with no layout mark, which is every file an upstream build or an earlier build
+    /// of the chain wrote, is refused by the mark before its bytes are decoded: the state here
+    /// is one this build would load.
+    #[test]
+    fn test_a_snapshot_without_a_layout_mark_is_refused() {
+        let mut data = Vec::new();
+        Snapshot::new(MicrovmState::default())
+            .save(&mut data)
+            .unwrap();
+        data.truncate(data.len() - LAYOUT_MARK_LEN);
+
+        let err = Snapshot::<MicrovmState>::load(&mut data.as_slice()).unwrap_err();
+        assert!(matches!(err, SnapshotError::NoLayoutMark), "{err}");
+        assert!(err.to_string().starts_with("Invalid data version"), "{err}");
+        assert!(matches!(
+            get_format_version(&mut data.as_slice()),
+            Err(SnapshotError::NoLayoutMark)
+        ));
+        // Shorter than a mark, and empty.
+        for len in [LAYOUT_MARK_LEN - 1, 0] {
+            assert!(matches!(
+                Snapshot::<MicrovmState>::load(&mut &data[..len]),
+                Err(SnapshotError::NoLayoutMark)
+            ));
+        }
+    }
+
+    /// A file of another layout is refused by its number, with state this build would load.
+    #[test]
+    fn test_a_snapshot_of_another_layout_is_refused() {
+        let mut data = Vec::new();
+        Snapshot::new(MicrovmState::default())
+            .save(&mut data)
+            .unwrap();
+        let mark_at = data.len() - LAYOUT_MARK_LEN;
+        let other = FCVM_SNAPSHOT_LAYOUT + 1;
+        data[mark_at..].copy_from_slice(&layout_mark(other));
+
+        let err = Snapshot::<MicrovmState>::load(&mut data.as_slice()).unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::InvalidLayout(found, read)
+                if found == other && read == FCVM_SNAPSHOT_LAYOUT),
+            "{err}"
+        );
+        assert!(err.to_string().starts_with("Invalid data version"), "{err}");
+
+        // A mark whose two copies of the number disagree is no mark.
+        data[mark_at + 12] ^= 1;
+        assert!(matches!(
+            Snapshot::<MicrovmState>::load(&mut data.as_slice()),
+            Err(SnapshotError::NoLayoutMark)
+        ));
+    }
+
+    /// A build that does not know the mark (upstream, and every build of the chain before the
+    /// mark) reads the last eight bytes of the file as the CRC of everything before them.
+    /// Those are the mark's, so that check cannot pass: such a build refuses the file even if
+    /// its decode of the bytes succeeds.
+    #[test]
+    fn test_a_reader_without_the_mark_fails_the_crc_of_a_marked_snapshot() {
+        let mut data = Vec::new();
+        Snapshot::new(MicrovmState::default())
+            .save(&mut data)
+            .unwrap();
+        assert_ne!(crc64(0, &data), 0);
+        // What such a build needs to see to accept the file.
+        assert_eq!(crc64(0, &data[..data.len() - LAYOUT_MARK_LEN]), 0);
+    }
+
+    /// The layout number was chosen for this snapshot version. When upstream moves the
+    /// version the saved state changed under the chain: give FCVM_SNAPSHOT_LAYOUT a number no
+    /// earlier build used, and then update the version here.
+    #[test]
+    fn test_the_layout_was_chosen_for_this_snapshot_version() {
+        assert_eq!(
+            (SNAPSHOT_VERSION, FCVM_SNAPSHOT_LAYOUT),
+            (Version::new(13, 0, 0), 1)
+        );
     }
 
     #[test]
