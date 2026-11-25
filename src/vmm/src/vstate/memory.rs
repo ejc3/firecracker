@@ -935,6 +935,58 @@ impl GuestMemoryRegion for GuestRegionMmapExt {
     }
 }
 
+/// The filesystem holding a guest memory backing file, as reported by `fstatfs(2)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackingFileSystem {
+    // The `statfs` field types differ between libc targets, so both are widened to i128.
+    magic: i128,
+    block_size: i128,
+}
+
+impl BackingFileSystem {
+    /// Reads the filesystem type and block size of `file`.
+    pub fn of(file: &File) -> io::Result<Self> {
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: `file` owns a valid descriptor and `stat` is writable storage for one `statfs`.
+        if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a successful `fstatfs` initialized `stat`.
+        let stat = unsafe { stat.assume_init() };
+        Ok(Self {
+            magic: i128::from(stat.f_type),
+            block_size: i128::from(stat.f_bsize),
+        })
+    }
+
+    /// Returns the huge page size in bytes when the file is on hugetlbfs, whose block size is its
+    /// page size, and `None` for any other filesystem.
+    pub fn hugetlbfs_page_size(&self) -> Option<u64> {
+        if self.magic == i128::from(libc::HUGETLBFS_MAGIC) {
+            u64::try_from(self.block_size).ok().filter(|size| *size > 0)
+        } else {
+            None
+        }
+    }
+
+    /// Returns whether the file is on tmpfs, where an ordinary memfd lives.
+    pub fn is_shmem(&self) -> bool {
+        self.magic == i128::from(libc::TMPFS_MAGIC)
+    }
+}
+
+impl std::fmt::Display for BackingFileSystem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(page_size) = self.hugetlbfs_page_size() {
+            write!(f, "hugetlbfs with {page_size}-byte pages")
+        } else if self.is_shmem() {
+            write!(f, "shmem")
+        } else {
+            write!(f, "a filesystem with magic {:#x}", self.magic)
+        }
+    }
+}
+
 /// Creates a `Vec` of anonymous `GuestRegionMmap` with the given configuration.
 pub fn memory_regions_from_ranges(
     regions: &[(GuestAddress, usize)],
@@ -948,7 +1000,7 @@ pub fn memory_regions_from_ranges(
             memory_region_from_range(
                 start,
                 size,
-                mmap_flags,
+                libc::MAP_NORESERVE | mmap_flags,
                 None,
                 track_dirty_pages,
                 madvise_flags,
@@ -960,6 +1012,24 @@ pub fn memory_regions_from_ranges(
 /// Creates a `Vec` of `GuestRegionMmap` mapped from a file: the first region at `file_offset`,
 /// each following one right after the previous.
 pub fn memory_regions_from_ranges_file_backed(
+    regions: &[(GuestAddress, usize)],
+    mmap_flags: libc::c_int,
+    file_offset: FileOffset,
+    track_dirty_pages: bool,
+    madvise_flags: libc::c_int,
+) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+    map_file_ranges(
+        regions,
+        libc::MAP_NORESERVE | mmap_flags,
+        file_offset,
+        track_dirty_pages,
+        madvise_flags,
+    )
+}
+
+/// [`memory_regions_from_ranges_file_backed`] with `mmap_flags` passed to `mmap(2)` as they
+/// are, so the caller decides whether the mapping is `MAP_NORESERVE`.
+fn map_file_ranges(
     regions: &[(GuestAddress, usize)],
     mmap_flags: libc::c_int,
     file_offset: FileOffset,
@@ -1002,7 +1072,8 @@ pub fn memory_regions_from_ranges_file_backed(
         .collect()
 }
 
-/// Creates a single `GuestRegionMmap`, mapped from `file_offset` if given.
+/// Creates a single `GuestRegionMmap`, mapped from `file_offset` if given. `mmap_flags` are
+/// passed to `mmap(2)` as they are.
 fn memory_region_from_range(
     start: GuestAddress,
     size: usize,
@@ -1015,7 +1086,7 @@ fn memory_region_from_range(
         start,
         size,
         libc::PROT_READ | libc::PROT_WRITE,
-        libc::MAP_NORESERVE | mmap_flags,
+        mmap_flags,
         file_offset,
         track_dirty_pages,
     )?;
@@ -1127,6 +1198,36 @@ pub fn snapshot_file(
     memory_regions_from_ranges_file_backed(
         regions,
         libc::MAP_PRIVATE,
+        FileOffset::new(file, 0),
+        track_dirty_pages,
+        huge_pages.madvise_flags(),
+    )
+}
+
+/// Maps the backing file of a UFFD minor-fault handler, which holds the guest memory of a
+/// snapshot laid out like its memory file: every region `MAP_PRIVATE`, one after the other
+/// from offset 0. A clean page stays shared with every other mapping of the file, and a guest
+/// write copies it.
+///
+/// A mapping of shmem is `MAP_NORESERVE`, like every other guest memory mapping: its copies
+/// are ordinary anonymous memory. A mapping of hugetlbfs is not, so the kernel reserves a
+/// huge page for the copy of each one it maps: a pool too small for that fails this call with
+/// `ENOMEM`, where an unreserved mapping would deliver `SIGBUS` to a running guest at the
+/// write the pool cannot serve.
+pub fn uffd_minor_backing(
+    file: File,
+    regions: &[(GuestAddress, usize)],
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+    let reservation = if huge_pages.is_hugetlbfs() {
+        0
+    } else {
+        libc::MAP_NORESERVE
+    };
+    map_file_ranges(
+        regions,
+        libc::MAP_PRIVATE | reservation | huge_pages.mmap_flags(),
         FileOffset::new(file, 0),
         track_dirty_pages,
         huge_pages.madvise_flags(),
@@ -1486,6 +1587,92 @@ pub mod test_utils {
                 .collect(),
         )
         .unwrap()
+    }
+
+    /// Creates a memfd of `len` bytes filled with `fill`: on hugetlbfs with 2 MiB pages when
+    /// `hugetlbfs` is set, on shmem otherwise. hugetlbfs has no `write(2)`, so the contents are
+    /// written through a shared mapping, which also claims the huge pages up front.
+    ///
+    /// Panics, naming the host requirement, when the huge page pool cannot back the file.
+    #[cfg(test)]
+    pub(crate) fn test_memfd(len: usize, hugetlbfs: bool, fill: u8) -> File {
+        use std::os::fd::FromRawFd;
+
+        let mut flags = libc::MFD_CLOEXEC;
+        if hugetlbfs {
+            flags |= libc::MFD_HUGETLB | libc::MFD_HUGE_2MB;
+        }
+        // SAFETY: the name is a valid NUL-terminated string.
+        let fd = unsafe { libc::memfd_create(c"firecracker_test_memfd".as_ptr(), flags) };
+        assert!(
+            fd >= 0,
+            "memfd_create failed: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: `fd` was just created and has no other owner.
+        let file = unsafe { File::from_raw_fd(fd) };
+        file.set_len(len as u64).unwrap();
+        // SAFETY: a new shared mapping of the first `len` bytes of `file`, unmapped below.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(
+            addr,
+            libc::MAP_FAILED,
+            "mapping the test memfd failed: {}{}",
+            io::Error::last_os_error(),
+            if hugetlbfs {
+                "; this test needs free 2 MiB huge pages (vm.nr_hugepages)"
+            } else {
+                ""
+            }
+        );
+        // SAFETY: `addr` maps `len` writable bytes that nothing else references.
+        unsafe {
+            std::ptr::write_bytes(addr.cast::<u8>(), fill, len);
+            libc::munmap(addr, len);
+        }
+        file
+    }
+
+    /// Serializes the unit tests that allocate 2 MiB huge pages and checks the pool first, so a
+    /// host needs only the pages of the largest single test, whatever the harness runs at once.
+    ///
+    /// Like `test_guest_region_alignment_and_size_huge`, a test skips when the host cannot
+    /// provide its pages: this prints why and returns `None`.
+    #[cfg(test)]
+    pub(crate) fn lock_free_huge_pages(pages: u64) -> Option<std::sync::MutexGuard<'static, ()>> {
+        static HUGE_PAGE_TESTS: Mutex<()> = Mutex::new(());
+        let guard = HUGE_PAGE_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let counter = |name: &str| {
+            std::fs::read_to_string(format!("/sys/kernel/mm/hugepages/hugepages-2048kB/{name}"))
+                .ok()?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        };
+        // Pages that another mapping has reserved count as free but cannot be claimed.
+        let available = counter("free_hugepages")
+            .zip(counter("resv_hugepages"))
+            .map(|(free, reserved)| free.saturating_sub(reserved));
+        if available.is_some_and(|available| available >= pages) {
+            return Some(guard);
+        }
+        let available = available.map_or_else(|| "none".to_string(), |count| count.to_string());
+        println!(
+            "Skipping: this test needs {pages} free 2 MiB hugepages and {available} are \
+             available; raise vm.nr_hugepages to provide them"
+        );
+        None
     }
 }
 
@@ -3026,6 +3213,125 @@ mod tests {
             }
         }
         None
+    }
+
+    fn vma_has_vm_flag(addr: usize, expected_flag: &str) -> bool {
+        use std::io::BufRead;
+
+        let smaps = std::fs::File::open("/proc/self/smaps").unwrap();
+        let mut in_target_vma = false;
+        for line in std::io::BufReader::new(smaps).lines() {
+            let line = line.unwrap();
+            if let Some(range) = line.split_whitespace().next()
+                && let Some((start, end)) = range.split_once('-')
+                && let (Ok(start), Ok(end)) = (
+                    usize::from_str_radix(start, 16),
+                    usize::from_str_radix(end, 16),
+                )
+            {
+                in_target_vma = addr >= start && addr < end;
+                continue;
+            }
+            if in_target_vma && line.starts_with("VmFlags:") {
+                return line
+                    .split_whitespace()
+                    .skip(1)
+                    .any(|flag| flag == expected_flag);
+            }
+        }
+        panic!("mapping containing address {addr:#x} has no VmFlags entry")
+    }
+
+    #[test]
+    fn test_lock_free_huge_pages_skips_when_the_pool_is_short() {
+        // The skip path must be reachable, or a short pool would fail the huge page tests.
+        assert!(test_utils::lock_free_huge_pages(u64::MAX).is_none());
+    }
+
+    /// The `resv_hugepages` counter of the 2 MiB pool.
+    fn reserved_hugepages_2m() -> u64 {
+        std::fs::read_to_string("/sys/kernel/mm/hugepages/hugepages-2048kB/resv_hugepages")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// A UFFD minor backing on shmem is mapped `MAP_NORESERVE` like other guest memory. One on
+    /// hugetlbfs is not: the kernel reserves a huge page for the copy of each one mapped, so a
+    /// short pool fails the restore instead of a guest write.
+    #[test]
+    fn test_uffd_minor_backing_reserves_copies_on_hugetlbfs_only() {
+        const HUGE_PAGE: usize = 2 << 20;
+        let regions = [(GuestAddress(0), 2 * HUGE_PAGE)];
+
+        let shmem = test_utils::test_memfd(2 * HUGE_PAGE, false, 0x5a);
+        let mapped = uffd_minor_backing(shmem, &regions, false, HugePageConfig::None).unwrap();
+        assert!(vma_has_vm_flag(mapped[0].as_ptr() as usize, "nr"));
+        assert_eq!(mapped[0].flags() & libc::MAP_PRIVATE, libc::MAP_PRIVATE);
+        drop(mapped);
+
+        // Two pages for the file and two reserved for their copies.
+        let Some(_pool) = test_utils::lock_free_huge_pages(4) else {
+            return;
+        };
+        let hugetlbfs = test_utils::test_memfd(2 * HUGE_PAGE, true, 0x5a);
+        let reserved_before = reserved_hugepages_2m();
+        let mapped =
+            uffd_minor_backing(hugetlbfs, &regions, false, HugePageConfig::Hugetlbfs2M).unwrap();
+        assert!(!vma_has_vm_flag(mapped[0].as_ptr() as usize, "nr"));
+        assert_eq!(reserved_hugepages_2m(), reserved_before + 2);
+        // The region knows its backing page size, which is what a discard aligns to.
+        assert_eq!(RawGuestRegionMmap::page_size(mapped[0].flags()), HUGE_PAGE);
+        drop(mapped);
+        assert_eq!(reserved_hugepages_2m(), reserved_before);
+    }
+
+    /// A discard on a UFFD minor restore with 2 MiB pages, a private mapping of a hugetlbfs
+    /// file: the huge pages the range covers whole are replaced with anonymous memory, the
+    /// partly covered ones at either end are zeroed where the range covers them, and the
+    /// handler's file keeps its bytes. The kernel cannot split a hugetlbfs mapping inside a
+    /// huge page, so a replacement that was not aligned to the backing page size would fail
+    /// after `MAP_FIXED` had unmapped the range.
+    #[test]
+    fn test_discard_range_on_a_uffd_minor_hugetlbfs_backing() {
+        const HUGE_PAGE: usize = 2 << 20;
+        // Three pages for the file and three reserved for their copies.
+        let Some(_pool) = test_utils::lock_free_huge_pages(6) else {
+            return;
+        };
+        let file = test_utils::test_memfd(3 * HUGE_PAGE, true, 0x5a);
+        let mem = into_region_ext(
+            uffd_minor_backing(
+                file.try_clone().unwrap(),
+                &[(GuestAddress(0), 3 * HUGE_PAGE)],
+                false,
+                HugePageConfig::Hugetlbfs2M,
+            )
+            .unwrap(),
+        );
+
+        // From the middle of the first huge page to the middle of the third.
+        let start = HUGE_PAGE / 2;
+        let len = 2 * HUGE_PAGE;
+        mem.discard_range(GuestAddress(start as u64), len).unwrap();
+
+        let mut actual = vec![0xff; 3 * HUGE_PAGE];
+        mem.read(&mut actual, GuestAddress(0)).unwrap();
+        let expected = [
+            vec![0x5a; start],
+            vec![0; len],
+            vec![0x5a; 3 * HUGE_PAGE - start - len],
+        ]
+        .concat();
+        assert!(actual == expected, "guest memory after the discard");
+
+        let mut backing = vec![0; 3 * HUGE_PAGE];
+        file.read_exact_at(&mut backing, 0).unwrap();
+        assert!(
+            backing.iter().all(|byte| *byte == 0x5a),
+            "the discard wrote to the handler's backing file"
+        );
     }
 
     #[test]
