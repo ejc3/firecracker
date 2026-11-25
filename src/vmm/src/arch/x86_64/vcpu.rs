@@ -762,6 +762,10 @@ impl KvmVcpu {
         self.fd
             .set_cpuid2(&state.cpuid)
             .map_err(KvmVcpuError::VcpuSetCpuid)?;
+        // KVM_SET_MP_STATE to runnable clears a pending paravirtual kick on Linux 6.15 and
+        // later. It is safe here because the vCPU is new and `KvmVm::kick_runnable_vcpus` runs
+        // after it. Never call it on a vCPU of a VM that has run without giving that vCPU a
+        // kick afterwards.
         self.fd
             .set_mp_state(state.mp_state)
             .map_err(KvmVcpuError::VcpuSetMpState)?;
