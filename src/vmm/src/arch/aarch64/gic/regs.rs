@@ -55,9 +55,16 @@ pub(crate) trait MmioReg {
 
 pub(crate) trait VgicRegEngine {
     type Reg: MmioReg;
-    type RegChunk: Clone + Default;
+    type RegChunk: Clone + Default + std::ops::Not<Output = Self::RegChunk>;
 
     fn group() -> u32;
+
+    /// Whether `reg` is one of the registers whose write clears the bits written as 1
+    /// (GICD_ICENABLERn, GICD_ICACTIVERn and their redistributor forms). A read of one
+    /// returns the state it clears, the same value its set-register reads.
+    fn clears_on_write(_reg: &Self::Reg) -> bool {
+        false
+    }
 
     fn mpidr_mask() -> u64 {
         0
@@ -122,8 +129,18 @@ pub(crate) trait VgicRegEngine {
     where
         Self: Sized,
     {
+        // The saved value of a clear-register is the state to end up with, so what has to be
+        // written is its complement: that clears every bit the saved state does not have.
+        // Writing the saved value itself clears the bits the set-register then sets again,
+        // and leaves set every bit the new VM started with that the saved state has clear.
+        let complement = Self::clears_on_write(reg);
         for (offset, val) in reg.iter::<Self::RegChunk>().zip(&data.chunks) {
-            fd.set_device_attr(&Self::kvm_device_attr(offset, &mut val.clone(), mpidr))
+            let mut val = if complement {
+                !val.clone()
+            } else {
+                val.clone()
+            };
+            fd.set_device_attr(&Self::kvm_device_attr(offset, &mut val, mpidr))
                 .map_err(|err| GicError::DeviceAttribute(err, true, Self::group()))?;
         }
 
