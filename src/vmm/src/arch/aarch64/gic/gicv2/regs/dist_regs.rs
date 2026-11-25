@@ -114,6 +114,12 @@ impl VgicRegEngine for DistRegEngine {
     fn mpidr_mask() -> u64 {
         0
     }
+
+    fn clears_on_write(reg: &Self::Reg) -> bool {
+        [GICD_ICENABLER, GICD_ICACTIVER]
+            .iter()
+            .any(|clear| clear.range() == reg.range())
+    }
 }
 
 pub(crate) fn get_dist_regs(fd: &DeviceFd) -> Result<Vec<GicRegState<u32>>, GicError> {
