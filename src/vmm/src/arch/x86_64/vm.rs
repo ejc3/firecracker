@@ -304,6 +304,10 @@ impl KvmVm {
                 // KVM's answer when it looks the destination up without its map of the local
                 // APICs and finds none.
                 Err(err) if err.errno() == libc::EPERM => false,
+                // Any other error fails the load: a failed restore says so, where a vCPU left
+                // without its kick hangs its guest rarely and with no message. KVM answers
+                // EINVAL without an in-kernel irqchip and for flags this message does not
+                // set, and a VM this VMM built gives it neither.
                 Err(err) => return Err(KvmVmError::KickRestoredVcpu(apic_id, err)),
             };
             if delivered {
@@ -423,7 +427,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, RecvTimeoutError};
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
 
     use kvm_bindings::{
         CpuId, KVM_CLOCK_REALTIME, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER,
@@ -578,11 +582,13 @@ mod tests {
     const GUEST_CODE_ADDR: u64 = 0x10000;
     const GUEST_MEM_SIZE: usize = 0x20000;
     const RFLAGS_IF: u64 = 1 << 9;
+    // The x2APIC enable bit of IA32_APIC_BASE.
+    const APIC_BASE_X2APIC: u64 = 1 << 10;
 
     // How long a vCPU that should run past its HLT gets to do it. The whole of it is spent
     // only when the test fails.
     const RUN_WAIT: Duration = Duration::from_secs(10);
-    // How long a vCPU that should stay blocked is watched.
+    // How long a vCPU that should stay blocked has to be seen blocked, without a break.
     const BLOCK_WAIT: Duration = Duration::from_millis(500);
 
     fn guest_vm() -> KvmVm {
@@ -678,8 +684,32 @@ mod tests {
     // lock word and the HLT. With `async_pf` the vCPU has async page faults on, as a Linux
     // guest's has.
     fn guest_stopped_before_hlt(vcpu_count: u8, async_pf: bool) -> (KvmVm, Vec<KvmVcpu>) {
+        guest_with_vcpu_stopped_before_hlt(vcpu_count, 0, async_pf, false)
+    }
+
+    // The same with the vCPU `waiter` as the one that stops before its HLT. Every vCPU of
+    // the guest is runnable, as the CPUs of a guest that has started them are, and with
+    // `x2apic` every local APIC is in x2APIC mode.
+    fn guest_with_vcpu_stopped_before_hlt(
+        vcpu_count: u8,
+        waiter: usize,
+        async_pf: bool,
+        x2apic: bool,
+    ) -> (KvmVm, Vec<KvmVcpu>) {
         let (vm, mut vcpus) = guest(vcpu_count);
-        let vcpu = &mut vcpus[0];
+        for vcpu in &vcpus {
+            vcpu.fd
+                .set_mp_state(kvm_mp_state {
+                    mp_state: KVM_MP_STATE_RUNNABLE,
+                })
+                .unwrap();
+            if x2apic {
+                let mut sregs = vcpu.fd.get_sregs().unwrap();
+                sregs.apic_base |= APIC_BASE_X2APIC;
+                vcpu.fd.set_sregs(&sregs).unwrap();
+            }
+        }
+        let vcpu = &mut vcpus[waiter];
         if async_pf {
             enable_async_pf(vcpu);
         }
@@ -734,9 +764,10 @@ mod tests {
         PastHlt,
         // KVM_RUN failed with this errno, which is not EINTR.
         Returned(i32),
-        // KVM_RUN had not come back to userspace when the wait ended. `cpu` is the CPU time
-        // the vCPU thread had used by then: next to none when KVM_RUN blocked.
-        StillInKvmRun { cpu: Duration },
+        // KVM_RUN had not come back to userspace when the run was stopped. `blocked` is how
+        // long the vCPU thread had been seen asleep in it without a break, and `cpu` the CPU
+        // time the thread had used.
+        StillInKvmRun { blocked: Duration, cpu: Duration },
     }
 
     extern "C" fn interrupt_kvm_run(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
@@ -756,20 +787,40 @@ mod tests {
         )
     }
 
-    // Runs `vcpu` on a thread of its own until the guest writes PAST_HLT, KVM_RUN fails, or
-    // `wait` has passed, when a signal takes the thread out of KVM_RUN.
-    fn run_bounded(mut vcpu: KvmVcpu, wait: Duration) -> (KvmVcpu, Ran) {
+    // Whether the thread `tid` of this process is asleep (state S in its stat file). A thread
+    // that is runnable and has not been given a CPU is not.
+    fn thread_sleeps(tid: libc::c_long) -> bool {
+        // The state follows the thread's name, which is in parentheses.
+        std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, rest)| rest.starts_with('S'))
+        })
+    }
+
+    // Runs `vcpu` on a thread of its own until the guest writes PAST_HLT or KVM_RUN fails.
+    // The run is stopped, by a signal that takes the thread out of KVM_RUN, once the thread
+    // has been seen asleep for `watch` without a break, or after RUN_WAIT.
+    //
+    // The thread says when it is about to call KVM_RUN and does nothing else that sleeps, so
+    // from then on it is asleep only while KVM_RUN blocks. A thread the host has not
+    // scheduled yet, and one that spins in the kernel, are not asleep.
+    fn run_bounded(mut vcpu: KvmVcpu, watch: Duration) -> (KvmVcpu, Ran) {
         // Not the signal the vCPU threads of other tests in this process use.
         let signal = sigrtmin() + 1;
         register_signal_handler(signal, interrupt_kvm_run).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let thread = std::thread::spawn({
             let stop = stop.clone();
             move || {
+                // SAFETY: gettid takes no arguments and cannot fail.
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+                started_tx.send(tid).unwrap();
                 let ran = loop {
                     if stop.load(Ordering::SeqCst) {
                         break Ran::StillInKvmRun {
+                            blocked: Duration::ZERO,
                             cpu: thread_cpu_time(),
                         };
                     }
@@ -790,59 +841,98 @@ mod tests {
                 (vcpu, ran)
             }
         });
-        let mut wait = wait;
+        let tid = started_rx.recv().expect("the vCPU thread did not start");
+        let deadline = Instant::now() + RUN_WAIT;
+        let mut asleep_since = None;
+        let mut blocked = Duration::ZERO;
+        let mut stopping = false;
         loop {
-            match done_rx.recv_timeout(wait) {
+            match done_rx.recv_timeout(Duration::from_millis(10)) {
                 Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {
-                    // The thread may be between its check of `stop` and KVM_RUN, where the
-                    // signal does nothing, so it is sent until the thread answers.
-                    stop.store(true, Ordering::SeqCst);
-                    thread.kill(signal).unwrap();
-                    wait = Duration::from_millis(10);
+                    if !stopping {
+                        if thread_sleeps(tid) {
+                            blocked = asleep_since.get_or_insert_with(Instant::now).elapsed();
+                        } else {
+                            asleep_since = None;
+                            blocked = Duration::ZERO;
+                        }
+                        stopping = blocked >= watch || Instant::now() >= deadline;
+                    }
+                    if stopping {
+                        // The thread may be between its check of `stop` and KVM_RUN, where
+                        // the signal does nothing, so it is sent until the thread answers.
+                        // The thread may also have ended since the timeout.
+                        stop.store(true, Ordering::SeqCst);
+                        let _ = thread.kill(signal);
+                    }
                 }
             }
         }
-        thread.join().expect("the vCPU thread panicked")
+        let (vcpu, mut ran) = thread.join().expect("the vCPU thread panicked");
+        if let Ran::StillInKvmRun { blocked: seen, .. } = &mut ran {
+            *seen = blocked;
+        }
+        (vcpu, ran)
     }
 
+    // The run ended with the vCPU thread asleep in KVM_RUN for BLOCK_WAIT. A thread that
+    // was never scheduled, and a vCPU that spins in the kernel, fail this after RUN_WAIT.
     fn assert_blocked(ran: Ran, what: &str) {
         match ran {
-            Ran::StillInKvmRun { cpu } => assert!(
-                cpu < BLOCK_WAIT / 5,
-                "{what}: KVM_RUN used {cpu:?} of CPU in {BLOCK_WAIT:?}, so it was not blocked"
+            Ran::StillInKvmRun { blocked, cpu } => assert!(
+                blocked >= BLOCK_WAIT,
+                "{what}: KVM_RUN was not seen blocked for {BLOCK_WAIT:?} within {RUN_WAIT:?}: its \
+                 thread was last asleep for {blocked:?} and used {cpu:?} of CPU"
             ),
             ran => panic!("{what}: KVM_RUN did not block: {ran:?}"),
         }
     }
 
-    // Saves a vCPU stopped just before a HLT with interrupts off, with a paravirtual kick
-    // pending, restores it into a new VM with `restore_kvm_state`, and runs the restored
-    // vCPU and then the source. Returns how each run ended.
-    fn restore_a_vcpu_stopped_before_its_hlt(async_pf: bool) -> (Ran, Ran) {
-        let (vm, mut vcpus) = guest_stopped_before_hlt(1, async_pf);
+    // Saves the guest of `guest_with_vcpu_stopped_before_hlt` with a paravirtual kick
+    // pending for every vCPU, restores it into a new VM with `restore_kvm_state`, and runs
+    // the restored `waiter` and then the source's. Returns how each run ended.
+    fn restore_a_vcpu_stopped_before_its_hlt(
+        vcpu_count: u8,
+        waiter: usize,
+        async_pf: bool,
+        x2apic: bool,
+    ) -> (Ran, Ran) {
+        let (vm, mut vcpus) =
+            guest_with_vcpu_stopped_before_hlt(vcpu_count, waiter, async_pf, x2apic);
+        let save = |vcpus: &[KvmVcpu]| -> Vec<VcpuState> {
+            vcpus
+                .iter()
+                .map(|vcpu| vcpu.save_state().unwrap())
+                .collect()
+        };
 
         // The kick of a lock holder's KVM_HC_KICK_CPU, delivered the same way.
-        let kicked = vm.kick_runnable_vcpus(&[vcpus[0].save_state().unwrap()]);
-        assert_eq!(kicked, Ok(1));
+        let kicked = vm.kick_runnable_vcpus(&save(&vcpus));
+        assert_eq!(kicked, Ok(usize::from(vcpu_count)));
 
-        // KVM reports a runnable vCPU and nothing of the kick.
-        let vcpu_states = [vcpus[0].save_state().unwrap()];
-        assert_eq!(vcpu_states[0].mp_state.mp_state, KVM_MP_STATE_RUNNABLE);
-        assert_eq!(async_pf_is_enabled(&vcpu_states[0]), async_pf);
+        // KVM reports runnable vCPUs and nothing of the kick.
+        let vcpu_states = save(&vcpus);
+        for (index, state) in vcpu_states.iter().enumerate() {
+            assert_eq!(state.mp_state.mp_state, KVM_MP_STATE_RUNNABLE);
+            assert_eq!(state.sregs.apic_base & APIC_BASE_X2APIC != 0, x2apic);
+            // The kick goes to the vCPU's own APIC id, which is its index.
+            assert_eq!(pv_kick_target(state), Some(u8::try_from(index).unwrap()));
+        }
+        assert_eq!(async_pf_is_enabled(&vcpu_states[waiter]), async_pf);
         let vm_state = vm.save_state().unwrap();
 
         let (mut restored_vm, mut restored_vcpus) = guest_to_restore(&vm, &vcpu_states);
         restored_vm
             .restore_kvm_state(&restored_vcpus, &vcpu_states, &vm_state, false)
             .unwrap();
-        let (_, restored) = run_bounded(restored_vcpus.remove(0), RUN_WAIT);
+        let (_, restored) = run_bounded(restored_vcpus.remove(waiter), RUN_WAIT);
         if async_pf {
             // The restore of MSR_KVM_ASYNC_PF_EN queued the completion again, and the
             // restored vCPU's first entry delivered it.
             assert_eq!(page_ready_token(&restored_vm), ASYNC_PF_WAKE_ALL);
         }
-        let (_, source) = run_bounded(vcpus.remove(0), RUN_WAIT);
+        let (_, source) = run_bounded(vcpus.remove(waiter), RUN_WAIT);
         (restored, source)
     }
 
@@ -852,7 +942,7 @@ mod tests {
     // KVM_SET_MP_STATE: given before, it is cleared and the vCPU halts.
     #[test]
     fn test_restore_kicks_a_vcpu_stopped_before_its_hlt() {
-        let (restored, source) = restore_a_vcpu_stopped_before_its_hlt(false);
+        let (restored, source) = restore_a_vcpu_stopped_before_its_hlt(1, 0, false, false);
         assert_eq!(
             restored,
             Ran::PastHlt,
@@ -866,7 +956,41 @@ mod tests {
         );
     }
 
-    // The same restore of a vCPU with async page faults on, as every vCPU of a Linux guest
+    // The vCPU that waits for a lock is any CPU of the guest. Here it is the second of two
+    // runnable ones, so the kick that lets it past its HLT is the one sent to APIC id 1.
+    #[test]
+    fn test_restore_kicks_a_second_vcpu_stopped_before_its_hlt() {
+        let (restored, source) = restore_a_vcpu_stopped_before_its_hlt(2, 1, false, false);
+        assert_eq!(
+            restored,
+            Ran::PastHlt,
+            "the restored second vCPU did not run past its HLT"
+        );
+        assert_eq!(
+            source,
+            Ran::PastHlt,
+            "the source's second vCPU did not run past its HLT"
+        );
+    }
+
+    // The same with the local APICs in x2APIC mode, as Linux runs them. KVM_GET_LAPIC gives
+    // the id in the xAPIC layout in this mode too, and the kick is addressed with it.
+    #[test]
+    fn test_restore_kicks_a_vcpu_in_x2apic_mode() {
+        let (restored, source) = restore_a_vcpu_stopped_before_its_hlt(2, 1, false, true);
+        assert_eq!(
+            restored,
+            Ran::PastHlt,
+            "the restored second vCPU did not run past its HLT in x2APIC mode"
+        );
+        assert_eq!(
+            source,
+            Ran::PastHlt,
+            "the source's second vCPU did not run past its HLT in x2APIC mode"
+        );
+    }
+
+    // The same restore of a vCPU with async page faults on, as a Linux guest
     // has. Restoring MSR_KVM_ASYNC_PF_EN queues a wake-up of every waiter in the guest, and
     // the vCPU's first KVM_RUN completes it through kvm_arch_async_page_present() before it
     // runs an instruction. From Linux 6.15 on that function clears a pending kick unless the
@@ -874,7 +998,7 @@ mod tests {
     // does the restore of any such guest caught before its HLT.
     #[test]
     fn test_the_restore_kick_survives_the_page_ready_wakeup_of_the_restore() {
-        let (restored, source) = restore_a_vcpu_stopped_before_its_hlt(true);
+        let (restored, source) = restore_a_vcpu_stopped_before_its_hlt(1, 0, true, false);
         assert_eq!(
             restored,
             Ran::PastHlt,
@@ -890,8 +1014,10 @@ mod tests {
         );
     }
 
-    // The state the test above restores, restored without the kick: the vCPU blocks in its
-    // HLT, and the kick is what it waits for.
+    // The state the first restore test restores, restored without the kick: the vCPU blocks
+    // in its HLT, and the kick is what it waits for. The run lasts until the vCPU thread has
+    // been asleep in KVM_RUN for BLOCK_WAIT, so a host that schedules the thread late makes
+    // the test longer and does not change its result.
     #[test]
     fn test_a_restored_vcpu_blocks_in_its_hlt_without_a_kick() {
         let (vm, vcpus) = guest_stopped_before_hlt(1, false);
