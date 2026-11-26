@@ -228,6 +228,9 @@ pub enum VmmError {
     #[cfg(target_arch = "aarch64")]
     /// Invalid command line error.
     Cmdline,
+    #[cfg(target_arch = "aarch64")]
+    /// Failed to set the guest counter offset: {0}
+    SetCounterOffset(crate::vstate::vm::KvmVmError),
     /// Device manager error: {0}
     DeviceManager(#[from] device_manager::DeviceManagerCreateError),
     /// MMIO Device manager error: {0}
@@ -323,6 +326,27 @@ pub struct Vmm {
     device_manager: DeviceManager,
     // Cleared once a device writing guest memory without dirty tracking is hot-plugged
     can_create_diff_snapshots: bool,
+    /// The VM-wide guest counter offset (`KVM_ARM_SET_COUNTER_OFFSET`) this VMM set at boot or
+    /// at a snapshot load, advanced by the length of every pause so that the guest's counter
+    /// stands still while the VM is paused. Without that the counter runs through a pause,
+    /// and every timer that came due in it fires at once at the resume. `None` when the host
+    /// kernel has no `KVM_CAP_COUNTER_OFFSET` (before 6.4): the counter then runs on through
+    /// a pause.
+    #[cfg(target_arch = "aarch64")]
+    pub counter_offset: Option<u64>,
+    /// The host counter when the VM was paused, for advancing `counter_offset` at the resume.
+    #[cfg(target_arch = "aarch64")]
+    paused_at_counter: Option<u64>,
+}
+
+/// The counter offset and pause record after the VM counter offset is advanced at host counter
+/// `now` for a pause that began at `paused_at`: the offset grows by the time paused, and the
+/// record becomes `now`. The guest's counter at the pause, record less offset, is the same
+/// before and after, so advancing again later (a resume that failed and is retried) counts no
+/// part of the pause twice.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn advance_counter_offset(offset: u64, paused_at: u64, now: u64) -> (u64, u64) {
+    (offset.wrapping_add(now.wrapping_sub(paused_at)), now)
 }
 
 impl Vmm {
@@ -524,8 +548,28 @@ impl Vmm {
             .vm
             .as_kvm()
             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
+
+        // Advance the counter offset by the length of the pause before any vCPU runs again,
+        // so the guest's counter goes on from where it stopped. The pause record moves with
+        // the offset and is dropped only once the vCPUs run: if anything below fails the VM is
+        // still paused, and a later resume advances by the time since.
+        #[cfg(target_arch = "aarch64")]
+        if let (Some(paused_at), Some(offset)) = (self.paused_at_counter, self.counter_offset) {
+            let now = crate::vstate::vm::KvmVm::host_counter();
+            let (new_offset, new_paused_at) = advance_counter_offset(offset, paused_at, now);
+            kvm_vm
+                .set_counter_offset(new_offset)
+                .map_err(VmmError::SetCounterOffset)?;
+            self.counter_offset = Some(new_offset);
+            self.paused_at_counter = Some(new_paused_at);
+        }
+
         self.device_manager.kick_virtio_devices();
         kvm_vm.resume_vcpus()?;
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.paused_at_counter = None;
+        }
         self.instance_info.state = VmState::Running;
         Ok(())
     }
@@ -541,6 +585,13 @@ impl Vmm {
             .as_kvm()
             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
         kvm_vm.pause_vcpus()?;
+
+        // The host counter at the pause, for resume_vm to advance the counter offset by.
+        #[cfg(target_arch = "aarch64")]
+        if self.paused_at_counter.is_none() {
+            self.paused_at_counter = Some(crate::vstate::vm::KvmVm::host_counter());
+        }
+
         self.instance_info.state = VmState::Paused;
         Ok(())
     }
@@ -609,9 +660,17 @@ impl Vmm {
             {
                 let mpidrs = construct_kvm_mpidrs(&vcpu_states);
 
-                kvm_vm
+                let mut vm_state = kvm_vm
                     .save_state(&mpidrs)
-                    .map_err(MicrovmStateError::SaveVmState)?
+                    .map_err(MicrovmStateError::SaveVmState)?;
+                // The guest's counter stopped at the pause; the registers saved above were read
+                // later, with the counter still running under them.
+                vm_state.guest_counter_at_pause =
+                    match (self.paused_at_counter, self.counter_offset) {
+                        (Some(paused_at), Some(offset)) => Some(paused_at.wrapping_sub(offset)),
+                        _ => None,
+                    };
+                vm_state
             }
         };
 
@@ -1024,5 +1083,49 @@ impl MutEventSubscriber for Vmm {
         {
             error!("Failed to register hot-unplug completion event: {}", err);
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_arch = "aarch64")]
+mod counter_offset_tests {
+    use super::*;
+
+    #[test]
+    fn test_advancing_the_counter_offset_keeps_the_guest_counter_of_the_pause() {
+        // Paused at host counter 1_000 with offset 400: the guest's counter stopped at 600.
+        let (offset, paused_at) = advance_counter_offset(400, 1_000, 1_500);
+        assert_eq!((offset, paused_at), (900, 1_500));
+        assert_eq!(paused_at - offset, 600);
+        // A resume that failed after the offset moved is retried later: the same counter.
+        let (offset, paused_at) = advance_counter_offset(offset, paused_at, 4_000);
+        assert_eq!(paused_at - offset, 600);
+        // The counters wrap.
+        let (offset, paused_at) = advance_counter_offset(u64::MAX - 5, 10, 30);
+        assert_eq!(
+            paused_at.wrapping_sub(offset),
+            10_u64.wrapping_sub(u64::MAX - 5)
+        );
+    }
+
+    #[test]
+    fn test_resume_drops_the_pause_record_only_after_the_vcpus_run() {
+        // A failed ioctl or a failed vCPU resume cannot be injected here, so this pins the
+        // order in the source: the record is cleared after resume_vcpus, and nowhere before.
+        let source = include_str!("lib.rs");
+        let body = &source[source.find("pub fn resume_vm(&mut self)").unwrap()..];
+        let body = &body[..body.find("\n    }\n").unwrap()];
+        let resumed = body
+            .find("kvm_vm.resume_vcpus()?;")
+            .expect("no vCPU resume");
+        let cleared = body
+            .find("self.paused_at_counter = None;")
+            .expect("the pause record is never dropped");
+        assert!(
+            resumed < cleared,
+            "the pause record is dropped before the vCPUs run"
+        );
+        assert_eq!(body.matches("self.paused_at_counter = None;").count(), 1);
+        assert!(!body.contains("paused_at_counter.take()"));
     }
 }

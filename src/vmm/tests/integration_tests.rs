@@ -396,6 +396,132 @@ fn verify_load_snapshot(
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
 
+/// vCPU 0's CNTPCT in a saved state: the guest's counter when the save read it.
+#[cfg(target_arch = "aarch64")]
+fn saved_cntpct(state: &MicrovmState) -> u64 {
+    state.vcpu_states[0]
+        .regs
+        .iter()
+        .find(|reg| reg.id == vmm::arch::aarch64::regs::KVM_REG_ARM_PTIMER_CNT)
+        .map(|reg| reg.value::<u64, 8>())
+        .expect("the state holds no CNTPCT")
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn test_the_guest_counter_stands_still_from_the_pause_to_the_resume_of_a_clone() {
+    // A VM is paused and saved 800 ms later, as a caller does that works between the two
+    // (fcvm copies disks there). The snapshot is loaded with `resume_vm: false` and resumed
+    // 800 ms later, as a caller does that configures the loaded VM before it runs. The clone's
+    // counter must go on from the source's counter at its pause: neither wait may be in it.
+    const WAIT: Duration = Duration::from_millis(800);
+    let frequency: u64;
+    // SAFETY: reading the counter frequency from EL0 is always permitted.
+    unsafe { core::arch::asm!("mrs {f}, cntfrq_el0", f = out(reg) frequency) };
+    let millis = |ticks: u64| ticks.saturating_mul(1000) / frequency;
+
+    let snapshot_file = TempFile::new().unwrap();
+    let memory_file = TempFile::new().unwrap();
+    let (vmm, _) = create_vmm(Some(NOISY_KERNEL_IMAGE), false, true, false, false);
+    if vmm.lock().unwrap().counter_offset.is_none() {
+        println!("Skipping: this host's KVM has no KVM_CAP_COUNTER_OFFSET");
+        vmm.lock().unwrap().stop(FcExitCode::Ok);
+        return;
+    }
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    let mut event_manager = EventManager::new().unwrap();
+    thread::sleep(Duration::from_millis(200));
+    controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+    thread::sleep(WAIT);
+    controller
+        .handle_request(
+            VmmAction::CreateSnapshot(CreateSnapshotParams {
+                snapshot_type: SnapshotType::Full,
+                snapshot_path: snapshot_file.as_path().to_path_buf(),
+                mem_file_path: memory_file.as_path().to_path_buf(),
+                sync_snapshot_files: true,
+            }),
+            &mut event_manager,
+        )
+        .unwrap();
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+
+    let saved: MicrovmState =
+        Snapshot::load(&mut std::fs::File::open(snapshot_file.as_path()).unwrap())
+            .unwrap()
+            .data;
+    let at_pause = saved
+        .vm_state
+        .guest_counter_at_pause
+        .expect("a VMM that owns the counter offset saves the guest's counter at the pause");
+    // The registers were read at the save, with the counter still running under them: this is
+    // the gap the load must not take over.
+    let gap_ms = millis(saved_cntpct(&saved).wrapping_sub(at_pause));
+    assert!(
+        gap_ms >= 700,
+        "the saved CNTPCT is {gap_ms} ms past the pause, after an 800 ms wait"
+    );
+
+    let mut event_manager = EventManager::new().unwrap();
+    let empty_seccomp_filters = get_empty_filters();
+    let mut vm_resources = VmResources::default();
+    let mut preboot_api_controller = PrebootApiController::new(
+        &empty_seccomp_filters,
+        InstanceInfo::default(),
+        &mut vm_resources,
+        &mut event_manager,
+    );
+    preboot_api_controller
+        .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
+            snapshot_path: snapshot_file.as_path().to_path_buf(),
+            mem_backend: MemBackendConfig {
+                backend_path: memory_file.as_path().to_path_buf(),
+                backend_type: MemBackendType::File,
+                write_set_path: None,
+            },
+            track_dirty_pages: false,
+            resume_vm: false,
+            network_overrides: vec![],
+            vsock_override: None,
+            drive_overrides: vec![],
+            pmem_overrides: vec![],
+            clock_realtime: false,
+            huge_pages: SnapshotLoadHugePageConfig::default(),
+        }))
+        .unwrap();
+    let clone = preboot_api_controller.built_vmm.take().unwrap();
+    assert_eq!(clone.lock().unwrap().instance_info.state, VmState::Paused);
+
+    thread::sleep(WAIT);
+    let mut controller = RuntimeApiController::new(clone.clone());
+    let mut event_manager = EventManager::new().unwrap();
+    controller
+        .handle_request(VmmAction::Resume, &mut event_manager)
+        .unwrap();
+    controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+    let vm_info = VmInfo::from(&*clone.lock().unwrap());
+    let state = clone.lock().unwrap().save_state(&vm_info).unwrap();
+    clone.lock().unwrap().stop(FcExitCode::Ok);
+
+    // The clone ran from its resume to its pause, a few milliseconds.
+    let ran_ms = millis(
+        state
+            .vm_state
+            .guest_counter_at_pause
+            .unwrap()
+            .wrapping_sub(at_pause),
+    );
+    assert!(
+        ran_ms < 400,
+        "the clone's counter is {ran_ms} ms past the source's pause; the source waited 800 ms \
+         before its save and the clone 800 ms before its resume"
+    );
+}
+
 #[test]
 fn test_create_and_load_snapshot() {
     for diff_snap in [false, true] {

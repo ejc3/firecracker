@@ -45,6 +45,8 @@ pub enum KvmVmError {
     SaveGic(crate::arch::aarch64::gic::GicError),
     /// Failed to restore the VM's GIC state: {0}
     RestoreGic(crate::arch::aarch64::gic::GicError),
+    /// Failed to set the VM counter offset (KVM_ARM_SET_COUNTER_OFFSET), errno: {0}
+    SetCounterOffset(i32),
     /// Failed to restore resource allocator: {0}
     ResourceAllocator(#[from] vm_allocator::Error),
 }
@@ -129,7 +131,59 @@ impl KvmVm {
                 .save_device(mpidrs)
                 .map_err(KvmVmError::SaveGic)?,
             resource_allocator: self.resource_allocator().save(),
+            guest_counter_at_pause: None,
         })
+    }
+
+    /// Sets the VM-wide guest counter offset with `KVM_ARM_SET_COUNTER_OFFSET`.
+    ///
+    /// The guest's CNTPCT and CNTVCT then read `host_counter - offset`. Owning this offset is
+    /// what lets the VMM move the guest's counter: without it the counter runs while the vCPUs
+    /// are out of `KVM_RUN`, so a VM resumed after a pause has its clock ahead by the pause and
+    /// every timer that came due in that time fires at once. The ioctl also sets KVM's
+    /// `KVM_ARCH_FLAG_VM_COUNTER_OFFSET`, after which a `KVM_SET_ONE_REG` of CNTVCT or CNTPCT
+    /// moves nothing, so a later register replay leaves the offset as set here.
+    ///
+    /// No vCPU may be running: KVM takes every vCPU's lock.
+    pub fn set_counter_offset(&self, offset: u64) -> Result<(), KvmVmError> {
+        #[repr(C)]
+        struct KvmArmCounterOffset {
+            counter_offset: u64,
+            reserved: u64,
+        }
+        // _IOW(KVMIO = 0xAE, 0xb5, struct kvm_arm_counter_offset), 16 bytes.
+        const KVM_ARM_SET_COUNTER_OFFSET: u64 = 0x4010_aeb5;
+        let arg = KvmArmCounterOffset {
+            counter_offset: offset,
+            reserved: 0,
+        };
+        // SAFETY: self.fd() is a valid KVM VM fd and `arg` lives across the call.
+        let ret = unsafe {
+            libc::ioctl(
+                std::os::fd::AsRawFd::as_raw_fd(self.fd()),
+                KVM_ARM_SET_COUNTER_OFFSET as _,
+                &arg,
+            )
+        };
+        if ret < 0 {
+            return Err(KvmVmError::SetCounterOffset(
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reads the host's generic timer counter (CNTVCT_EL0).
+    ///
+    /// On a VHE host a process's virtual counter offset is zero, so this is the counter
+    /// KVM's `kvm_phys_timer_read()` reads.
+    pub fn host_counter() -> u64 {
+        let cnt: u64;
+        // SAFETY: reading the virtual counter from EL0 is always permitted.
+        unsafe {
+            core::arch::asm!("isb", "mrs {cnt}, cntvct_el0", cnt = out(reg) cnt);
+        }
+        cnt
     }
 
     /// Restore the KVM VM state
@@ -156,4 +210,8 @@ pub struct VmState {
     pub gic: GicState,
     /// resource allocator
     pub resource_allocator: ResourceAllocatorState,
+    /// The guest's counter when the VM was paused for this save, when the VMM owned the
+    /// counter offset: the load continues the counter from here. A vCPU's saved CNTPCT is
+    /// read at the save and is ahead of this by the time between the pause and the save.
+    pub guest_counter_at_pause: Option<u64>,
 }

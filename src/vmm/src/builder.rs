@@ -377,6 +377,22 @@ pub fn build_microvm_for_boot(
         vm_resources.nv2_enabled,
     )?;
 
+    // Own the guest's counter from the start: a VM-wide offset that makes CNTPCT and CNTVCT
+    // start at zero, which pause_vm and resume_vm then advance by the length of each pause.
+    #[cfg(target_arch = "aarch64")]
+    let counter_offset = {
+        let offset = KvmVm::host_counter();
+        match kvm_vm.set_counter_offset(offset) {
+            Ok(()) => Some(offset),
+            // A kernel without KVM_CAP_COUNTER_OFFSET (before 6.4): the guest's counter is
+            // the host's and runs on through a pause.
+            Err(err) => {
+                warn!("{err}; the guest clock will not stand still across a pause");
+                None
+            }
+        }
+    };
+
     let vmm = Vmm {
         instance_info: instance_info.clone(),
         machine_config: vm_resources.machine_config.clone(),
@@ -385,6 +401,10 @@ pub fn build_microvm_for_boot(
         vm,
         device_manager,
         can_create_diff_snapshots: true,
+        #[cfg(target_arch = "aarch64")]
+        counter_offset,
+        #[cfg(target_arch = "aarch64")]
+        paused_at_counter: None,
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -588,6 +608,47 @@ pub fn build_microvm_from_snapshot(
     #[cfg(target_arch = "aarch64")]
     crate::devices::virtio::vsock::set_nv2_enabled(vm_resources.nv2_enabled);
 
+    // The guest's counter goes on from where it stopped: a VM-wide offset of the host counter
+    // less the guest's counter at the pause the snapshot was taken in. The offset is the VMM's
+    // to move from here on, which is what keeps the counter still while this VM is loaded and
+    // not yet resumed, and across every later pause. It is set before the register replay
+    // below: once it is set, the replay's writes of CNTVCT and CNTPCT move nothing.
+    #[cfg(target_arch = "aarch64")]
+    let loaded_at_counter = KvmVm::host_counter();
+    #[cfg(target_arch = "aarch64")]
+    let counter_offset = {
+        // A state saved without the pause's counter (the saving VMM did not own the offset)
+        // has vCPU 0's CNTPCT, read at the save.
+        let saved_counter = microvm_state.vm_state.guest_counter_at_pause.or_else(|| {
+            microvm_state.vcpu_states[0]
+                .regs
+                .iter()
+                .find(|reg| reg.id == crate::arch::aarch64::regs::KVM_REG_ARM_PTIMER_CNT)
+                .map(|reg| reg.value::<u64, 8>())
+        });
+        match saved_counter {
+            Some(saved) => {
+                let offset = loaded_at_counter.wrapping_sub(saved);
+                match kvm_vm.set_counter_offset(offset) {
+                    Ok(()) => Some(offset),
+                    Err(err) => {
+                        warn!("{err}; the guest clock will not stand still across a pause");
+                        None
+                    }
+                }
+            }
+            // A snapshot of another producer, without a saved counter: the register replay
+            // sets the counters, and this VMM owns no offset.
+            None => {
+                warn!(
+                    "The snapshot holds no guest counter; the guest clock will not stand still \
+                     across a pause"
+                );
+                None
+            }
+        }
+    };
+
     #[cfg(target_arch = "aarch64")]
     {
         if clock_realtime {
@@ -633,6 +694,13 @@ pub fn build_microvm_from_snapshot(
         vm,
         device_manager,
         can_create_diff_snapshots: true,
+        #[cfg(target_arch = "aarch64")]
+        counter_offset,
+        // The VM is built paused. The record makes the first resume advance the offset by the
+        // time since the load, as a resume after any other pause does, so the guest's counter
+        // goes on from its saved value however long the VM stays loaded and not resumed.
+        #[cfg(target_arch = "aarch64")]
+        paused_at_counter: counter_offset.map(|_| loaded_at_counter),
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -1055,6 +1123,10 @@ pub(crate) mod tests {
             vm: Vm::Kvm(Arc::new(vm)),
             device_manager: default_device_manager(),
             can_create_diff_snapshots: true,
+            #[cfg(target_arch = "aarch64")]
+            counter_offset: None,
+            #[cfg(target_arch = "aarch64")]
+            paused_at_counter: None,
         }
     }
 
@@ -1078,6 +1150,10 @@ pub(crate) mod tests {
             vm: Vm::Kvm(vm),
             device_manager,
             can_create_diff_snapshots: true,
+            #[cfg(target_arch = "aarch64")]
+            counter_offset: None,
+            #[cfg(target_arch = "aarch64")]
+            paused_at_counter: None,
         }
     }
 
