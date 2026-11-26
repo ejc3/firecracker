@@ -236,7 +236,7 @@ pub const SNAPSHOT_VERSION: Version = Version::new(13, 0, 0);
 /// upstream base, and when a commit of the chain changes a type that is saved.
 /// `test_the_layout_was_chosen_for_this_snapshot_version` fails when upstream's version moves
 /// under it.
-pub const FCVM_SNAPSHOT_LAYOUT: u32 = 3;
+pub const FCVM_SNAPSHOT_LAYOUT: u32 = 4;
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(

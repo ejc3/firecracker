@@ -22,6 +22,12 @@ pub struct GicRegState<T> {
 pub struct VgicSysRegsState {
     pub main_icc_regs: Vec<GicRegState<u64>>,
     pub ap_icc_regs: Vec<Option<GicRegState<u64>>>,
+    /// ICH_HCR_EL2, ICH_VMCR_EL2 and ICH_LR0_EL2 to ICH_LR15_EL2 of a vCPU with a virtual EL2
+    /// (GICv3), in that order. Empty for any other vCPU.
+    pub main_ich_regs: Vec<GicRegState<u64>>,
+    /// ICH_AP0R0_EL2 to ICH_AP0R3_EL2 and then ICH_AP1R0_EL2 to ICH_AP1R3_EL2 of such a vCPU,
+    /// `None` where the host's priority bits leave the register out. Empty for any other vCPU.
+    pub ap_ich_regs: Vec<Option<GicRegState<u64>>>,
 }
 
 /// Structure used for serializing the state of the GIC registers.
@@ -33,6 +39,18 @@ pub struct GicState {
     pub gic_vcpu_states: Vec<GicVcpuState>,
     /// The state of the ITS device. Only present with GICv3.
     pub its_state: Option<ItsRegisterState>,
+}
+
+impl GicState {
+    /// Whether this state holds the ICH_*_EL2 registers of every vCPU that `has_el2` marks, in
+    /// vCPU order: a vCPU with a virtual EL2 has them, and a vGIC that does not expose them
+    /// saves none.
+    pub fn holds_ich_regs_where(&self, has_el2: &[bool]) -> bool {
+        has_el2
+            .iter()
+            .zip(&self.gic_vcpu_states)
+            .all(|(has_el2, vcpu)| !has_el2 || !vcpu.icc.main_ich_regs.is_empty())
+    }
 }
 
 /// Structure used for serializing the state of the GIC registers for a specific vCPU.
@@ -182,5 +200,27 @@ impl SimpleReg {
 impl MmioReg for SimpleReg {
     fn range(&self) -> Range<u64> {
         self.offset..self.offset + u64::from(self.size)
+    }
+}
+
+#[cfg(test)]
+mod ich_tests {
+    use super::*;
+
+    #[test]
+    fn test_a_vcpu_with_a_virtual_el2_must_have_its_ich_regs_in_the_state() {
+        // Two vCPUs' interface states, neither with an ICH_*_EL2 register.
+        let mut gic = GicState {
+            gic_vcpu_states: vec![GicVcpuState::default(), GicVcpuState::default()],
+            ..Default::default()
+        };
+        assert!(gic.holds_ich_regs_where(&[false, false]));
+        assert!(!gic.holds_ich_regs_where(&[false, true]));
+        gic.gic_vcpu_states[1]
+            .icc
+            .main_ich_regs
+            .push(GicRegState { chunks: vec![0] });
+        assert!(gic.holds_ich_regs_where(&[false, true]));
+        assert!(!gic.holds_ich_regs_where(&[true, true]));
     }
 }
