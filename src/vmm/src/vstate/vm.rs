@@ -648,7 +648,6 @@ impl KvmVm {
             .iter()
             .map(|region| {
                 let mut bitmap = vec![0; (region.size() / page_size).div_ceil(64)];
-                // Asked once per region, and only here: it takes an fstatfs(2).
                 let private_file = region.maps_file_privately();
                 for (i, (mem_slot, plugged)) in region.slots().enumerate() {
                     if plugged {

@@ -773,6 +773,9 @@ pub struct GuestRegionMmapExt {
     /// cannot read an unplugged slot to find out. A Diff snapshot is refused while it is set
     /// ([`Self::failed_discard_of_unplugged_memory`]).
     failed_unplugged_discard: AtomicBool,
+    /// Whether the region maps a file privately on a filesystem other than hugetlbfs
+    /// ([`Self::maps_file_privately`]), read once when the region is made.
+    private_file: bool,
 }
 
 /// What a discard does with a backing page its range covers only part of. Only memory on huge
@@ -824,6 +827,19 @@ fn write_allocates(addr: usize, shared: bool) -> Option<bool> {
         u64::from_ne_bytes(entry),
         shared,
     ))
+}
+
+/// Whether `region` maps a file privately on a filesystem other than hugetlbfs. It takes an
+/// fstatfs(2), which the seccomp filters of a running VMM do not list, so a region asks when
+/// it is made: a region with a file is made before the filters are installed.
+fn maps_file_privately(region: &GuestRegionMmap) -> bool {
+    match region.file_offset() {
+        Some(file_offset) if region.flags() & libc::MAP_PRIVATE != 0 => {
+            BackingFileSystem::of(file_offset.file())
+                .is_ok_and(|fs| fs.hugetlbfs_page_size().is_none())
+        }
+        _ => false,
+    }
 }
 
 /// The bitmap of a region's discarded pages, present when the region tracks dirty pages or maps
@@ -1010,13 +1026,7 @@ impl GuestRegionMmapExt {
     /// restore from a snapshot file does. A page the guest writes in it becomes a private
     /// anonymous copy, which /proc/self/pagemap tells from one it only read.
     pub(crate) fn maps_file_privately(&self) -> bool {
-        match self.inner.file_offset() {
-            Some(file_offset) if self.inner.flags() & libc::MAP_PRIVATE != 0 => {
-                BackingFileSystem::of(file_offset.file())
-                    .is_ok_and(|fs| fs.hugetlbfs_page_size().is_none())
-            }
-            _ => false,
-        }
+        self.private_file
     }
 
     /// Whether the mapping is `MAP_SHARED`, so another mapping of the same
@@ -1030,6 +1040,7 @@ impl GuestRegionMmapExt {
         let slot_size = u64_to_usize(region.len());
         GuestRegionMmapExt {
             discarded: discard_bitmap(&region),
+            private_file: maps_file_privately(&region),
             failed_unplugged_discard: AtomicBool::new(false),
             inner: region,
             region_type: GuestRegionType::Dram,
@@ -1053,6 +1064,7 @@ impl GuestRegionMmapExt {
 
         GuestRegionMmapExt {
             discarded: discard_bitmap(&region),
+            private_file: maps_file_privately(&region),
             failed_unplugged_discard: AtomicBool::new(false),
             inner: region,
             region_type: GuestRegionType::Hotpluggable,
@@ -1081,6 +1093,7 @@ impl GuestRegionMmapExt {
 
         Ok(GuestRegionMmapExt {
             discarded: discard_bitmap(&region),
+            private_file: maps_file_privately(&region),
             failed_unplugged_discard: AtomicBool::new(false),
             inner: region,
             slot_size,
