@@ -936,6 +936,51 @@ pub(crate) mod tests {
         assert!(pagemap_written(PAGEMAP_SWAPPED), "a private copy swapped out");
     }
 
+    #[test]
+    fn test_untracked_diff_of_a_private_file_mapping_writes_its_writes_and_discards() {
+        // Guest memory mapped privately from its parent's memory file without dirty tracking,
+        // as a File backend restore loaded with track_dirty_pages off. A Diff writes the pages
+        // the guest wrote and the pages a discard emptied, and nothing else: the target holds
+        // 0xCD so that a page written with the parent's bytes shows. Page 1 is only read, page
+        // 3 written, pages 5 and 6 discarded, page 6 written after its discard.
+        let size = mib_to_bytes(1);
+        let page = host_page_size();
+        let dir = TempDir::new().unwrap();
+        let parent = dir.as_path().join("parent");
+        let parent_bytes: Vec<u8> = (0..size).map(|i| (i / page) as u8 | 1).collect();
+        std::fs::write(&parent, &parent_bytes).unwrap();
+        let mut vm = setup_vm();
+        vm.register_dram_memory_regions(
+            crate::vstate::memory::snapshot_file(
+                File::open(&parent).unwrap(),
+                std::iter::once((GuestAddress(0), size)),
+                false,
+                HugePageConfig::None,
+                false,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mem = vm.guest_memory();
+        let at = |page_index: usize| GuestAddress((page_index * page) as u64);
+        assert_eq!(mem.read_obj::<u8>(at(1)).unwrap(), parent_bytes[page]);
+        mem.write_slice(&[0xaa; 64], at(3)).unwrap();
+        mem.discard_range(at(5), 2 * page).unwrap();
+        mem.write_slice(&[0xbb; 8], GuestAddress((6 * page + 100) as u64))
+            .unwrap();
+
+        let mut expected = vec![0xcdu8; size];
+        expected[3 * page..4 * page].copy_from_slice(&parent_bytes[3 * page..4 * page]);
+        expected[3 * page..3 * page + 64].fill(0xaa);
+        expected[5 * page..7 * page].fill(0);
+        expected[6 * page + 100..6 * page + 108].fill(0xbb);
+        let target = dir.as_path().join("diff");
+        std::fs::write(&target, vec![0xcdu8; size]).unwrap();
+        vm.snapshot_memory_to_file(&target, SnapshotType::Diff, false)
+            .unwrap();
+        assert_eq!(first_difference(&target, &expected), None);
+    }
+
     // Auxiliary function being used throughout the tests.
     pub(crate) fn setup_vm() -> KvmVm {
         let kvm = Kvm::new(vec![]).expect("Cannot create Kvm");
