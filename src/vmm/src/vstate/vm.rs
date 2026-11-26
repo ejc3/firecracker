@@ -576,17 +576,16 @@ impl KvmVm {
     pub fn get_dirty_bitmap(&self) -> Result<DirtyBitmap, VmError> {
         self.guest_memory()
             .iter()
-            .flat_map(|region| {
-                let private_file = region.maps_file_privately();
-                region.plugged_slots().map(move |slot| (private_file, slot))
-            })
-            .map(|(private_file, mem_slot)| {
+            .flat_map(|region| region.plugged_slots().map(move |slot| (region, slot)))
+            .map(|(region, mem_slot)| {
                 let bitmap = match mem_slot.slice.bitmap() {
                     Some(_) => self
                         .fd()
                         .get_dirty_log(mem_slot.slot, mem_slot.slice.len())
                         .map_err(VmError::GetDirtyLog)?,
-                    None if private_file => written_private_pages(
+                    // Only a slot without dirty tracking asks what its region maps, which takes
+                    // an fstatfs(2) that not every seccomp filter allows.
+                    None if region.maps_file_privately() => written_private_pages(
                         mem_slot.slice.ptr_guard_mut().as_ptr(),
                         mem_slot.slice.len(),
                     )?,
@@ -807,13 +806,25 @@ fn pagemap_written(entry: u64) -> bool {
 /// earlier snapshot of this VM are included too, which a diff against that snapshot writes
 /// again with the bytes it already holds. Discards are recorded apart (`discarded`).
 ///
-/// pagemap is read with lseek(2) and read(2), which Firecracker's seccomp filters allow.
+/// pagemap is read with lseek(2) and read(2), which Firecracker's seccomp filters allow. A
+/// process that cannot open it (a jail without /proc) takes the slot's bitmap from mincore(2), as
+/// it did before: every resident page of the slot, so the Diff is larger, and complete while the
+/// host does not swap.
 fn written_private_pages(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
     use std::io::{Read, Seek, SeekFrom};
     let page_size = host_page_size();
     let pages = len / page_size;
     let mut bitmap = vec![0u64; pages.div_ceil(64)];
-    let mut file = std::fs::File::open("/proc/self/pagemap").map_err(VmError::Pagemap)?;
+    let mut file = match std::fs::File::open("/proc/self/pagemap") {
+        Ok(file) => file,
+        Err(err) => {
+            crate::logger::warn!(
+                "Cannot open /proc/self/pagemap ({err}), so a Diff takes every resident page of \
+                 a slot without dirty tracking (mincore)"
+            );
+            return mincore_bitmap(addr, len);
+        }
+    };
     file.seek(SeekFrom::Start((addr as usize / page_size * 8) as u64))
         .map_err(VmError::Pagemap)?;
     // 64 KiB of entries, 32 MiB of guest memory with 4 KiB pages, per read
@@ -933,7 +944,10 @@ pub(crate) mod tests {
             "a page only read maps the page cache"
         );
         assert!(pagemap_written(PAGEMAP_PRESENT), "a private copy");
-        assert!(pagemap_written(PAGEMAP_SWAPPED), "a private copy swapped out");
+        assert!(
+            pagemap_written(PAGEMAP_SWAPPED),
+            "a private copy swapped out"
+        );
     }
 
     #[test]
