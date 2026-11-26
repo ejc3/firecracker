@@ -97,6 +97,10 @@ pub struct VmCommon {
     pub vcpus_handles: Mutex<Vec<VcpuHandle>>,
     /// Event fd written to by vCPUs on exit.
     pub vcpus_exit_evt: EventFd,
+    /// Whether KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 is on for this VM (aarch64 only). With it,
+    /// KVM_GET_DIRTY_LOG copies a slot's log and leaves the log and the write protection as
+    /// they are, and [`KvmVm::take_dirty_bitmap`] empties the logs slot by slot afterwards.
+    manual_dirty_log_protect: bool,
     /// Test-only countdown that forces the Nth-next `set_user_memory_region` call to fail, used
     /// to exercise partial-failure handling. 0 means never fail.
     #[cfg(test)]
@@ -209,6 +213,7 @@ impl KvmVm {
         };
 
         let vcpus_exit_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(VmError::EventFd)?;
+        let manual_dirty_log_protect = Self::enable_manual_dirty_log_protect(&fd);
 
         Ok(VmCommon {
             fd,
@@ -222,9 +227,56 @@ impl KvmVm {
             uffd: None,
             vcpus_handles: Mutex::new(Vec::new()),
             vcpus_exit_evt,
+            manual_dirty_log_protect,
             #[cfg(test)]
             fail_set_user_memory_region_in: AtomicU32::new(0),
         })
+    }
+
+    /// Turns KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 on for a new VM on aarch64 and says whether it
+    /// is on. x86_64 keeps KVM's default, where KVM_GET_DIRTY_LOG empties the log itself.
+    ///
+    /// On arm64, emptying a log through KVM_GET_DIRTY_LOG write-protects each 64 pages that hold
+    /// a dirty one in a call of its own, and each such call also write-protects every nested
+    /// stage-2 MMU of the VM over its whole range (`kvm_arch_mmu_enable_log_dirty_pt_masked`
+    /// calls `kvm_nested_s2_wp`). For a guest with a virtual EL2 that took most of a snapshot:
+    /// 6.1 s of a Full snapshot of a 1 GiB guest that had written 345 MiB, against 7 ms for
+    /// emptying the logs a slot at a time (Graviton3, Linux 7.0).
+    #[cfg(target_arch = "aarch64")]
+    fn enable_manual_dirty_log_protect(fd: &VmFd) -> bool {
+        use kvm_bindings::{
+            KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2, KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE, kvm_enable_cap,
+        };
+        let manual_protect = kvm_enable_cap {
+            cap: KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2,
+            args: [u64::from(KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE), 0, 0, 0],
+            ..Default::default()
+        };
+        // _IOW(KVMIO = 0xAE, 0xa3, struct kvm_enable_cap), 104 bytes. kvm-ioctls has
+        // `VmFd::enable_cap` on x86_64 only.
+        const KVM_ENABLE_CAP: u32 = 0x4068_aea3;
+        const _: () = assert!(std::mem::size_of::<kvm_enable_cap>() == 0x68);
+        // SAFETY: `fd` is a valid KVM VM fd and `manual_protect` lives across the call.
+        let ret = unsafe {
+            libc::ioctl(
+                std::os::fd::AsRawFd::as_raw_fd(fd),
+                // The request is `c_ulong` on glibc and `c_int` on musl.
+                KVM_ENABLE_CAP as _,
+                &manual_protect,
+            )
+        };
+        if ret < 0 {
+            debug!(
+                "KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 not enabled: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        ret == 0
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn enable_manual_dirty_log_protect(_fd: &VmFd) -> bool {
+        false
     }
 
     /// Creates the specified number of [`Vcpu`]s.
@@ -613,16 +665,49 @@ impl KvmVm {
     pub fn take_dirty_bitmap(&self) -> Result<DirtyBitmap, VmError> {
         let guest_memory = self.guest_memory();
         let mut dirty_bitmap = guest_memory.take_dirty();
-        let merged = guest_memory.merge_slot_kvm_dirty_logs(&mut dirty_bitmap, |mem_slot| {
-            self.fd()
-                .get_dirty_log(mem_slot.slot, mem_slot.slice.len())
-                .map_err(VmError::GetDirtyLog)
-        });
+        let merged = guest_memory
+            .merge_slot_kvm_dirty_logs(&mut dirty_bitmap, |mem_slot| {
+                self.fd()
+                    .get_dirty_log(mem_slot.slot, mem_slot.slice.len())
+                    .map_err(VmError::GetDirtyLog)
+            })
+            .and_then(|()| {
+                // With manual protection the reads above copied the logs. The pages are in
+                // `dirty_bitmap` now, so a reset that fails part way loses none of them.
+                if self.common.manual_dirty_log_protect {
+                    self.reset_kvm_dirty_logs()
+                } else {
+                    Ok(())
+                }
+            });
         if let Err(err) = merged {
             guest_memory.store_dirty_bitmap(&dirty_bitmap);
             return Err(err);
         }
         Ok(dirty_bitmap)
+    }
+
+    /// Empties KVM's dirty log of every plugged slot and write-protects the slot again, by
+    /// turning logging off and on for it: KVM frees the log, allocates an empty one and
+    /// write-protects the slot in one pass. No vCPU may be running.
+    ///
+    /// A failure between the two calls leaves a slot without a log. The next read of it fails
+    /// (ENOENT), and with it every later snapshot that reads the dirty log.
+    fn reset_kvm_dirty_logs(&self) -> Result<(), VmError> {
+        use kvm_bindings::KVM_MEM_LOG_DIRTY_PAGES;
+        for region in self.guest_memory().iter() {
+            for (mem_slot, plugged) in region.slots() {
+                if !plugged || mem_slot.slice.bitmap().is_none() {
+                    continue;
+                }
+                let mut kvm_region = kvm_userspace_memory_region::from(&mem_slot);
+                kvm_region.flags &= !KVM_MEM_LOG_DIRTY_PAGES;
+                self.set_user_memory_region(kvm_region)?;
+                kvm_region.flags |= KVM_MEM_LOG_DIRTY_PAGES;
+                self.set_user_memory_region(kvm_region)?;
+            }
+        }
+        Ok(())
     }
 
     /// Whether guest memory tracks dirty pages. Either every region does, or none does.
@@ -991,6 +1076,96 @@ pub(crate) mod tests {
             self.check("sync")?;
             self.file.sync_all()
         }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_taking_the_dirty_log_leaves_each_slot_logging_with_an_empty_log() {
+        use vmm_sys_util::tempfile::TempFile;
+
+        // The take empties KVM's logs by turning logging off and on for each slot. A slot left
+        // with logging off has no log, and the next read of it fails with ENOENT.
+        let page_size = host_page_size();
+        let mut vm = setup_vm();
+        if !vm.common.manual_dirty_log_protect {
+            println!("Skipping: this host's KVM has no KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2");
+            return;
+        }
+        let regions = anonymous(
+            &[(GuestAddress(0), 4 * page_size)],
+            true,
+            HugePageConfig::None,
+        );
+        vm.register_dram_memory_regions(regions.unwrap()).unwrap();
+        let slots: Vec<(u32, usize)> = vm
+            .guest_memory()
+            .iter()
+            .flat_map(|region| region.plugged_slots())
+            .map(|slot| (slot.slot, slot.slice.len()))
+            .collect();
+        assert!(!slots.is_empty());
+
+        for _ in 0..2 {
+            vm.take_dirty_bitmap().unwrap();
+            for (slot, len) in &slots {
+                let log = vm
+                    .fd()
+                    .get_dirty_log(*slot, *len)
+                    .expect("the take left the slot without a dirty log");
+                assert!(log.iter().all(|word| *word == 0));
+            }
+        }
+
+        let file = TempFile::new().unwrap();
+        vm.snapshot_memory_to_path(file.as_path(), SnapshotType::Full, false)
+            .unwrap();
+        vm.snapshot_memory_to_path(file.as_path(), SnapshotType::Diff, false)
+            .unwrap();
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_a_failed_dirty_log_reset_keeps_the_pages_taken() {
+        use crate::vstate::memory::{Bitmap, Bytes};
+
+        // The reset fails at its first call, after the logs were read. The pages already taken
+        // must be dirty again, or the next Diff would leave them out.
+        let page_size = host_page_size();
+        let mut vm = setup_vm();
+        if !vm.common.manual_dirty_log_protect {
+            println!("Skipping: this host's KVM has no KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2");
+            return;
+        }
+        let regions = anonymous(
+            &[(GuestAddress(0), 4 * page_size)],
+            true,
+            HugePageConfig::None,
+        );
+        vm.register_dram_memory_regions(regions.unwrap()).unwrap();
+        vm.guest_memory()
+            .write(&[1], GuestAddress(page_size as u64))
+            .unwrap();
+        let is_dirty = || {
+            vm.guest_memory()
+                .iter()
+                .any(|region| region.bitmap().dirty_at(page_size))
+        };
+        assert!(is_dirty());
+
+        vm.fail_next_set_user_memory_region(1);
+        let err = vm.take_dirty_bitmap().unwrap_err();
+        assert!(matches!(err, VmError::SetUserMemoryRegion(_)), "{err}");
+        assert!(is_dirty(), "the failed take lost a dirty page");
+
+        // The slot still logs (the first call, which failed, was the one turning logging
+        // off), so the next take succeeds and returns the page.
+        let taken = vm.take_dirty_bitmap().unwrap();
+        assert!(
+            taken
+                .iter()
+                .any(|region| region.iter().any(|word| *word != 0))
+        );
+        assert!(!is_dirty());
     }
 
     #[test]
