@@ -126,6 +126,8 @@ pub enum VmError {
     InsertRegion(#[from] vm_memory::GuestRegionCollectionError),
     /// Error calling mincore: {0}
     Mincore(vmm_sys_util::errno::Error),
+    /// Error reading /proc/self/pagemap: {0}
+    Pagemap(std::io::Error),
     /// ResourceAllocator error: {0}
     ResourceAllocator(#[from] vm_allocator::Error),
     /// MemoryError error: {0}
@@ -636,19 +638,28 @@ impl KvmVm {
         tracked != 0
     }
 
-    /// The pages resident in memory, one bitmap per region.
-    fn resident_pages(&self) -> Result<DirtyBitmap, VmError> {
+    /// The pages a Diff of guest memory without dirty tracking writes, one bitmap per region.
+    /// For a region that maps a file privately (a restore from a snapshot file, or from a UFFD
+    /// minor-fault handler's memfd) they are the pages the guest wrote, read from
+    /// /proc/self/pagemap. For any other region they are the pages resident in memory.
+    fn written_or_resident_pages(&self) -> Result<DirtyBitmap, VmError> {
         let page_size = host_page_size();
         self.guest_memory()
             .iter()
             .map(|region| {
                 let mut bitmap = vec![0; (region.size() / page_size).div_ceil(64)];
+                // Asked once per region, and only here: it takes an fstatfs(2).
+                let private_file = region.maps_file_privately();
                 for (i, (mem_slot, plugged)) in region.slots().enumerate() {
                     if plugged {
-                        bitmap[region.slot_words(i)].copy_from_slice(&mincore_bitmap(
-                            mem_slot.slice.ptr_guard_mut().as_ptr(),
-                            mem_slot.slice.len(),
-                        )?);
+                        let addr = mem_slot.slice.ptr_guard_mut().as_ptr();
+                        let len = mem_slot.slice.len();
+                        let pages = if private_file {
+                            written_private_pages(addr, len)?
+                        } else {
+                            mincore_bitmap(addr, len)?
+                        };
+                        bitmap[region.slot_words(i)].copy_from_slice(&pages);
                     }
                 }
                 Ok(bitmap)
@@ -752,7 +763,7 @@ impl KvmVm {
         }
         let dirty_bitmap = match (snapshot_type, self.tracks_dirty_pages()) {
             (_, true) => self.take_dirty_bitmap()?,
-            (SnapshotType::Diff, false) => self.resident_pages()?,
+            (SnapshotType::Diff, false) => self.written_or_resident_pages()?,
             (SnapshotType::Full, false) => DirtyBitmap::new(),
         };
         let discarded = guest_memory.take_discarded();
@@ -896,6 +907,64 @@ impl MemoryFile for File {
     }
 }
 
+/// The bits of a /proc/self/pagemap entry for a page in memory (63) and a page swapped out (62).
+const PAGEMAP_PRESENT: u64 = 1 << 63;
+const PAGEMAP_SWAPPED: u64 = 1 << 62;
+/// Bit 61: the page is a file page or shared anonymous memory.
+const PAGEMAP_FILE: u64 = 1 << 61;
+
+/// Whether a pagemap entry of a private file mapping is for a page the process wrote: a private
+/// anonymous copy, in memory or swapped out. A page it only read maps the file's page cache
+/// page (bit 61), and a page it never touched has no entry.
+fn pagemap_written(entry: u64) -> bool {
+    entry & PAGEMAP_SWAPPED != 0 || (entry & PAGEMAP_PRESENT != 0 && entry & PAGEMAP_FILE == 0)
+}
+
+/// The dirty bitmap of a memslot that maps a snapshot file privately with dirty tracking off:
+/// the pages the guest wrote since the restore, from /proc/self/pagemap. A write to such a
+/// mapping copies the page, so the written pages are exactly the private anonymous ones; KVM's
+/// dirty log is not needed, nor the write protection that keeps it. The pages written before an
+/// earlier snapshot of this VM are included too, which a diff against that snapshot writes
+/// again with the bytes it already holds. Discards are recorded apart (`discarded`).
+///
+/// pagemap is read with lseek(2) and read(2), which Firecracker's seccomp filters allow. A
+/// process that cannot open it (a jail without /proc) takes the slot's bitmap from mincore(2), as
+/// it did before: every resident page of the slot, so the Diff is larger, and complete while the
+/// host does not swap.
+fn written_private_pages(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let page_size = host_page_size();
+    let pages = len / page_size;
+    let mut bitmap = vec![0u64; pages.div_ceil(64)];
+    let mut file = match std::fs::File::open("/proc/self/pagemap") {
+        Ok(file) => file,
+        Err(err) => {
+            crate::logger::warn!(
+                "Cannot open /proc/self/pagemap ({err}), so a Diff takes every resident page of \
+                 a slot without dirty tracking (mincore)"
+            );
+            return mincore_bitmap(addr, len);
+        }
+    };
+    file.seek(SeekFrom::Start((addr as usize / page_size * 8) as u64))
+        .map_err(VmError::Pagemap)?;
+    // 64 KiB of entries, 32 MiB of guest memory with 4 KiB pages, per read
+    let mut entries = vec![0u8; 8192 * 8];
+    let mut page = 0;
+    while page < pages {
+        let count = (pages - page).min(8192);
+        let bytes = &mut entries[..count * 8];
+        file.read_exact(bytes).map_err(VmError::Pagemap)?;
+        for (i, entry) in bytes.chunks_exact(8).enumerate() {
+            if pagemap_written(u64::from_ne_bytes(entry.try_into().unwrap())) {
+                bitmap[(page + i) / 64] |= 1 << ((page + i) % 64);
+            }
+        }
+        page += count;
+    }
+    Ok(bitmap)
+}
+
 /// Use `mincore(2)` to overapproximate the dirty bitmap for the given memslot. To be used
 /// if a diff snapshot is requested, but dirty page tracking wasn't enabled.
 fn mincore_bitmap(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
@@ -951,6 +1020,99 @@ pub(crate) mod tests {
     use crate::vstate::kvm::Kvm;
     use crate::vstate::memory::test_utils::data_runs;
     use crate::vstate::memory::{Bytes, GuestRegionType, HOLE_GRANULE, anonymous};
+
+    #[test]
+    fn test_written_private_pages_are_the_written_ones() {
+        // A private mapping of a 16-page file: page 1 read, pages 3 and 7 written, page 9 read
+        // and then written. Only the written pages are reported, the read ones are not.
+        let page = host_page_size();
+        let file = TempFile::new().unwrap();
+        file.as_file().set_len((16 * page) as u64).unwrap();
+        std::io::Write::write_all(&mut file.as_file(), &vec![1u8; 16 * page]).unwrap();
+        // SAFETY: a private mapping of a file of this length, unmapped below.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                16 * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                std::os::fd::AsRawFd::as_raw_fd(file.as_file()),
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+        let mem = addr.cast::<u8>();
+        // SAFETY: every offset below is inside the mapping.
+        unsafe {
+            assert_eq!(std::ptr::read_volatile(mem.add(page)), 1);
+            std::ptr::write_volatile(mem.add(3 * page), 2);
+            std::ptr::write_volatile(mem.add(7 * page + 5), 2);
+            assert_eq!(std::ptr::read_volatile(mem.add(9 * page)), 1);
+            std::ptr::write_volatile(mem.add(9 * page), 2);
+        }
+        let bitmap = written_private_pages(mem, 16 * page).unwrap();
+        // SAFETY: the mapping made above.
+        unsafe { libc::munmap(addr, 16 * page) };
+        assert_eq!(bitmap, vec![(1 << 3) | (1 << 7) | (1 << 9)]);
+    }
+
+    #[test]
+    fn test_pagemap_written_reads_the_entry_bits() {
+        assert!(!pagemap_written(0), "an untouched page");
+        assert!(
+            !pagemap_written(PAGEMAP_PRESENT | PAGEMAP_FILE),
+            "a page only read maps the page cache"
+        );
+        assert!(pagemap_written(PAGEMAP_PRESENT), "a private copy");
+        assert!(
+            pagemap_written(PAGEMAP_SWAPPED),
+            "a private copy swapped out"
+        );
+    }
+
+    #[test]
+    fn test_untracked_diff_of_a_private_file_mapping_writes_its_writes_and_discards() {
+        // Guest memory mapped privately from its parent's memory file without dirty tracking,
+        // as a File backend restore loaded with track_dirty_pages off. A Diff writes the pages
+        // the guest wrote and the pages a discard emptied, and nothing else: the target holds
+        // 0xCD so that a page written with the parent's bytes shows. Page 1 is only read, page
+        // 3 written, pages 5 and 6 discarded, page 6 written after its discard.
+        let size = mib_to_bytes(1);
+        let page = host_page_size();
+        let dir = TempDir::new().unwrap();
+        let parent = dir.as_path().join("parent");
+        let parent_bytes: Vec<u8> = (0..size).map(|i| (i / page) as u8 | 1).collect();
+        std::fs::write(&parent, &parent_bytes).unwrap();
+        let mut vm = setup_vm();
+        vm.register_dram_memory_regions(
+            crate::vstate::memory::snapshot_file(
+                File::open(&parent).unwrap(),
+                &[(GuestAddress(0), size)],
+                false,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mem = vm.guest_memory();
+        let at = |page_index: usize| GuestAddress((page_index * page) as u64);
+        assert_eq!(mem.read_obj::<u8>(at(1)).unwrap(), parent_bytes[page]);
+        mem.write_slice(&[0xaa; 64], at(3)).unwrap();
+        mem.discard_range(at(5), 2 * page).unwrap();
+        mem.write_slice(&[0xbb; 8], GuestAddress((6 * page + 100) as u64))
+            .unwrap();
+
+        let mut expected = vec![0xcdu8; size];
+        expected[3 * page..4 * page].copy_from_slice(&parent_bytes[3 * page..4 * page]);
+        expected[3 * page..3 * page + 64].fill(0xaa);
+        expected[5 * page..7 * page].fill(0);
+        expected[6 * page + 100..6 * page + 108].fill(0xbb);
+        let target = dir.as_path().join("diff");
+        std::fs::write(&target, vec![0xcdu8; size]).unwrap();
+        vm.snapshot_memory_to_path(&target, SnapshotType::Diff, false)
+            .unwrap();
+        assert_eq!(first_difference(&target, &expected), None);
+    }
 
     // Auxiliary function being used throughout the tests.
     pub(crate) fn setup_vm() -> KvmVm {
