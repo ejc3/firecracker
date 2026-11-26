@@ -48,7 +48,7 @@ pub(crate) fn get_icc_regs(fd: &DeviceFd, mpidr: u64) -> Result<VgicSysRegsState
 
     Ok(VgicSysRegsState {
         main_icc_regs,
-        ap_icc_regs: Vec::new(),
+        ..Default::default()
     })
 }
 

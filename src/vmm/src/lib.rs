@@ -663,6 +663,23 @@ impl Vmm {
                 let mut vm_state = kvm_vm
                     .save_state(&mpidrs)
                     .map_err(MicrovmStateError::SaveVmState)?;
+                // A host whose vGIC does not expose a guest hypervisor's ICH_*_EL2 registers
+                // saves none, and a snapshot without them restores a nested guest with its
+                // interrupts masked.
+                let has_el2: Vec<bool> = vcpu_states
+                    .iter()
+                    .map(|vcpu| {
+                        vcpu.kvi.features[0] & (1 << kvm_bindings::KVM_ARM_VCPU_HAS_EL2) != 0
+                    })
+                    .collect();
+                if !vm_state.gic.holds_ich_regs_where(&has_el2) {
+                    return Err(MicrovmStateError::NotAllowed(
+                        "a vCPU with a virtual EL2 has no ICH_*_EL2 registers in the vGIC's \
+                         state: this host's KVM does not expose them, and a snapshot without \
+                         them restores a nested guest with its interrupts masked"
+                            .into(),
+                    ));
+                }
                 // The guest's counter stopped at the pause; the registers saved above were read
                 // later, with the counter still running under them.
                 vm_state.guest_counter_at_pause =
