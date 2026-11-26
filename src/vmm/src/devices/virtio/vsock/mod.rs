@@ -27,6 +27,7 @@ use vmm_sys_util::epoll::EventSet;
 
 pub use self::defs::VSOCK_DEV_ID;
 pub use self::device::Vsock;
+pub use self::event_handler::set_nv2_enabled;
 use self::packet::{VsockPacketRx, VsockPacketTx};
 pub use self::unix::{VsockUnixBackend, VsockUnixBackendError};
 use super::iov_deque::IovDequeError;
