@@ -891,6 +891,51 @@ pub(crate) mod tests {
         get_registers(&vcpu.fd, &reg_list, &mut Aarch64RegisterVec::default()).unwrap();
     }
 
+    /// The guest's physical counter as KVM reports it for a vCPU that is not running.
+    fn guest_counter(vcpu: &KvmVcpu) -> u64 {
+        let mut bytes = [0_u8; 8];
+        vcpu.fd.get_one_reg(SYS_CNTPCT_EL0, &mut bytes).unwrap();
+        u64::from_le_bytes(bytes)
+    }
+
+    #[test]
+    fn test_the_vm_counter_offset_is_what_the_guest_counter_lags_the_host_by() {
+        let (vm, vcpu) = setup_vcpu(0x10000);
+        if !vm.kvm().optional_capabilities().counter_offset {
+            println!("Skipping: this host's KVM has no KVM_CAP_COUNTER_OFFSET");
+            return;
+        }
+        // Ten seconds of counter ticks at any frequency a host has (1 MHz to 1 GHz) is far above
+        // the time the calls below take and far below a host's uptime.
+        let slack = 10_000_000_000_u64;
+
+        // An offset of the host counter: the guest's counter starts over.
+        vm.set_counter_offset(KvmVm::host_counter()).unwrap();
+        let from_zero = guest_counter(&vcpu);
+        assert!(from_zero < slack, "{from_zero}");
+
+        // An offset a known distance short of it: the guest's counter reads that distance.
+        let saved = 1_u64 << 40;
+        vm.set_counter_offset(KvmVm::host_counter().wrapping_sub(saved))
+            .unwrap();
+        let continued = guest_counter(&vcpu);
+        assert!(
+            continued >= saved && continued - saved < slack,
+            "{continued}"
+        );
+
+        // With the VM-wide offset set, writing the counter register does not move the counter,
+        // which is what keeps a register replay from undoing the offset.
+        vcpu.fd
+            .set_one_reg(KVM_REG_ARM_PTIMER_CNT, &[0; 8])
+            .unwrap();
+        let after_write = guest_counter(&vcpu);
+        assert!(
+            after_write >= continued && after_write - saved < slack,
+            "{after_write}"
+        );
+    }
+
     #[test]
     fn test_get_invalid_regs() {
         // Test `get_regs()` with invalid register IDs.
