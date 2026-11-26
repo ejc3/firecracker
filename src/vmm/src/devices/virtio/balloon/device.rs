@@ -449,7 +449,11 @@ impl Balloon {
                 let guest_addr =
                     GuestAddress(u64::from(page_frame_number) << VIRTIO_BALLOON_PFN_SHIFT);
 
-                if let Err(err) = mem.discard_range(
+                // The inflate queue only: a page in the balloon holds nothing the guest may
+                // rely on. The hinting and reporting queues below keep the zeroing discard,
+                // because a guest that reports free pages may have told the device that it
+                // expects them back zeroed (page poisoning with a poison value of 0).
+                if let Err(err) = mem.discard_ballooned_range(
                     guest_addr,
                     usize::try_from(range_len).unwrap() << VIRTIO_BALLOON_PFN_SHIFT,
                 ) {

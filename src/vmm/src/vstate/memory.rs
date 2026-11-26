@@ -12,7 +12,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::ops::{Deref, Range};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bitvec::vec::BitVec;
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
@@ -775,6 +775,57 @@ pub struct GuestRegionMmapExt {
     failed_unplugged_discard: AtomicBool,
 }
 
+/// What a discard does with a backing page its range covers only part of. Only memory on huge
+/// pages has such pages: a discard is made of host pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialPages {
+    /// Writes zeros over the part in the range, whatever that costs: writing to a huge page
+    /// that is not backed yet allocates it, and writing to one that a private mapping shares
+    /// with its file copies it.
+    Zero,
+    /// Writes zeros over the part in the range only where the write allocates nothing: the
+    /// huge page is in memory and is this mapping's own. A huge page that is absent, or that a
+    /// private mapping still shares with its file, is left as it is, and the part in the
+    /// range keeps the bytes it had.
+    ZeroWithoutAllocating,
+}
+
+/// Whether a write to a page with this /proc/self/pagemap entry allocates a backing page: the
+/// page is not in memory (bit 63 clear), or it is a page of the file (bit 61) under a private
+/// mapping, which a write copies.
+fn pagemap_entry_write_allocates(entry: u64, shared: bool) -> bool {
+    const PRESENT: u64 = 1 << 63;
+    const FILE_PAGE: u64 = 1 << 61;
+    entry & PRESENT == 0 || (!shared && entry & FILE_PAGE != 0)
+}
+
+/// Whether a write to the page at `addr` of a mapping would allocate a backing page
+/// ([`pagemap_entry_write_allocates`]). `None` when /proc/self/pagemap cannot be read.
+fn write_allocates(addr: usize, shared: bool) -> Option<bool> {
+    use std::os::unix::fs::FileExt;
+    static PAGEMAP: OnceLock<Option<File>> = OnceLock::new();
+    let pagemap = PAGEMAP
+        .get_or_init(|| {
+            File::open("/proc/self/pagemap")
+                .inspect_err(|err| {
+                    warn!(
+                        "Cannot open /proc/self/pagemap ({err}), so a balloon discard zeroes \
+                         every partial huge page"
+                    )
+                })
+                .ok()
+        })
+        .as_ref()?;
+    let mut entry = [0u8; 8];
+    pagemap
+        .read_exact_at(&mut entry, (addr / host_page_size() * 8) as u64)
+        .ok()?;
+    Some(pagemap_entry_write_allocates(
+        u64::from_ne_bytes(entry),
+        shared,
+    ))
+}
+
 /// The bitmap of a region's discarded pages, present when the region tracks dirty pages or maps
 /// a file privately. Without dirty tracking a private file mapping has its written pages read
 /// from /proc/self/pagemap, which cannot see a discard either.
@@ -1184,6 +1235,7 @@ impl GuestRegionMmapExt {
         &self,
         caddr: MemoryRegionAddress,
         len: usize,
+        partial_pages: PartialPages,
     ) -> Result<(), GuestMemoryError> {
         // The address and length can come straight from a guest descriptor (balloon), so reject
         // ranges that are not host page aligned or that run past the end of the region.
@@ -1200,10 +1252,11 @@ impl GuestRegionMmapExt {
         };
 
         // Only whole backing pages can be freed. With hugetlbfs, the partial huge pages at either
-        // end of the range are zeroed instead, which allocates them if they were not backed yet.
-        // Linux guests inflate the traditional balloon at most 1 MiB at a time, so with
-        // hugetlbfs, inflation frees nothing and can increase host memory use. Free page hinting
-        // reports whole huge pages, and so does free page reporting by default.
+        // end of the range are zeroed instead, which allocates them if they were not backed yet,
+        // unless `partial_pages` says to zero only where that allocates nothing. Linux guests
+        // inflate the traditional balloon at most 1 MiB at a time, so with hugetlbfs, inflation
+        // frees nothing, and with [`PartialPages::Zero`] it increases host memory use. Free page
+        // hinting reports whole huge pages, and so does free page reporting by default.
         let backing_page_size = RawGuestRegionMmap::page_size(self.inner.flags()) as u64;
         let backing_aligned_start = align_up!(start, backing_page_size).min(end);
         let backing_aligned_end = align_down!(end, backing_page_size).max(backing_aligned_start);
@@ -1258,6 +1311,14 @@ impl GuestRegionMmapExt {
                 continue;
             }
             let edge = self.get_slice(edge_addr, edge_len)?;
+            // An edge lies within one backing page, so its first host page answers for it. When
+            // pagemap cannot be read the edge is zeroed.
+            if partial_pages == PartialPages::ZeroWithoutAllocating
+                && write_allocates(edge.ptr_guard().as_ptr() as usize, self.is_shared())
+                    == Some(true)
+            {
+                continue;
+            }
             // SAFETY: `get_slice` bounds `edge` within this region's mapping,
             // and plugged memory is writable.
             unsafe { std::ptr::write_bytes(edge.ptr_guard_mut().as_ptr(), 0, edge.len()) };
@@ -1901,6 +1962,19 @@ where
     /// instead.
     fn discard_range(&self, addr: GuestAddress, range_len: usize) -> Result<(), GuestMemoryError>;
 
+    /// Discards a memory range a guest gave to the traditional balloon: as
+    /// [`Self::discard_range`], except that a huge page the range covers part of is zeroed
+    /// only where that allocates nothing ([`PartialPages::ZeroWithoutAllocating`]). A guest
+    /// may not rely on what a page in the balloon holds, and it gets the page back with the
+    /// bytes this VM had there before, so nothing but the cost differs: zeroing an unbacked
+    /// huge page for 4 KiB of balloon allocates 2 MiB, and on memory mapped privately from a
+    /// file shared between VMs it turns a shared page into a private one.
+    fn discard_ballooned_range(
+        &self,
+        addr: GuestAddress,
+        range_len: usize,
+    ) -> Result<(), GuestMemoryError>;
+
     /// Check whether the given guest address range falls entirely within plugged memory.
     /// Returns Err if the address is not in any region or is in an unplugged slot.
     fn check_range_plugged(&self, addr: GuestAddress, len: usize) -> Result<(), GuestMemoryError>;
@@ -2156,7 +2230,17 @@ impl GuestMemoryExtension for GuestMemoryMmap {
 
     fn discard_range(&self, addr: GuestAddress, range_len: usize) -> Result<(), GuestMemoryError> {
         self.try_for_each_region_in_range(addr, range_len, |region, start, len| {
-            region.discard_range(start, len)
+            region.discard_range(start, len, PartialPages::Zero)
+        })
+    }
+
+    fn discard_ballooned_range(
+        &self,
+        addr: GuestAddress,
+        range_len: usize,
+    ) -> Result<(), GuestMemoryError> {
+        self.try_for_each_region_in_range(addr, range_len, |region, start, len| {
+            region.discard_range(start, len, PartialPages::ZeroWithoutAllocating)
         })
     }
 
@@ -3849,7 +3933,11 @@ mod tests {
         let region = mem.iter().next().unwrap();
         assert_match!(
             region
-                .discard_range(MemoryRegionAddress(page_size as u64), 2 * page_size)
+                .discard_range(
+                    MemoryRegionAddress(page_size as u64),
+                    2 * page_size,
+                    PartialPages::Zero,
+                )
                 .unwrap_err(),
             GuestMemoryError::InvalidGuestAddress(_)
         );
@@ -3970,7 +4058,11 @@ mod tests {
             .unwrap();
 
         region
-            .discard_range(MemoryRegionAddress(host_page_size() as u64), page_size)
+            .discard_range(
+                MemoryRegionAddress(host_page_size() as u64),
+                page_size,
+                PartialPages::Zero,
+            )
             .unwrap();
 
         let mut actual = vec![0; page_size];
@@ -5130,6 +5222,165 @@ mod tests {
             backing.iter().all(|byte| *byte == 0x5a),
             "the discard wrote to the handler's backing file"
         );
+    }
+
+    #[test]
+    fn test_which_pagemap_entries_a_write_would_allocate_for() {
+        const PRESENT: u64 = 1 << 63;
+        const FILE_PAGE: u64 = 1 << 61;
+        // Not in memory: any write allocates.
+        assert!(pagemap_entry_write_allocates(0, false));
+        assert!(pagemap_entry_write_allocates(0, true));
+        // The mapping's own page.
+        assert!(!pagemap_entry_write_allocates(PRESENT, false));
+        // A page of the file: a private mapping copies it, a shared one writes it in place.
+        assert!(pagemap_entry_write_allocates(PRESENT | FILE_PAGE, false));
+        assert!(!pagemap_entry_write_allocates(PRESENT | FILE_PAGE, true));
+    }
+
+    /// Free 2 MiB pages of the host, for tests that hold [`test_utils::lock_free_huge_pages`].
+    fn free_huge_pages() -> u64 {
+        std::fs::read_to_string("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// A clone of a UFFD minor-fault handler on 2 MiB pages maps the handler's file privately.
+    /// A balloon range from the middle of the first huge page to the middle of the third
+    /// covers the second whole and the other two in part. The clone has written none of them,
+    /// so zeroing the two parts would copy two huge pages for it: the range must cost nothing.
+    #[test]
+    fn test_a_ballooned_range_allocates_no_huge_page_for_a_page_it_covers_in_part() {
+        const HUGE_PAGE: usize = 2 << 20;
+        let Some(_pool) = test_utils::lock_free_huge_pages(6) else {
+            return;
+        };
+        let file = test_utils::test_memfd(3 * HUGE_PAGE, true, 0x5a);
+        let mem = into_region_ext(
+            uffd_minor_backing(
+                file.try_clone().unwrap(),
+                &[(GuestAddress(0), 3 * HUGE_PAGE)],
+                false,
+                HugePageConfig::Hugetlbfs2M,
+            )
+            .unwrap(),
+        );
+        let start = HUGE_PAGE / 2;
+        let len = 2 * HUGE_PAGE;
+
+        let free_before = free_huge_pages();
+        mem.discard_ballooned_range(GuestAddress(start as u64), len)
+            .unwrap();
+        assert_eq!(
+            free_huge_pages(),
+            free_before,
+            "the balloon discard allocated huge pages"
+        );
+
+        // The second huge page was freed and reads as zeros. The parts of the first and third
+        // keep the file's bytes, which are this guest's own from before the snapshot.
+        let mut actual = vec![0xff; 3 * HUGE_PAGE];
+        mem.read(&mut actual, GuestAddress(0)).unwrap();
+        let expected = [
+            vec![0x5a; HUGE_PAGE],
+            vec![0; HUGE_PAGE],
+            vec![0x5a; HUGE_PAGE],
+        ]
+        .concat();
+        assert!(actual == expected, "guest memory after the balloon discard");
+        let mut backing = vec![0; 3 * HUGE_PAGE];
+        file.read_exact_at(&mut backing, 0).unwrap();
+        assert!(
+            backing.iter().all(|byte| *byte == 0x5a),
+            "the discard wrote to the handler's backing file"
+        );
+    }
+
+    /// The same range after the clone has written all three huge pages, so each is a private
+    /// copy: the parts in the range are zeroed in place, which allocates nothing, and the
+    /// huge page the range covers whole is freed.
+    #[test]
+    fn test_a_ballooned_range_zeroes_private_huge_pages_and_frees_whole_ones() {
+        const HUGE_PAGE: usize = 2 << 20;
+        let Some(_pool) = test_utils::lock_free_huge_pages(6) else {
+            return;
+        };
+        let file = test_utils::test_memfd(3 * HUGE_PAGE, true, 0x5a);
+        let mem = into_region_ext(
+            uffd_minor_backing(
+                file.try_clone().unwrap(),
+                &[(GuestAddress(0), 3 * HUGE_PAGE)],
+                false,
+                HugePageConfig::Hugetlbfs2M,
+            )
+            .unwrap(),
+        );
+        let start = HUGE_PAGE / 2;
+        let len = 2 * HUGE_PAGE;
+
+        let free_untouched = free_huge_pages();
+        for page in 0..3 {
+            mem.write_obj(0x77u8, GuestAddress((page * HUGE_PAGE) as u64))
+                .unwrap();
+        }
+        assert_eq!(
+            free_huge_pages(),
+            free_untouched - 3,
+            "three private copies"
+        );
+
+        mem.discard_ballooned_range(GuestAddress(start as u64), len)
+            .unwrap();
+        assert_eq!(
+            free_huge_pages(),
+            free_untouched - 2,
+            "the whole huge page was not freed, or a part cost a page"
+        );
+
+        let mut actual = vec![0xff; 3 * HUGE_PAGE];
+        mem.read(&mut actual, GuestAddress(0)).unwrap();
+        let mut expected = [
+            vec![0x5a; start],
+            vec![0; len],
+            vec![0x5a; 3 * HUGE_PAGE - start - len],
+        ]
+        .concat();
+        expected[0] = 0x77;
+        assert!(actual == expected, "guest memory after the balloon discard");
+    }
+
+    /// Anonymous 2 MiB pages, as a VM booted with huge pages has: a balloon range over parts of
+    /// two huge pages nothing has touched allocates neither, and they read as zeros, which is
+    /// what the zeroing would have left.
+    #[test]
+    fn test_a_ballooned_range_allocates_no_anonymous_huge_page() {
+        const HUGE_PAGE: usize = 2 << 20;
+        let Some(_pool) = test_utils::lock_free_huge_pages(4) else {
+            return;
+        };
+        let mem = into_region_ext(
+            anonymous(
+                &[(GuestAddress(0), 2 * HUGE_PAGE)],
+                false,
+                HugePageConfig::Hugetlbfs2M,
+            )
+            .unwrap(),
+        );
+        let free_before = free_huge_pages();
+        mem.discard_ballooned_range(GuestAddress((HUGE_PAGE / 2) as u64), HUGE_PAGE)
+            .unwrap();
+        assert_eq!(free_huge_pages(), free_before);
+
+        // Written, a part is the mapping's own and is zeroed.
+        mem.write_slice(&[0x33; 8192], GuestAddress((HUGE_PAGE / 2) as u64))
+            .unwrap();
+        mem.discard_ballooned_range(GuestAddress((HUGE_PAGE / 2) as u64), HUGE_PAGE)
+            .unwrap();
+        let mut actual = vec![0xff; 2 * HUGE_PAGE];
+        mem.read(&mut actual, GuestAddress(0)).unwrap();
+        assert!(actual.iter().all(|byte| *byte == 0));
     }
 
     #[test]
