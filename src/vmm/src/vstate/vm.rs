@@ -38,8 +38,8 @@ use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorGroup};
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{
-    AbsentPages, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemoryState,
-    GuestRegionMmap, GuestRegionMmapExt, MemoryError, ZeroPages,
+    AbsentPages, CleanGaps, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
+    GuestMemoryState, GuestRegionMmap, GuestRegionMmapExt, MemoryError, ZeroPages,
 };
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
@@ -733,19 +733,38 @@ impl KvmVm {
             (true, Some(_)) => ZeroPages::Hole(AbsentPages::Read),
             (true, None) => ZeroPages::Hole(AbsentPages::Skip),
         };
+        // A Diff into a file that already had the right size is written in place over the
+        // guest's memory as of the last snapshot, so short clean gaps between written runs are
+        // written with them. A read of an untouched page there is a userfaultfd fault its server
+        // answers with the snapshot's page, and elsewhere could map the shared zero page, so
+        // without a userfaultfd only pages with a page table entry are. A file that held no data
+        // gets only the marked pages, so it keeps its holes.
+        let clean_gaps = match (starts_empty, &self.common.uffd) {
+            (true, _) => CleanGaps::Seek,
+            (false, Some(_)) => CleanGaps::Bridge(AbsentPages::Read),
+            (false, None) => CleanGaps::Bridge(AbsentPages::Skip),
+        };
 
-        self.snapshot_memory_to_file(&mut file, snapshot_type, zero_pages, sync_snapshot_files)
+        self.snapshot_memory_to_file(
+            &mut file,
+            snapshot_type,
+            zero_pages,
+            clean_gaps,
+            sync_snapshot_files,
+        )
     }
 
     /// Writes guest memory to `file` as a snapshot of `snapshot_type`, taking the dirty and the
     /// discarded pages it covers, then flushes it and, if asked, syncs it. If any of that fails,
     /// the pages taken are marked dirty and discarded again. `zero_pages` says what a full
-    /// snapshot does with all-zero pages.
+    /// snapshot does with all-zero pages, and `clean_gaps` what a diff does with the clean pages
+    /// between the runs it writes.
     fn snapshot_memory_to_file<F: MemoryFile>(
         &self,
         file: &mut F,
         snapshot_type: SnapshotType,
         zero_pages: ZeroPages,
+        clean_gaps: CleanGaps,
         sync_snapshot_files: bool,
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::{Memory, MemoryBackingFile};
@@ -772,7 +791,9 @@ impl KvmVm {
         };
 
         match snapshot_type {
-            SnapshotType::Diff => guest_memory.dump_dirty(file, &dirty_bitmap, &discarded),
+            SnapshotType::Diff => {
+                guest_memory.dump_dirty(file, &dirty_bitmap, &discarded, clean_gaps)
+            }
             SnapshotType::Full => guest_memory.dump(file, zero_pages, &discarded),
         }
         .map_err(Memory)
@@ -1223,14 +1244,26 @@ pub(crate) mod tests {
                     file: TempFile::new().unwrap().into_file(),
                     state: TestMemoryFileState::Fails(fails),
                 };
-                vm.snapshot_memory_to_file(&mut file, snapshot_type, ZeroPages::Write, true)
-                    .unwrap_err();
+                vm.snapshot_memory_to_file(
+                    &mut file,
+                    snapshot_type,
+                    ZeroPages::Write,
+                    CleanGaps::Seek,
+                    true,
+                )
+                .unwrap_err();
                 assert!(is_dirty(), "{snapshot_type:?}: {fails} failed");
             }
 
             let mut file = TempFile::new().unwrap().into_file();
-            vm.snapshot_memory_to_file(&mut file, snapshot_type, ZeroPages::Write, true)
-                .unwrap();
+            vm.snapshot_memory_to_file(
+                &mut file,
+                snapshot_type,
+                ZeroPages::Write,
+                CleanGaps::Seek,
+                true,
+            )
+            .unwrap();
             assert!(!is_dirty(), "{snapshot_type:?} succeeded");
         }
     }
@@ -1264,8 +1297,14 @@ pub(crate) mod tests {
                     value: 2,
                 },
             };
-            vm.snapshot_memory_to_file(&mut racing_file, snapshot_type, ZeroPages::Write, false)
-                .unwrap();
+            vm.snapshot_memory_to_file(
+                &mut racing_file,
+                snapshot_type,
+                ZeroPages::Write,
+                CleanGaps::Seek,
+                false,
+            )
+            .unwrap();
             file = racing_file.file;
             let is_dirty = vm
                 .guest_memory()
@@ -1274,8 +1313,14 @@ pub(crate) mod tests {
             assert!(is_dirty, "{snapshot_type:?}");
 
             file.rewind().unwrap();
-            vm.snapshot_memory_to_file(&mut file, SnapshotType::Diff, ZeroPages::Write, false)
-                .unwrap();
+            vm.snapshot_memory_to_file(
+                &mut file,
+                SnapshotType::Diff,
+                ZeroPages::Write,
+                CleanGaps::Seek,
+                false,
+            )
+            .unwrap();
             let mut byte = [0];
             file.read_exact_at(&mut byte, page_size as u64).unwrap();
             assert_eq!(byte, [2], "{snapshot_type:?}");
@@ -1362,6 +1407,38 @@ pub(crate) mod tests {
 
         // Seeking over the zero page would leave the old 0xFF bytes under it.
         assert_eq!(first_difference(file.as_path(), &contents), None);
+    }
+
+    #[test]
+    fn test_diff_into_an_empty_target_bridges_no_clean_gap() {
+        // A clean page is written with the runs around it only over a file that holds the
+        // guest's memory. A Diff into a file that held none keeps it a hole, even where the page
+        // has a page table entry and lies between two written pages.
+        let size = mib_to_bytes(1);
+        let page = host_page_size();
+        let mut vm = setup_vm();
+        vm.register_dram_memory_regions(
+            anonymous(&[(GuestAddress(0), size)], true, HugePageConfig::None).unwrap(),
+        )
+        .unwrap();
+        let mem = vm.guest_memory();
+        // Every page gets a page table entry, and a Full snapshot takes the marks.
+        mem.write_slice(&vec![0x11; size], GuestAddress(0)).unwrap();
+        let dir = TempDir::new().unwrap();
+        vm.snapshot_memory_to_path(&dir.as_path().join("full"), SnapshotType::Full, false)
+            .unwrap();
+        mem.write_slice(&vec![0x22; page], GuestAddress(0)).unwrap();
+        mem.write_slice(&vec![0x22; page], GuestAddress(2 * page as u64))
+            .unwrap();
+
+        let diff = dir.as_path().join("diff");
+        vm.snapshot_memory_to_path(&diff, SnapshotType::Diff, false)
+            .unwrap();
+        let page = page as u64;
+        assert_eq!(
+            data_runs(&File::open(&diff).unwrap()),
+            vec![(0, page), (2 * page, page)]
+        );
     }
 
     #[test]
@@ -1592,8 +1669,14 @@ pub(crate) mod tests {
             .unwrap();
         // The parent of the Diff snapshots below.
         let mut file = TempFile::new().unwrap().into_file();
-        vm.snapshot_memory_to_file(&mut file, SnapshotType::Full, ZeroPages::Write, false)
-            .unwrap();
+        vm.snapshot_memory_to_file(
+            &mut file,
+            SnapshotType::Full,
+            ZeroPages::Write,
+            CleanGaps::Seek,
+            false,
+        )
+        .unwrap();
         vm.guest_memory()
             .discard_range(GuestAddress(page_size as u64), page_size)
             .unwrap();
@@ -1604,13 +1687,25 @@ pub(crate) mod tests {
                 file: TempFile::new().unwrap().into_file(),
                 state: TestMemoryFileState::Fails(fails),
             };
-            vm.snapshot_memory_to_file(&mut failing, SnapshotType::Diff, ZeroPages::Write, true)
-                .unwrap_err();
+            vm.snapshot_memory_to_file(
+                &mut failing,
+                SnapshotType::Diff,
+                ZeroPages::Write,
+                CleanGaps::Seek,
+                true,
+            )
+            .unwrap_err();
         }
 
         file.rewind().unwrap();
-        vm.snapshot_memory_to_file(&mut file, SnapshotType::Diff, ZeroPages::Write, false)
-            .unwrap();
+        vm.snapshot_memory_to_file(
+            &mut file,
+            SnapshotType::Diff,
+            ZeroPages::Write,
+            CleanGaps::Seek,
+            false,
+        )
+        .unwrap();
         let mut expected = vec![0xab; len];
         expected[page_size..2 * page_size].fill(0);
         let mut snapshot = vec![0xff; len];
