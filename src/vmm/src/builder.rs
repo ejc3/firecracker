@@ -590,7 +590,8 @@ pub fn build_microvm_from_snapshot(
         }
     }
 
-    // Restore vcpus kvm state.
+    // Restore vcpus kvm state. On aarch64 the replay follows the counter offset, below.
+    #[cfg(target_arch = "x86_64")]
     for (vcpu, state) in vcpus.iter_mut().zip(microvm_state.vcpu_states.iter()) {
         vcpu.kvm_vcpu
             .restore_state(state)
@@ -651,6 +652,14 @@ pub fn build_microvm_from_snapshot(
 
     #[cfg(target_arch = "aarch64")]
     {
+        // Restore vcpus kvm state.
+        for (vcpu, state) in vcpus.iter_mut().zip(microvm_state.vcpu_states.iter()) {
+            vcpu.kvm_vcpu
+                .restore_state(state)
+                .map_err(VcpuError::VcpuResponse)
+                .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)?;
+        }
+
         if clock_realtime {
             return Err(BuildMicrovmFromSnapshotError::UnsupportedClockRealtime);
         }

@@ -479,7 +479,6 @@ fn test_the_guest_counter_stands_still_from_the_pause_to_the_resume_of_a_clone()
             mem_backend: MemBackendConfig {
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
-                write_set_path: None,
             },
             track_dirty_pages: false,
             resume_vm: false,
