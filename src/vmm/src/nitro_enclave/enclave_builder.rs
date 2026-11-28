@@ -494,6 +494,11 @@ pub fn build_and_boot_enclave(
         vm: Vm::Enclave(enclave_vm),
         device_manager,
         can_create_diff_snapshots: true,
+        // An enclave has no pause and resume, so this VMM owns no counter offset for it.
+        #[cfg(target_arch = "aarch64")]
+        counter_offset: None,
+        #[cfg(target_arch = "aarch64")]
+        paused_at_counter: None,
     };
     let vmm = Arc::new(Mutex::new(vmm));
     // Enclave VMs are already running after the NE start ioctl — there is no

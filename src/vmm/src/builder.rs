@@ -618,7 +618,7 @@ pub fn build_microvm_from_snapshot(
         match saved_cntpct {
             Some(saved) => {
                 let offset = KvmVm::host_counter().wrapping_sub(saved);
-                match vm.set_counter_offset(offset) {
+                match kvm_vm.set_counter_offset(offset) {
                     Ok(()) => Some(offset),
                     Err(err) => {
                         log::warn!(
@@ -1151,6 +1151,10 @@ pub(crate) mod tests {
             vm: Vm::Kvm(vm),
             device_manager,
             can_create_diff_snapshots: true,
+            #[cfg(target_arch = "aarch64")]
+            counter_offset: None,
+            #[cfg(target_arch = "aarch64")]
+            paused_at_counter: None,
         }
     }
 
