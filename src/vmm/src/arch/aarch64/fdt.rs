@@ -103,7 +103,7 @@ pub fn create_fdt(
     create_memory_node(&mut fdt_writer, guest_mem)?;
     create_chosen_node(&mut fdt_writer, cmdline, initrd)?;
     create_gic_node(&mut fdt_writer, gic_device)?;
-    create_timer_node(&mut fdt_writer)?;
+    create_timer_node(&mut fdt_writer, nested_virt)?;
     create_clock_node(&mut fdt_writer)?;
     create_psci_node(&mut fdt_writer, nested_virt)?;
     create_devices_node(&mut fdt_writer, device_manager)?;
@@ -373,19 +373,31 @@ fn create_clock_node(fdt: &mut FdtWriter) -> Result<(), FdtError> {
     Ok(())
 }
 
-fn create_timer_node(fdt: &mut FdtWriter) -> Result<(), FdtError> {
+/// The `interrupts` cells of the timer node: (type, PPI number, flags) for each timer, in
+/// the order the arm,armv8-timer binding gives them: secure physical, non-secure physical,
+/// virtual, hypervisor physical and, for a guest with a virtual EL2, hypervisor virtual.
+///
+/// A kernel that boots at EL2 with VHE takes its tick from the hypervisor virtual timer
+/// (PPI 12, INTID 28, KVM's default for it) and reads the virtual counter. Without that
+/// fifth interrupt Linux reports "VHE-capable CPU without EL2 virtual timer interrupt" and
+/// falls back to the hypervisor physical timer and the physical counter, while its vDSO
+/// still reads the virtual counter. A guest without EL2 gets the four it always got.
+fn timer_interrupt_cells(nested_virt: bool) -> Vec<u32> {
     // See
-    // https://github.com/torvalds/linux/blob/master/Documentation/devicetree/bindings/interrupt-controller/arch_timer.txt
+    // https://github.com/torvalds/linux/blob/master/Documentation/devicetree/bindings/timer/arm,arch_timer.yaml
     // These are fixed interrupt numbers for the timer device.
-    let irqs = [13, 14, 11, 10];
-    let compatible = "arm,armv8-timer";
-
-    let mut timer_reg_cells: Vec<u32> = Vec::new();
-    for &irq in irqs.iter() {
-        timer_reg_cells.push(GIC_FDT_IRQ_TYPE_PPI);
-        timer_reg_cells.push(irq);
-        timer_reg_cells.push(IRQ_TYPE_LEVEL_HI);
+    let mut irqs = vec![13, 14, 11, 10];
+    if nested_virt {
+        irqs.push(12);
     }
+    irqs.into_iter()
+        .flat_map(|irq| [GIC_FDT_IRQ_TYPE_PPI, irq, IRQ_TYPE_LEVEL_HI])
+        .collect()
+}
+
+fn create_timer_node(fdt: &mut FdtWriter, nested_virt: bool) -> Result<(), FdtError> {
+    let compatible = "arm,armv8-timer";
+    let timer_reg_cells = timer_interrupt_cells(nested_virt);
 
     let timer = fdt.begin_node("timer")?;
     fdt.property_string("compatible", compatible)?;
@@ -651,6 +663,23 @@ mod tests {
             create_memory_node(&mut fdt, &mem),
             Err(FdtError::GuestMemoryTooSmall(..))
         ));
+    }
+
+    #[test]
+    fn test_a_guest_with_el2_gets_the_hypervisor_virtual_timer_interrupt() {
+        let ppis = |nested_virt| -> Vec<u32> {
+            let cells = timer_interrupt_cells(nested_virt);
+            assert_eq!(cells.len() % 3, 0);
+            for triple in cells.chunks(3) {
+                assert_eq!(triple[0], GIC_FDT_IRQ_TYPE_PPI);
+                assert_eq!(triple[2], IRQ_TYPE_LEVEL_HI);
+            }
+            cells.chunks(3).map(|triple| triple[1]).collect()
+        };
+        // Without EL2: the four the node has always had.
+        assert_eq!(ppis(false), [13, 14, 11, 10]);
+        // With EL2: the hypervisor virtual timer, PPI 12 (INTID 28), as the fifth.
+        assert_eq!(ppis(true), [13, 14, 11, 10, 12]);
     }
 
     #[test]
