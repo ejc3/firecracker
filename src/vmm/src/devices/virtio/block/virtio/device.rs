@@ -84,11 +84,9 @@ impl DiskProperties {
     /// past what its guest asked for. A file whose filesystem refuses
     /// the advice is used as it is.
     fn without_readahead(file: &File) {
-        // SAFETY: `file` is an open descriptor; posix_fadvise reads nothing through pointers.
-        let ret = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
-        if ret != 0 {
-            warn!("posix_fadvise(POSIX_FADV_RANDOM) on a drive's backing file failed: {ret}");
-        }
+        // MEASUREMENT ONLY (fcvm #2211's cost bisect): the advice is not given, so the drive's
+        // backing file keeps the host's readahead.
+        let _ = file;
     }
 
     // Helper function that gets the size of the file
